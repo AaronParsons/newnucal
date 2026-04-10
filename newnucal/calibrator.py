@@ -29,7 +29,7 @@ from jaxopt import LBFGS
 
 from .array import HERAArray
 from .beam import BeamModel
-from .dpss import dpss_matrix, dpss_project
+from .dpss import dpss_matrix
 from .simulate import ForwardModel
 from .gains import apply_gains, init_gain_params
 
@@ -123,13 +123,6 @@ class Calibrator:
         self.rot_matrices = jnp.array(rot_matrices, dtype=DTYPE_R)
         self.data = jnp.array(data, dtype=DTYPE_C)
         self.bls = jnp.array(array.bls, dtype=DTYPE_R)
-
-        # Store constructor args needed for sub-Calibrators in fit_progressive
-        self._array = array
-        self._beam_model = beam_model
-        self._sky_eta_max = sky_eta_max
-        self._sky_eigenval_cutoff = sky_eigenval_cutoff
-        self._eps = eps
 
         # Sky DPSS matrix
         self.A_sky = dpss_matrix(
@@ -407,8 +400,8 @@ class Calibrator:
             L-BFGS iterations per sky step.
         verbose : bool
         _stop_flag : _StopFitFlag or None
-            Internal: shared stop flag injected by ``fit_progressive``.
-            When None a private flag is installed as the SIGINT handler.
+            Internal use only.  When None a private flag is installed as
+            the SIGINT handler.
 
         Returns
         -------
@@ -438,190 +431,6 @@ class Calibrator:
                 _StopFitFlag.restore(old_handler)
         return sky_coeffs, gain_params, loss
 
-    def fit_progressive(
-        self,
-        sky_coeffs,
-        gain_params,
-        nside_schedule=None,
-        outer_per_level=None,
-        sky_maxiter_per_level=None,
-        eps_per_level=None,
-        verbose: bool = False,
-    ):
-        """
-        Multi-resolution coarse-to-fine alternating calibration.
-
-        Runs ``fit_alternating`` at successively finer sky resolutions.
-        Coarse levels are cheap (NUFFT cost ∝ npix_sky) and quickly drive
-        the gain and large-scale sky parameters near the correct solution;
-        finer levels then refine small-scale structure.
-
-        Sky coefficients are transferred between levels by:
-          1. Reconstruct full-frequency sky map from DPSS coefficients.
-          2. Resample to new nside with ``healpy.ud_grade``.
-          3. Re-project onto the new DPSS basis with ``dpss_project``.
-
-        Gain parameters are dimensionless scalars per frequency and transfer
-        directly without modification.
-
-        **Interrupt handling**: pressing Ctrl-C (SIGINT) at any point sets a
-        shared stop flag.  The running L-BFGS iteration completes, then the
-        current sky is upscaled to the final nside (if stopped at a coarse
-        level) and the method returns the best state so far.  A single Ctrl-C
-        is enough regardless of which level is active.
-
-        Parameters
-        ----------
-        sky_coeffs : jnp.array, shape (npix_sky_final, nmodes_sky)
-            Initial sky at the *final* (finest) nside.  Downgraded internally
-            for coarser levels.
-        gain_params : dict  with keys log_amp, phase, phi
-        nside_schedule : list[int], optional
-            nside values to use, coarse to fine.  The last entry must equal
-            ``self.fwd.sky_nside``.  Defaults to a geometric sequence from
-            nside=8 up to the final nside (doubling each step).
-        outer_per_level : list[int], optional
-            Number of alternating outer iterations at each level.
-            Default: 5 for coarse levels, 10 for the final level.
-        sky_maxiter_per_level : list[int], optional
-            L-BFGS iterations per sky step at each level.
-            Default: 10 for all levels.
-        eps_per_level : list[float], optional
-            NUFFT accuracy at each level.  Coarser levels can tolerate lower
-            accuracy (e.g., 1e-4) for extra speed.
-            Default: ``self._eps`` at all levels.
-        verbose : bool
-
-        Returns
-        -------
-        sky_coeffs : jnp.array, shape (npix_sky_final, nmodes_sky)
-        gain_params : dict
-        loss : float
-        """
-        import healpy as hp
-        import numpy as np
-
-        final_nside = self.fwd.sky_nside
-        A_sky_np = np.array(self.A_sky)
-
-        # ---- build default schedule ----------------------------------------
-        if nside_schedule is None:
-            nside = 8
-            nside_schedule = []
-            while nside < final_nside:
-                nside_schedule.append(nside)
-                nside *= 2
-            nside_schedule.append(final_nside)
-
-        nlevels = len(nside_schedule)
-
-        if outer_per_level is None:
-            outer_per_level = [5] * (nlevels - 1) + [10]
-        if sky_maxiter_per_level is None:
-            sky_maxiter_per_level = [10] * nlevels
-        if eps_per_level is None:
-            eps_per_level = [self._eps] * nlevels
-
-        assert nside_schedule[-1] == final_nside, (
-            f"Last nside in schedule ({nside_schedule[-1]}) must equal "
-            f"the calibrator's sky_nside ({final_nside})"
-        )
-
-        # ---- shared stop flag + SIGINT handler -----------------------------
-        stop = _StopFitFlag()
-        old_handler = _StopFitFlag.install(stop)
-
-        # ---- reconstruct flux map at final nside from initial sky_coeffs ---
-        # sky_coeffs: (npix_final, nmodes); A_sky: (nfreq, nmodes)
-        # flux_map_final: (npix_final, nfreq)
-        flux_map_final = np.array(sky_coeffs) @ A_sky_np.T  # (npix_final, nfreq)
-        sky_coeffs_lvl = sky_coeffs   # initialise so it's always defined
-        loss = float(self._jit_loss({"sky_coeffs": sky_coeffs, **gain_params}))
-
-        try:
-            # ---- iterate over levels ---------------------------------------
-            for lvl, nside_lvl in enumerate(nside_schedule):
-                npix_lvl    = hp.nside2npix(nside_lvl)
-                n_outer     = outer_per_level[lvl]
-                sky_maxiter = sky_maxiter_per_level[lvl]
-                eps_lvl     = eps_per_level[lvl]
-                is_final    = (nside_lvl == final_nside)
-
-                if verbose:
-                    print(f"[progressive] nside={nside_lvl:4d}  npix={npix_lvl:6d}  "
-                          f"n_outer={n_outer}  sky_maxiter={sky_maxiter}  eps={eps_lvl:.0e}")
-
-                # Downgrade flux map to current nside
-                if is_final:
-                    flux_map_lvl = flux_map_final       # (npix_final, nfreq)
-                else:
-                    flux_map_lvl = np.stack(
-                        [hp.ud_grade(flux_map_final[:, f], nside_lvl)
-                         for f in range(self.nfreq)],
-                        axis=1,
-                    )  # (npix_lvl, nfreq)
-
-                # Project onto DPSS basis at this level (A_sky is frequency-only)
-                sky_coeffs_lvl = jnp.array(
-                    dpss_project(flux_map_lvl, A_sky_np), dtype=DTYPE_R
-                )  # (npix_lvl, nmodes_sky)
-
-                # Build sub-Calibrator at this nside/eps
-                if is_final:
-                    sub_cal = self
-                else:
-                    sub_cal = Calibrator(
-                        self._array,
-                        self._beam_model,
-                        nside_lvl,
-                        self._sky_eta_max,
-                        np.array(self.freqs),
-                        np.array(self.rot_matrices),
-                        np.array(self.data),
-                        sky_eigenval_cutoff=self._sky_eigenval_cutoff,
-                        eps=eps_lvl,
-                    )
-
-                # Run alternating minimisation — shares the stop flag so one
-                # Ctrl-C stops both the inner loop and this outer loop.
-                sky_coeffs_lvl, gain_params, loss = sub_cal.fit_alternating(
-                    sky_coeffs_lvl,
-                    gain_params,
-                    n_outer=n_outer,
-                    sky_maxiter=sky_maxiter,
-                    verbose=verbose,
-                    _stop_flag=stop,
-                )
-
-                if verbose:
-                    print(f"  → loss after nside={nside_lvl}: {loss:.4e}")
-
-                # Upscale flux map for next level (also used on early exit)
-                if not is_final:
-                    flux_map_final = np.array(sky_coeffs_lvl) @ A_sky_np.T
-                    flux_map_final = np.stack(
-                        [hp.ud_grade(flux_map_final[:, f], final_nside)
-                         for f in range(self.nfreq)],
-                        axis=1,
-                    )  # (npix_final, nfreq)
-
-                if stop.stop:
-                    break   # exit level loop; upscaling handled below
-
-        finally:
-            _StopFitFlag.restore(old_handler)
-
-        # ---- if stopped at a coarse level, upscale sky to final nside ------
-        if stop.stop and sky_coeffs_lvl.shape[0] != hp.nside2npix(final_nside):
-            if verbose:
-                print(f"[progressive] Upscaling sky from nside={nside_lvl} "
-                      f"→ nside={final_nside} before returning.")
-            sky_coeffs_lvl = jnp.array(
-                dpss_project(flux_map_final, A_sky_np), dtype=DTYPE_R
-            )
-            loss = float(self._jit_loss({"sky_coeffs": sky_coeffs_lvl, **gain_params}))
-
-        return sky_coeffs_lvl, gain_params, loss
 
     def fit_lbfgs(self, params, maxiter: int = 30, tol: float = 1e-7):
         """

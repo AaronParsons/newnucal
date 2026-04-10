@@ -114,52 +114,68 @@ class TestPointSourcePhaseGradient:
         assert jnp.max(amp) < 10.0 * amp_mean, \
             f"Amplitude variation too large: max={jnp.max(amp):.2e}, mean={amp_mean:.2e}"
 
-    def test_source_east_phase_increases_with_baseline(self, forward_model_small, freqs):
+    def test_source_east_phase_matches_analytical(self, forward_model_small, freqs):
         """
-        Point source due East (l>0, m=0):
-        ŝ ≈ (sin(l), 0, cos(l)) ≈ (l, 0, 1) for small l
-        → b_east · ŝ ≈ b_east * l
-        → phase ≈ 2π * ν/c * b_east * l
+        For a single bright pixel the visibility should satisfy:
 
-        East baselines have increasing length, so phase should
-        increase monotonically (modulo 2π).
+            V[f, b] ≈ W[f] · exp(+2πi·ν_f·(b_x·tx + b_y·ty)/c)
+
+        where W[f] = sky_spec[f] · beam_spec[f] and (tx, ty) is the
+        source's topocentric direction.  Tests that the NUFFT gives the
+        right complex value (not just a non-zero gradient).
         """
-        npix = forward_model_small.npix_sky
-        freqs_arr = freqs
+        import healjax
+        from healjax import get_interp_weights as _giw
+        C = 299_792_458.0
 
-        # Source at small east offset: HEALPix pixel with theta~0.3 rad (~17°)
-        # Find pixels near the east direction (theta small, phi ≈ π/2)
-        all_th, all_ph = healpy.pix2ang(forward_model_small.sky_nside, np.arange(npix))
+        npix      = forward_model_small.npix_sky
+        freqs_arr = np.array(freqs)
+        A_sky     = forward_model_small.A_sky
+        beam      = forward_model_small.array  # only used for bls below
 
-        # Find pixel near (theta ~= 0.3, phi ~= π/2) — east direction
-        east_mask = (all_th < 0.5) & (np.abs(all_ph - np.pi/2) < 0.4)
-        if east_mask.sum() == 0:
-            # Fallback: take pixel with smallest theta
-            east_px = np.argmin(all_th)
-        else:
-            east_px = np.where(east_mask)[0][0]
+        # Pick pixel 0 (near zenith) — guaranteed above horizon
+        px = 0
+        px_th, px_ph = healpy.pix2ang(forward_model_small.sky_nside, px)
+        topo_vec = np.array(healpy.ang2vec(px_th, px_ph))   # (3,)
 
         flat_flux = np.zeros((npix, freqs_arr.shape[0]), dtype=np.float32)
-        flat_flux[east_px, :] = 1.0
-
-        sky_coeffs = dpss_project(flat_flux, forward_model_small.A_sky)
-        sky_coeffs = jnp.array(sky_coeffs, dtype=jnp.float32)
+        flat_flux[px, :] = 1.0
+        sky_coeffs = jnp.array(dpss_project(flat_flux, A_sky), dtype=jnp.float32)
 
         rot_m = jnp.eye(3, dtype=jnp.float32)[None, :, :]
-        vis = forward_model_small.simulate(sky_coeffs, rot_m)[0]  # (nfreq, nbls)
+        vis   = np.array(forward_model_small.simulate(sky_coeffs, rot_m)[0])   # (nfreq, nbls)
 
-        # Check phase monotonicity at each frequency
-        # (Baselines are sorted by length, roughly)
-        for freq_idx in range(min(2, vis.shape[0])):  # Check first 2 freqs
-            phases = jnp.angle(vis[freq_idx, :])  # (nbls,)
-            # Unwrap and check monotonicity (allowing for some tolerance)
-            phases_unwrap = np.unwrap(phases)
-            # Phase should generally increase with baseline index
-            # (baseline table is roughly sorted by length)
-            dph = np.diff(phases_unwrap)
-            n_increasing = np.sum(dph > -0.3)  # Most differences should be positive
-            assert n_increasing > len(dph) * 0.5, \
-                f"Phase not monotonic for east source at freq {freq_idx}"
+        # Reconstruct W[px, f] = sky_spec * beam_spec at this pixel
+        sky_spec = np.array((sky_coeffs[px:px+1] @ jnp.array(A_sky).T)[0])
+
+        beam_model = forward_model_small._beam_model_ref if hasattr(
+            forward_model_small, '_beam_model_ref') else None
+        # Use beam_interp directly from the stored coeffs
+        th0  = jnp.array([float(px_th)])
+        ph0  = jnp.array([float(px_ph)])
+        px_b, wgts = _giw(th0, ph0, forward_model_small.beam_nside)
+        beam_interp = np.array(
+            jnp.sum(wgts[:, :, None] * forward_model_small.beam_coeffs[px_b], axis=0)[0]
+        )
+        beam_spec = np.array(forward_model_small.A_beam) @ beam_interp   # (nfreq,)
+        W = sky_spec * beam_spec   # (nfreq,)
+
+        # Compare to analytical formula for each cross-baseline
+        bls    = np.array(forward_model_small.array.bls)
+        bl_len = np.linalg.norm(bls[:, :2], axis=1)
+        cross  = np.where(bl_len > 1.0)[0]
+
+        tx, ty = topo_vec[0], topo_vec[1]
+        for bi in cross:
+            b_x, b_y = bls[bi, 0], bls[bi, 1]
+            phase_anal = 2*np.pi * freqs_arr * (b_x*tx + b_y*ty) / C
+            V_anal = W * np.exp(+1j * phase_anal)   # (nfreq,)
+            V_got  = vis[:, bi]                     # (nfreq,)
+            rms_err = np.sqrt(np.mean(np.abs(V_got - V_anal)**2))
+            rms_sig = np.sqrt(np.mean(np.abs(V_anal)**2)) + 1e-30
+            assert rms_err / rms_sig < 0.01, \
+                (f"Analytical mismatch for baseline {bi} "
+                 f"(bl={bls[bi,:2]}): RMS err/signal = {rms_err/rms_sig:.3e}")
 
     def test_phase_gradient_magnitude(self, forward_model_small, freqs):
         """
