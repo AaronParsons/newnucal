@@ -164,6 +164,68 @@ class Calibrator:
     # Optimisers
     # ------------------------------------------------------------------
 
+    def fit_gains_linear(self, sky_coeffs):
+        """
+        Analytically solve for gain parameters with sky held fixed.
+
+        The MSE loss is nonlinear in (log_amp, phase, phi) because gains enter
+        as exp(...), so iterative optimisers like L-BFGS only approximate the
+        solution.  This method is exact in one pass via two linear steps:
+
+          1. Per-baseline optimal complex gain by matched-filter projection:
+               g[f,b] = Σ_t data·conj(model) / Σ_t |model|²
+
+          2. Log-domain weighted linear regression per frequency:
+               log g[f,b] = log_amp[f]  +  i·(phase[f]
+                             + phi_x[f]·bl_x[b] + phi_y[f]·bl_y[b])
+
+        Parameters
+        ----------
+        sky_coeffs : jnp.array, shape (npix_sky, nmodes_sky)
+            Fixed sky model.
+
+        Returns
+        -------
+        gain_params : dict  with keys log_amp, phase, phi
+        loss : float
+        """
+        import numpy as np
+
+        vis_model = jax.jit(self.fwd.simulate)(sky_coeffs, self.rot_matrices)
+
+        # Step 1: optimal unconstrained per-(freq, baseline) complex gain
+        num = jnp.sum(self.data * jnp.conj(vis_model), axis=0)  # (nfreq, nbls)
+        den = jnp.sum(jnp.abs(vis_model) ** 2, axis=0)          # (nfreq, nbls)
+        g_opt = np.array(num / (den + 1e-30))   # (nfreq, nbls), complex
+        w     = np.array(den)                   # model power, used as weights
+
+        # Step 2: project onto 4-DOF gain model in the log domain
+        #   Re(log g[f,b]) = log_amp[f]          (baseline-independent)
+        #   Im(log g[f,b]) = phase[f] + phi_x[f]*bl_x[b] + phi_y[f]*bl_y[b]
+        log_g = np.log(g_opt)           # (nfreq, nbls); principal log of complex
+        bls   = np.array(self.bls)      # (nbls, 3)
+
+        # log_amp: weighted mean of Re(log g) across baselines
+        w_sum   = w.sum(axis=1) + 1e-30
+        log_amp = (w * np.real(log_g)).sum(axis=1) / w_sum      # (nfreq,)
+
+        # (phase, phi_x, phi_y): weighted lstsq of Im(log g) vs [1, bl_x, bl_y]
+        X     = np.column_stack([np.ones(self.nbls), bls[:, 0], bls[:, 1]])
+        theta = np.empty((3, self.nfreq), dtype=np.float64)
+        for f in range(self.nfreq):
+            sw         = np.sqrt(w[f] + 1e-30)
+            theta[:, f] = np.linalg.lstsq(
+                X * sw[:, None], np.imag(log_g[f]) * sw, rcond=None
+            )[0]
+
+        gain_params = {
+            "log_amp": jnp.array(log_amp, dtype=jnp.float32),
+            "phase":   jnp.array(theta[0], dtype=jnp.float32),
+            "phi":     jnp.array(theta[1:], dtype=jnp.float32),
+        }
+        loss = float(self._jit_loss({"sky_coeffs": sky_coeffs, **gain_params}))
+        return gain_params, loss
+
     def fit_gains_only(self, sky_coeffs, gain_params, maxiter: int = 60, tol: float = 1e-9):
         """
         Optimise gain parameters with sky held fixed.
