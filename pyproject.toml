@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "newnucal"
+version = "0.1.0"
+description = "Forward sky modelling calibration for HERA using JAX-NUFFT and DPSS spectral constraints"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "jax",
+    "jaxlib",
+    "jax-finufft",
+    "healjax",
+    "healpy",
+    "astropy",
+    "hera-filters",
+    "hera-sim",
+    "fftvis",
+    "matvis",
+    "pyuvdata",
+    "optax",
+    "jaxopt",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["newnucal*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

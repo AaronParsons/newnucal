@@ -1,0 +1,80 @@
+"""
+Shared pytest fixtures for newnucal tests.
+
+All fixtures use small sizes so tests run quickly:
+  hexnum=2  →  7 antennas, ~20 unique baselines
+  nfreq=16, nside=8 (768 pixels), ntimes=2
+"""
+
+import numpy as np
+import pytest
+from astropy.time import Time
+from astropy.coordinates import EarthLocation
+
+from newnucal.array import HERAArray
+from newnucal.dpss import dpss_matrix
+
+
+HERA_LOC = EarthLocation.from_geodetic(
+    lat=-30.72152612068926,
+    lon=21.42830382686301,
+    height=1051.69,
+)
+
+NFREQ = 16
+FREQS = np.linspace(100e6, 200e6, NFREQ, endpoint=False)
+NSIDE_SKY = 8
+NSIDE_BEAM = 8
+NTIMES = 2
+ETA_MAX_SKY = 40e-9   # seconds
+ETA_MAX_BEAM = 20e-9  # seconds
+
+
+@pytest.fixture(scope="session")
+def freqs():
+    return FREQS.copy()
+
+
+@pytest.fixture(scope="session")
+def array():
+    return HERAArray.from_hex(hexnum=2)
+
+
+@pytest.fixture(scope="session")
+def A_sky(freqs):
+    return dpss_matrix(freqs, ETA_MAX_SKY)
+
+
+@pytest.fixture(scope="session")
+def A_beam(freqs):
+    return dpss_matrix(freqs, ETA_MAX_BEAM)
+
+
+@pytest.fixture(scope="session")
+def beam_model(freqs):
+    from newnucal.beam import BeamModel
+    return BeamModel(
+        nside=NSIDE_BEAM,
+        freqs=freqs,
+        eta_max=ETA_MAX_BEAM,
+    )
+
+
+@pytest.fixture(scope="session")
+def rot_matrices():
+    """Two rotation matrices: one near transit, one ~1 hr later."""
+    from newnucal.simulate import compute_rotation_matrices
+    t0 = Time("2018-08-31T04:02:30", format="isot", scale="utc")
+    times = Time(
+        np.linspace(t0.jd, t0.jd + 1 / 24, NTIMES),
+        format="jd",
+    )
+    return compute_rotation_matrices(times, HERA_LOC)
+
+
+@pytest.fixture(scope="session")
+def forward_model(array, beam_model, freqs, A_sky):
+    from newnucal.simulate import ForwardModel
+    fwd = ForwardModel(array, NSIDE_SKY, beam_model, freqs)
+    fwd.set_sky_dpss(A_sky)
+    return fwd

@@ -1,0 +1,106 @@
+"""
+HERA array geometry.
+
+HERAArray wraps fftvis antenna gridding to produce the three things needed
+by the forward model:
+
+  basis_matrix  [3, 3]      Converts topocentric unit vectors to grid
+                            coordinates.  Has been divided by c so that
+                            basis_matrix @ topo_uvec * freq gives
+                            dimensionless NUFFT arguments (cycles, not
+                            radians — the factor of 2π is applied later).
+
+  bl_grid       [nbls, 2]   Integer (East, North) grid positions for each
+                            unique baseline.  Positive and negative values
+                            are both used; Python negative indexing into
+                            the NUFFT output grid gives the correct mode.
+
+  n_modes       int         NUFFT grid edge length, chosen to contain all
+                            baselines.
+"""
+
+import numpy as np
+import hera_sim.antpos
+import fftvis.core.antenna_gridding as _fg
+import fftvis.utils as _fu
+
+
+C = _fu.speed_of_light  # m / s
+
+
+class HERAArray:
+    """
+    Geometric description of a HERA-like hexagonal array.
+
+    Parameters
+    ----------
+    ants : dict[int, array_like]
+        Antenna positions in metres, keyed by antenna index.
+        Each value is a 3-element (East, North, Up) position.
+    """
+
+    def __init__(self, ants: dict):
+        self.ants = {k: np.asarray(v, dtype=np.float64) for k, v in ants.items()}
+        antpos = np.array(list(self.ants.values()), dtype=np.float64)
+
+        # Unique baselines — one representative per redundant group
+        red_gps = _fu.get_pos_reds(self.ants)
+        self.antpairs = np.array([gp[0] for gp in red_gps], dtype=int)  # (nbls, 2)
+        self.bls = np.array(
+            [self.ants[i] - self.ants[j] for i, j in self.antpairs],
+            dtype=np.float32,
+        )  # (nbls, 3)  metres
+
+        # Grid baseline positions and change-of-basis matrix
+        _, gridded_antpos, basis_matrix = (
+            _fg.check_antpos_griddability(self.ants)
+        )
+        # bl_grid[bl, 0/1]: integer (East, North) grid positions
+        self.bl_grid = np.array(
+            [
+                np.round(gridded_antpos[j] - gridded_antpos[i]).astype(int)[:2]
+                for i, j in self.antpairs
+            ],
+            dtype=int,
+        )  # (nbls, 2)
+
+        self.n_modes = int(2 * np.max(np.abs(self.bl_grid)) + 1)
+
+        # Divide basis_matrix by c so the NUFFT argument is
+        #   x[freq, px] = 2π * (basis_matrix @ topo)[0, px] * freq
+        # where topo are dimensionless direction cosines.
+        self.basis_matrix = (basis_matrix / C).astype(np.float64)  # (3, 3)
+
+    # ------------------------------------------------------------------
+    # Convenience constructors
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_hex(cls, hexnum: int, sep: float = 14.6, outriggers: bool = False):
+        """
+        Build a HERAArray from a hex array specification.
+
+        Parameters
+        ----------
+        hexnum : int
+            Number of antennas along one side of the hex core.
+        sep : float
+            Antenna separation in metres.
+        outriggers : bool
+            Include outrigger antennas.
+        """
+        hx = hera_sim.antpos.HexArray(sep=sep, outriggers=outriggers)
+        ants = hx(hexnum, outriggers=outriggers)
+        return cls(ants)
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def nants(self) -> int:
+        return len(self.ants)
+
+    @property
+    def nbls(self) -> int:
+        return self.antpairs.shape[0]
