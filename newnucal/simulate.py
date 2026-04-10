@@ -29,6 +29,9 @@ import healjax
 from .array import HERAArray
 from .beam import BeamModel
 
+DTYPE_R = jnp.float32
+DTYPE_C = jnp.complex64
+DTYPE_R_NPY = np.float32
 
 class ForwardModel:
     """
@@ -59,7 +62,7 @@ class ForwardModel:
         self.beam_nside = beam_model.nside
         self.eps = eps
 
-        freqs = np.asarray(freqs, dtype=np.float32)
+        freqs = np.asarray(freqs, dtype=DTYPE_R_NPY)
         self.freqs = jnp.array(freqs)
 
         # Pre-computed static quantities (captured by JIT)
@@ -73,10 +76,10 @@ class ForwardModel:
 
         # Equatorial unit vectors for all sky pixels
         npix_sky = healpy.nside2npix(sky_nside)
-        eq_xyz = np.array(healpy.pix2vec(sky_nside, np.arange(npix_sky)), dtype=np.float32)
+        eq_xyz = np.array(healpy.pix2vec(sky_nside, np.arange(npix_sky)), dtype=DTYPE_R_NPY)
         self.eq_coords = jnp.array(eq_xyz)  # (3, npix_sky)
 
-        self.basis_matrix = jnp.array(array.basis_matrix, dtype=jnp.float32)  # (3, 3)
+        self.basis_matrix = jnp.array(array.basis_matrix, dtype=DTYPE_R)  # (3, 3)
         self.bl_grid = jnp.array(array.bl_grid, dtype=int)  # (nbls, 2)
         self.n_modes = array.n_modes
 
@@ -90,7 +93,7 @@ class ForwardModel:
 
     def set_sky_dpss(self, A_sky):
         """Set the sky DPSS matrix.  A_sky shape: (nfreq, nmodes_sky)."""
-        self.A_sky = jnp.array(A_sky, dtype=jnp.float32)
+        self.A_sky = jnp.array(A_sky, dtype=DTYPE_R)
         # Recompile JIT with the new matrix captured.
         self._jit_one = jax.jit(self._simulate_one)
 
@@ -120,7 +123,7 @@ class ForwardModel:
         topo_grid = jnp.dot(self.basis_matrix.T, topo)  # (3, npix_sky)
 
         # 3. Horizon mask — multiply flux, not filter (keeps shapes static)
-        horizon = (topo_grid[2] > 0).astype(jnp.float32)  # (npix_sky,)
+        horizon = (topo_grid[2] > 0).astype(DTYPE_R)  # (npix_sky,)
 
         # 4. Interpolate beam DPSS coefficients at topocentric sky positions
         topo_th, topo_ph = healjax.vec2ang(topo[0], topo[1], topo[2])
@@ -135,12 +138,12 @@ class ForwardModel:
         beam_spec = interp_beam_coeffs @ self.A_beam.T  # (npix_sky, nfreq)
 
         # 6. Weighted flux with horizon mask  →  (nfreq, npix_sky), complex64
-        flux = ((sky_spec * beam_spec) * horizon[:, None]).T.astype(jnp.complex64)
+        flux = ((sky_spec * beam_spec) * horizon[:, None]).T.astype(DTYPE_C)
 
         # 7. Frequency-dependent NUFFT non-uniform point coordinates
         #    x[freq, px] = 2π * topo_grid[0, px] * freq
-        x_nu = (2 * jnp.pi * topo_grid[0][None, :] * self.freqs[:, None]).astype(jnp.float32)
-        y_nu = (2 * jnp.pi * topo_grid[1][None, :] * self.freqs[:, None]).astype(jnp.float32)
+        x_nu = (2 * jnp.pi * topo_grid[0][None, :] * self.freqs[:, None]).astype(DTYPE_R)
+        y_nu = (2 * jnp.pi * topo_grid[1][None, :] * self.freqs[:, None]).astype(DTYPE_R)
 
         # 8. Type-1 NUFFT: (nfreq, npix) → (nfreq, n_modes, n_modes)
         vis_grid = nufft1(

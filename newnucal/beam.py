@@ -24,6 +24,7 @@ from pyuvdata.analytic_beam import AiryBeam
 
 from .dpss import dpss_matrix, dpss_project
 
+DTYPE_R = np.float32
 
 class BeamModel:
     """
@@ -79,7 +80,7 @@ class BeamModel:
         beam_power = self._eval_beam(beam, az, za, ch_chunk)  # (npix, nfreq)
 
         # Project onto DPSS basis: coeffs[px, mode] = sum_ν beam_power[px, ν] * A[ν, mode]
-        self.coeffs = dpss_project(beam_power, self.A_beam).astype(np.float32)
+        self.coeffs = dpss_project(beam_power, self.A_beam).astype(DTYPE_R)
         # (npix, nmodes)
 
     # ------------------------------------------------------------------
@@ -88,7 +89,7 @@ class BeamModel:
         """Evaluate beam power on the pixel grid across all frequencies."""
         nfreq = len(self.freqs)
         npix = len(az)
-        beam_power = np.empty((npix, nfreq), dtype=np.float32)
+        beam_power = np.empty((npix, nfreq), dtype=DTYPE_R)
 
         for ch in range(0, nfreq, ch_chunk):
             ch_sl = slice(ch, ch + ch_chunk)
@@ -99,7 +100,7 @@ class BeamModel:
                 za_array=za,
                 freq_array=freqs_chunk,
             )[0, 0]  # → (nfreq_chunk, npix)
-            beam_power[:, ch_sl] = resp.T.astype(np.float32)
+            beam_power[:, ch_sl] = resp.T.astype(DTYPE_R)
 
         return beam_power  # (npix, nfreq)
 

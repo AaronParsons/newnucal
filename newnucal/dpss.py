@@ -11,6 +11,7 @@ axis via  data[..., nfreq] = coeffs[..., nmodes] @ A.T .
 import numpy as np
 from hera_filters.dspec import dpss_operator
 
+DTYPE_R = np.float32
 
 def dpss_matrix(freqs, eta_max, eigenval_cutoff=1e-9):
     """
@@ -35,12 +36,12 @@ def dpss_matrix(freqs, eta_max, eigenval_cutoff=1e-9):
     A : ndarray, shape (nfreq, nmodes), dtype float32
     """
     A, _ = dpss_operator(
-        np.asarray(freqs, dtype=np.float64),
+        np.asarray(freqs, dtype=DTYPE_R),
         filter_centers=[0.0],
         filter_half_widths=[eta_max],
         eigenval_cutoff=[eigenval_cutoff],
     )
-    return A.real.astype(np.float32)
+    return A.real.astype(DTYPE_R)
 
 
 def dpss_project(data, A):

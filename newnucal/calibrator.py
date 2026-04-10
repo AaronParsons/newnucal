@@ -31,6 +31,9 @@ from .dpss import dpss_matrix
 from .simulate import ForwardModel
 from .gains import apply_gains, init_gain_params
 
+DTYPE_R = jnp.float32
+DTYPE_C = jnp.complex64
+
 
 class Calibrator:
     """
@@ -68,10 +71,10 @@ class Calibrator:
         sky_eigenval_cutoff: float = 1e-9,
         eps: float = 1e-6,
     ):
-        self.freqs = jnp.array(freqs, dtype=jnp.float32)
-        self.rot_matrices = jnp.array(rot_matrices, dtype=jnp.float32)
-        self.data = jnp.array(data, dtype=jnp.complex64)
-        self.bls = jnp.array(array.bls, dtype=jnp.float32)
+        self.freqs = jnp.array(freqs, dtype=DTYPE_R)
+        self.rot_matrices = jnp.array(rot_matrices, dtype=DTYPE_R)
+        self.data = jnp.array(data, dtype=DTYPE_C)
+        self.bls = jnp.array(array.bls, dtype=DTYPE_R)
 
         # Sky DPSS matrix
         self.A_sky = dpss_matrix(
@@ -133,7 +136,7 @@ class Calibrator:
         npix_sky = self.fwd.npix_sky
         nmodes_sky = self.A_sky.shape[1]
         params = {
-            "sky_coeffs": jnp.zeros((npix_sky, nmodes_sky), dtype=jnp.float32),
+            "sky_coeffs": jnp.zeros((npix_sky, nmodes_sky), dtype=DTYPE_R),
             **init_gain_params(self.nfreq),
         }
         return params
@@ -154,7 +157,7 @@ class Calibrator:
         from .dpss import dpss_project
         import numpy as np
         return jnp.array(
-            dpss_project(np.asarray(flux), self.A_sky), dtype=jnp.float32
+            dpss_project(np.asarray(flux), self.A_sky), dtype=DTYPE_R
         )
 
     # ------------------------------------------------------------------

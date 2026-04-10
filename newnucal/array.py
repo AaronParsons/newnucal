@@ -24,7 +24,7 @@ import hera_sim.antpos
 import fftvis.core.antenna_gridding as _fg
 import fftvis.utils as _fu
 
-
+DTYPE_R = np.float32
 C = _fu.speed_of_light  # m / s
 
 
@@ -40,15 +40,15 @@ class HERAArray:
     """
 
     def __init__(self, ants: dict):
-        self.ants = {k: np.asarray(v, dtype=np.float64) for k, v in ants.items()}
-        antpos = np.array(list(self.ants.values()), dtype=np.float64)
+        self.ants = {k: np.asarray(v, dtype=DTYPE_R) for k, v in ants.items()}
+        antpos = np.array(list(self.ants.values()), dtype=DTYPE_R)
 
         # Unique baselines — one representative per redundant group
         red_gps = _fu.get_pos_reds(self.ants)
         self.antpairs = np.array([gp[0] for gp in red_gps], dtype=int)  # (nbls, 2)
         self.bls = np.array(
             [self.ants[i] - self.ants[j] for i, j in self.antpairs],
-            dtype=np.float32,
+            dtype=DTYPE_R,
         )  # (nbls, 3)  metres
 
         # Grid baseline positions and change-of-basis matrix
@@ -69,7 +69,7 @@ class HERAArray:
         # Divide basis_matrix by c so the NUFFT argument is
         #   x[freq, px] = 2π * (basis_matrix @ topo)[0, px] * freq
         # where topo are dimensionless direction cosines.
-        self.basis_matrix = (basis_matrix / C).astype(np.float64)  # (3, 3)
+        self.basis_matrix = (basis_matrix / C).astype(DTYPE_R)  # (3, 3)
 
     # ------------------------------------------------------------------
     # Convenience constructors

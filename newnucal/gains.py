@@ -24,6 +24,7 @@ imposing spectral smoothness constraints on the gain itself.
 import numpy as np
 import jax.numpy as jnp
 
+DTYPE_R = jnp.float32
 
 def apply_gains(vis, log_amp, phase, phi, bls):
     """
@@ -48,10 +49,10 @@ def apply_gains(vis, log_amp, phase, phi, bls):
     vis_cal : jnp.array, same shape as *vis*
     """
     # Baseline-dependent phase: (nfreq, nbls)
-    phs_grad = jnp.einsum("xf,bx->fb", phi, bls[:, :2].astype(jnp.float32))
+    phs_grad = jnp.einsum("xf,bx->fb", phi, bls[:, :2].astype(DTYPE_R))
     # Total gain factor per (freq, baseline): amplitude × phase
-    gain = jnp.exp(log_amp[:, None].astype(jnp.float32)) * jnp.exp(
-        1j * (phase[:, None] + phs_grad).astype(jnp.float32)
+    gain = jnp.exp(log_amp[:, None].astype(DTYPE_R)) * jnp.exp(
+        1j * (phase[:, None] + phs_grad).astype(DTYPE_R)
     )  # (nfreq, nbls), complex64
 
     if vis.ndim == 3:
@@ -73,7 +74,7 @@ def init_gain_params(nfreq: int):
     params : dict with keys 'log_amp', 'phase', 'phi'
     """
     return {
-        "log_amp": jnp.zeros(nfreq, dtype=jnp.float32),
-        "phase": jnp.zeros(nfreq, dtype=jnp.float32),
-        "phi": jnp.zeros((2, nfreq), dtype=jnp.float32),
+        "log_amp": jnp.zeros(nfreq, dtype=DTYPE_R),
+        "phase": jnp.zeros(nfreq, dtype=DTYPE_R),
+        "phi": jnp.zeros((2, nfreq), dtype=DTYPE_R),
     }
