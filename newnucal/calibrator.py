@@ -161,6 +161,48 @@ class Calibrator:
     # Optimisers
     # ------------------------------------------------------------------
 
+    def fit_gains_only(self, sky_coeffs, gain_params, maxiter: int = 60, tol: float = 1e-9):
+        """
+        Optimise gain parameters with sky held fixed.
+
+        Pre-computes model visibilities from *sky_coeffs*, then minimises
+        only over {log_amp, phase, phi}.  This is faster and more stable
+        than joint optimisation when the sky model is already good.
+
+        Parameters
+        ----------
+        sky_coeffs : jnp.array, shape (npix_sky, nmodes_sky)
+            Fixed sky model (not updated during optimisation).
+        gain_params : dict
+            Initial gain parameters with keys 'log_amp', 'phase', 'phi'.
+        maxiter : int
+        tol : float
+
+        Returns
+        -------
+        gain_params : dict
+        loss : float
+        """
+        # Pre-compute model visibilities once; only differentiate through gains.
+        vis_model = jax.jit(self.fwd.simulate)(sky_coeffs, self.rot_matrices)
+
+        def gain_loss(gp):
+            vis_cal = apply_gains(vis_model, gp["log_amp"], gp["phase"], gp["phi"], self.bls)
+            return jnp.mean(jnp.abs(self.data - vis_cal) ** 2)
+
+        solver = LBFGS(
+            fun=gain_loss,
+            tol=tol,
+            maxiter=maxiter,
+            verbose=False,
+            linesearch="backtracking",
+            increase_factor=5,
+            history_size=20,
+            jit=True,
+        )
+        result = solver.run(gain_params)
+        return result.params, float(result.state.value)
+
     def fit_lbfgs(self, params, maxiter: int = 30, tol: float = 1e-7):
         """
         L-BFGS optimisation via jaxopt.
