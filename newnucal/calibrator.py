@@ -27,7 +27,7 @@ from jaxopt import LBFGS
 
 from .array import HERAArray
 from .beam import BeamModel
-from .dpss import dpss_matrix
+from .dpss import dpss_matrix, dpss_project
 from .simulate import ForwardModel
 from .gains import apply_gains, init_gain_params
 
@@ -75,6 +75,13 @@ class Calibrator:
         self.rot_matrices = jnp.array(rot_matrices, dtype=DTYPE_R)
         self.data = jnp.array(data, dtype=DTYPE_C)
         self.bls = jnp.array(array.bls, dtype=DTYPE_R)
+
+        # Store constructor args needed for sub-Calibrators in fit_progressive
+        self._array = array
+        self._beam_model = beam_model
+        self._sky_eta_max = sky_eta_max
+        self._sky_eigenval_cutoff = sky_eigenval_cutoff
+        self._eps = eps
 
         # Sky DPSS matrix
         self.A_sky = dpss_matrix(
@@ -267,6 +274,258 @@ class Calibrator:
         )
         result = solver.run(gain_params)
         return result.params, float(result.state.value)
+
+    def fit_sky_only(self, sky_coeffs, gain_params, maxiter: int = 30, tol: float = 1e-7):
+        """
+        Optimise sky coefficients with gains held fixed.
+
+        Pre-applies the inverse gain to the data, then differentiates only
+        through the sky NUFFT.  This halves the parameter space vs joint
+        L-BFGS and avoids computing gain gradients (which are trivial anyway).
+
+        Parameters
+        ----------
+        sky_coeffs : jnp.array, shape (npix_sky, nmodes_sky)
+        gain_params : dict  with keys log_amp, phase, phi
+        maxiter : int
+        tol : float
+
+        Returns
+        -------
+        sky_coeffs : jnp.array
+        loss : float
+        """
+        # Pre-apply inverse gain to data so the sky loss is gain-free.
+        inv_gain_params = {
+            "log_amp": -gain_params["log_amp"],
+            "phase":   -gain_params["phase"],
+            "phi":     -gain_params["phi"],
+        }
+        data_cal = apply_gains(self.data, inv_gain_params["log_amp"],
+                               inv_gain_params["phase"], inv_gain_params["phi"],
+                               self.bls)
+
+        def sky_loss(sc):
+            vis_model = self.fwd.simulate(sc, self.rot_matrices)
+            return jnp.mean(jnp.abs(data_cal - vis_model) ** 2)
+
+        solver = LBFGS(
+            fun=sky_loss,
+            tol=tol,
+            maxiter=maxiter,
+            verbose=False,
+            linesearch="backtracking",
+            increase_factor=5,
+            history_size=10,
+            jit=True,
+        )
+        result = solver.run(sky_coeffs)
+        sky_new = result.params
+        loss = float(self._jit_loss({"sky_coeffs": sky_new, **gain_params}))
+        return sky_new, loss
+
+    def fit_alternating(
+        self,
+        sky_coeffs,
+        gain_params,
+        n_outer: int = 10,
+        sky_maxiter: int = 10,
+        sky_tol: float = 1e-7,
+        verbose: bool = False,
+    ):
+        """
+        Alternating minimisation: exact gain solve + sky gradient steps.
+
+        Each outer iteration:
+          1. Sky step  — L-BFGS on sky_coeffs only (gradient, NUFFT fwd+bwd)
+          2. Gain step — analytic linear solve      (no gradient, NUFFT fwd only)
+
+        This is the major/minor cycle structure from radio interferometry.
+        Gain steps cost ~half a sky step (no NUFFT backward) and give the
+        exact optimal gains for the current sky rather than a small nudge.
+
+        Parameters
+        ----------
+        sky_coeffs : jnp.array
+        gain_params : dict
+        n_outer : int
+            Number of alternating cycles.
+        sky_maxiter : int
+            L-BFGS iterations per sky step.
+        verbose : bool
+
+        Returns
+        -------
+        sky_coeffs : jnp.array
+        gain_params : dict
+        loss : float
+        """
+        loss = float(self._jit_loss({"sky_coeffs": sky_coeffs, **gain_params}))
+        try:
+            for i in range(n_outer):
+                sky_coeffs, _  = self.fit_sky_only(sky_coeffs, gain_params, maxiter=sky_maxiter, tol=sky_tol)
+                gain_params, loss = self.fit_gains_linear(sky_coeffs)
+                if verbose:
+                    print(f"  outer {i:03d}: loss={loss:.4e}")
+        except KeyboardInterrupt:
+            if verbose:
+                print(f"  Fitting loop manually terminated.")
+        return sky_coeffs, gain_params, loss
+
+    def fit_progressive(
+        self,
+        sky_coeffs,
+        gain_params,
+        nside_schedule=None,
+        outer_per_level=None,
+        sky_maxiter_per_level=None,
+        eps_per_level=None,
+        verbose: bool = False,
+    ):
+        """
+        Multi-resolution coarse-to-fine alternating calibration.
+
+        Runs ``fit_alternating`` at successively finer sky resolutions.
+        Coarse levels are cheap (NUFFT cost ∝ npix_sky) and quickly drive
+        the gain and large-scale sky parameters near the correct solution;
+        finer levels then refine small-scale structure.
+
+        Sky coefficients are transferred between levels by:
+          1. Reconstruct full-frequency sky map from DPSS coefficients.
+          2. Resample to new nside with ``healpy.ud_grade``.
+          3. Re-project onto the new DPSS basis with ``dpss_project``.
+
+        Gain parameters are dimensionless scalars per frequency and transfer
+        directly without modification.
+
+        Parameters
+        ----------
+        sky_coeffs : jnp.array, shape (npix_sky_final, nmodes_sky)
+            Initial sky at the *final* (finest) nside.  Downgraded internally
+            for coarser levels.
+        gain_params : dict  with keys log_amp, phase, phi
+        nside_schedule : list[int], optional
+            nside values to use, coarse to fine.  The last entry must equal
+            ``self.fwd.sky_nside``.  Defaults to a geometric sequence from
+            nside=8 up to the final nside (doubling each step).
+        outer_per_level : list[int], optional
+            Number of alternating outer iterations at each level.
+            Default: 5 for coarse levels, 10 for the final level.
+        sky_maxiter_per_level : list[int], optional
+            L-BFGS iterations per sky step at each level.
+            Default: 10 for all levels.
+        eps_per_level : list[float], optional
+            NUFFT accuracy at each level.  Coarser levels can tolerate lower
+            accuracy (e.g., 1e-4) for extra speed.
+            Default: ``self._eps`` at all levels.
+        verbose : bool
+
+        Returns
+        -------
+        sky_coeffs : jnp.array, shape (npix_sky_final, nmodes_sky)
+        gain_params : dict
+        loss : float
+        """
+        import healpy as hp
+        import numpy as np
+
+        final_nside = self.fwd.sky_nside
+
+        # ---- build default schedule ----------------------------------------
+        if nside_schedule is None:
+            nside = 8
+            nside_schedule = []
+            while nside < final_nside:
+                nside_schedule.append(nside)
+                nside *= 2
+            nside_schedule.append(final_nside)
+
+        nlevels = len(nside_schedule)
+
+        if outer_per_level is None:
+            outer_per_level = [5] * (nlevels - 1) + [10]
+        if sky_maxiter_per_level is None:
+            sky_maxiter_per_level = [10] * nlevels
+        if eps_per_level is None:
+            eps_per_level = [self._eps] * nlevels
+
+        assert nside_schedule[-1] == final_nside, (
+            f"Last nside in schedule ({nside_schedule[-1]}) must equal "
+            f"the calibrator's sky_nside ({final_nside})"
+        )
+
+        # ---- reconstruct flux map at final nside from initial sky_coeffs ---
+        # sky_coeffs: (npix_final, nmodes); A_sky: (nfreq, nmodes)
+        # flux_map_final: (npix_final, nfreq)
+        flux_map_final = np.array(sky_coeffs) @ np.array(self.A_sky).T  # (npix_final, nfreq)
+
+        # ---- iterate over levels -------------------------------------------
+        for lvl, nside_lvl in enumerate(nside_schedule):
+            npix_lvl = hp.nside2npix(nside_lvl)
+            n_outer    = outer_per_level[lvl]
+            sky_maxiter = sky_maxiter_per_level[lvl]
+            eps_lvl    = eps_per_level[lvl]
+            is_final   = (nside_lvl == final_nside)
+
+            if verbose:
+                print(f"[progressive] nside={nside_lvl:4d}  npix={npix_lvl:6d}  "
+                      f"n_outer={n_outer}  sky_maxiter={sky_maxiter}  eps={eps_lvl:.0e}")
+
+            # Downgrade flux map to current nside
+            if nside_lvl == final_nside:
+                flux_map_lvl = flux_map_final          # (npix_final, nfreq)
+            else:
+                # ud_grade expects (npix,) maps; apply per-frequency
+                flux_map_lvl = np.stack(
+                    [hp.ud_grade(flux_map_final[:, f], nside_lvl) for f in range(self.nfreq)],
+                    axis=1,
+                )  # (npix_lvl, nfreq)
+
+            # Project onto DPSS basis at this level (same freqs, same A_sky)
+            sky_coeffs_lvl = jnp.array(
+                dpss_project(flux_map_lvl, np.array(self.A_sky)), dtype=DTYPE_R
+            )  # (npix_lvl, nmodes_sky)
+
+            # Build sub-Calibrator at this nside/eps
+            if is_final:
+                sub_cal = self
+            else:
+                sub_cal = Calibrator(
+                    self._array,
+                    self._beam_model,
+                    nside_lvl,
+                    self._sky_eta_max,
+                    np.array(self.freqs),
+                    np.array(self.rot_matrices),
+                    np.array(self.data),
+                    sky_eigenval_cutoff=self._sky_eigenval_cutoff,
+                    eps=eps_lvl,
+                )
+
+            # Run alternating minimisation at this level
+            sky_coeffs_lvl, gain_params, loss = sub_cal.fit_alternating(
+                sky_coeffs_lvl,
+                gain_params,
+                n_outer=n_outer,
+                sky_maxiter=sky_maxiter,
+                verbose=verbose,
+            )
+
+            if verbose:
+                print(f"  → loss after nside={nside_lvl}: {loss:.4e}")
+
+            # Upscale flux map for next level (or return at final level)
+            if not is_final:
+                # Reconstruct flux map from optimised coefficients at this level
+                flux_map_final = np.array(sky_coeffs_lvl) @ np.array(self.A_sky).T
+                # ud_grade back to final nside (fills in missing detail with nearest-neighbour)
+                flux_map_final = np.stack(
+                    [hp.ud_grade(flux_map_final[:, f], final_nside) for f in range(self.nfreq)],
+                    axis=1,
+                )  # (npix_final, nfreq)
+
+        # sky_coeffs_lvl is now at final_nside (sub_cal is self for last level)
+        return sky_coeffs_lvl, gain_params, loss
 
     def fit_lbfgs(self, params, maxiter: int = 30, tol: float = 1e-7):
         """
