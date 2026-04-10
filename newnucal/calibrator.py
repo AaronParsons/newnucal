@@ -20,6 +20,8 @@ The loss is  mean |V_data - gain * V_model|^2  summed over time, frequency,
 and baselines.
 """
 
+import signal as _signal
+
 import jax
 import jax.numpy as jnp
 import optax
@@ -33,6 +35,52 @@ from .gains import apply_gains, init_gain_params
 
 DTYPE_R = jnp.float32
 DTYPE_C = jnp.complex64
+
+
+class _StopFitFlag:
+    """
+    SIGINT-driven graceful stop flag for fit loops.
+
+    Install as a SIGINT handler: ``signal.signal(SIGINT, flag)``.
+    After receiving SIGINT the flag is set and the current JAX computation
+    is allowed to finish.  Fit loops check ``flag.stop`` after each
+    complete iteration.
+
+    Calling code in a non-main thread (e.g. pytest workers) cannot install
+    signal handlers; the flag then acts as a plain False sentinel.
+    """
+
+    def __init__(self):
+        self.stop = False
+
+    def __call__(self, signum, frame):
+        self.stop = True
+        print(
+            "\n  [stop requested — finishing current iteration and returning]",
+            flush=True,
+        )
+
+    @staticmethod
+    def install(flag):
+        """
+        Try to install *flag* as the SIGINT handler.
+
+        Returns the previous handler, or None if installation failed
+        (non-main thread, unsupported platform, etc.).
+        """
+        try:
+            return _signal.signal(_signal.SIGINT, flag)
+        except (ValueError, OSError):
+            return None
+
+    @staticmethod
+    def restore(old_handler):
+        """Restore a previous SIGINT handler returned by ``install``."""
+        if old_handler is not None:
+            try:
+                _signal.signal(_signal.SIGINT, old_handler)
+            except (ValueError, OSError):
+                pass
 
 
 class Calibrator:
@@ -332,6 +380,7 @@ class Calibrator:
         sky_maxiter: int = 10,
         sky_tol: float = 1e-7,
         verbose: bool = False,
+        _stop_flag=None,
     ):
         """
         Alternating minimisation: exact gain solve + sky gradient steps.
@@ -344,6 +393,10 @@ class Calibrator:
         Gain steps cost ~half a sky step (no NUFFT backward) and give the
         exact optimal gains for the current sky rather than a small nudge.
 
+        Pressing Ctrl-C (SIGINT) sets a stop flag that is checked after each
+        complete outer iteration, so the last full sky+gain state is always
+        returned cleanly.
+
         Parameters
         ----------
         sky_coeffs : jnp.array
@@ -353,6 +406,9 @@ class Calibrator:
         sky_maxiter : int
             L-BFGS iterations per sky step.
         verbose : bool
+        _stop_flag : _StopFitFlag or None
+            Internal: shared stop flag injected by ``fit_progressive``.
+            When None a private flag is installed as the SIGINT handler.
 
         Returns
         -------
@@ -360,16 +416,26 @@ class Calibrator:
         gain_params : dict
         loss : float
         """
-        loss = float(self._jit_loss({"sky_coeffs": sky_coeffs, **gain_params}))
+        # Install SIGINT handler if we own it (standalone call)
+        if _stop_flag is None:
+            stop = _StopFitFlag()
+            old_handler = _StopFitFlag.install(stop)
+        else:
+            stop = _stop_flag
+            old_handler = None  # caller owns the handler
+
         try:
+            loss = float(self._jit_loss({"sky_coeffs": sky_coeffs, **gain_params}))
             for i in range(n_outer):
-                sky_coeffs, _  = self.fit_sky_only(sky_coeffs, gain_params, maxiter=sky_maxiter, tol=sky_tol)
+                sky_coeffs, _ = self.fit_sky_only(sky_coeffs, gain_params, maxiter=sky_maxiter, tol=sky_tol)
                 gain_params, loss = self.fit_gains_linear(sky_coeffs)
                 if verbose:
                     print(f"  outer {i:03d}: loss={loss:.4e}")
-        except KeyboardInterrupt:
-            if verbose:
-                print(f"  Fitting loop manually terminated.")
+                if stop.stop:
+                    break
+        finally:
+            if _stop_flag is None:
+                _StopFitFlag.restore(old_handler)
         return sky_coeffs, gain_params, loss
 
     def fit_progressive(
@@ -397,6 +463,12 @@ class Calibrator:
 
         Gain parameters are dimensionless scalars per frequency and transfer
         directly without modification.
+
+        **Interrupt handling**: pressing Ctrl-C (SIGINT) at any point sets a
+        shared stop flag.  The running L-BFGS iteration completes, then the
+        current sky is upscaled to the final nside (if stopped at a coarse
+        level) and the method returns the best state so far.  A single Ctrl-C
+        is enough regardless of which level is active.
 
         Parameters
         ----------
@@ -430,6 +502,7 @@ class Calibrator:
         import numpy as np
 
         final_nside = self.fwd.sky_nside
+        A_sky_np = np.array(self.A_sky)
 
         # ---- build default schedule ----------------------------------------
         if nside_schedule is None:
@@ -454,77 +527,100 @@ class Calibrator:
             f"the calibrator's sky_nside ({final_nside})"
         )
 
+        # ---- shared stop flag + SIGINT handler -----------------------------
+        stop = _StopFitFlag()
+        old_handler = _StopFitFlag.install(stop)
+
         # ---- reconstruct flux map at final nside from initial sky_coeffs ---
         # sky_coeffs: (npix_final, nmodes); A_sky: (nfreq, nmodes)
         # flux_map_final: (npix_final, nfreq)
-        flux_map_final = np.array(sky_coeffs) @ np.array(self.A_sky).T  # (npix_final, nfreq)
+        flux_map_final = np.array(sky_coeffs) @ A_sky_np.T  # (npix_final, nfreq)
+        sky_coeffs_lvl = sky_coeffs   # initialise so it's always defined
+        loss = float(self._jit_loss({"sky_coeffs": sky_coeffs, **gain_params}))
 
-        # ---- iterate over levels -------------------------------------------
-        for lvl, nside_lvl in enumerate(nside_schedule):
-            npix_lvl = hp.nside2npix(nside_lvl)
-            n_outer    = outer_per_level[lvl]
-            sky_maxiter = sky_maxiter_per_level[lvl]
-            eps_lvl    = eps_per_level[lvl]
-            is_final   = (nside_lvl == final_nside)
+        try:
+            # ---- iterate over levels ---------------------------------------
+            for lvl, nside_lvl in enumerate(nside_schedule):
+                npix_lvl    = hp.nside2npix(nside_lvl)
+                n_outer     = outer_per_level[lvl]
+                sky_maxiter = sky_maxiter_per_level[lvl]
+                eps_lvl     = eps_per_level[lvl]
+                is_final    = (nside_lvl == final_nside)
 
-            if verbose:
-                print(f"[progressive] nside={nside_lvl:4d}  npix={npix_lvl:6d}  "
-                      f"n_outer={n_outer}  sky_maxiter={sky_maxiter}  eps={eps_lvl:.0e}")
+                if verbose:
+                    print(f"[progressive] nside={nside_lvl:4d}  npix={npix_lvl:6d}  "
+                          f"n_outer={n_outer}  sky_maxiter={sky_maxiter}  eps={eps_lvl:.0e}")
 
-            # Downgrade flux map to current nside
-            if nside_lvl == final_nside:
-                flux_map_lvl = flux_map_final          # (npix_final, nfreq)
-            else:
-                # ud_grade expects (npix,) maps; apply per-frequency
-                flux_map_lvl = np.stack(
-                    [hp.ud_grade(flux_map_final[:, f], nside_lvl) for f in range(self.nfreq)],
-                    axis=1,
-                )  # (npix_lvl, nfreq)
+                # Downgrade flux map to current nside
+                if is_final:
+                    flux_map_lvl = flux_map_final       # (npix_final, nfreq)
+                else:
+                    flux_map_lvl = np.stack(
+                        [hp.ud_grade(flux_map_final[:, f], nside_lvl)
+                         for f in range(self.nfreq)],
+                        axis=1,
+                    )  # (npix_lvl, nfreq)
 
-            # Project onto DPSS basis at this level (same freqs, same A_sky)
-            sky_coeffs_lvl = jnp.array(
-                dpss_project(flux_map_lvl, np.array(self.A_sky)), dtype=DTYPE_R
-            )  # (npix_lvl, nmodes_sky)
+                # Project onto DPSS basis at this level (A_sky is frequency-only)
+                sky_coeffs_lvl = jnp.array(
+                    dpss_project(flux_map_lvl, A_sky_np), dtype=DTYPE_R
+                )  # (npix_lvl, nmodes_sky)
 
-            # Build sub-Calibrator at this nside/eps
-            if is_final:
-                sub_cal = self
-            else:
-                sub_cal = Calibrator(
-                    self._array,
-                    self._beam_model,
-                    nside_lvl,
-                    self._sky_eta_max,
-                    np.array(self.freqs),
-                    np.array(self.rot_matrices),
-                    np.array(self.data),
-                    sky_eigenval_cutoff=self._sky_eigenval_cutoff,
-                    eps=eps_lvl,
+                # Build sub-Calibrator at this nside/eps
+                if is_final:
+                    sub_cal = self
+                else:
+                    sub_cal = Calibrator(
+                        self._array,
+                        self._beam_model,
+                        nside_lvl,
+                        self._sky_eta_max,
+                        np.array(self.freqs),
+                        np.array(self.rot_matrices),
+                        np.array(self.data),
+                        sky_eigenval_cutoff=self._sky_eigenval_cutoff,
+                        eps=eps_lvl,
+                    )
+
+                # Run alternating minimisation — shares the stop flag so one
+                # Ctrl-C stops both the inner loop and this outer loop.
+                sky_coeffs_lvl, gain_params, loss = sub_cal.fit_alternating(
+                    sky_coeffs_lvl,
+                    gain_params,
+                    n_outer=n_outer,
+                    sky_maxiter=sky_maxiter,
+                    verbose=verbose,
+                    _stop_flag=stop,
                 )
 
-            # Run alternating minimisation at this level
-            sky_coeffs_lvl, gain_params, loss = sub_cal.fit_alternating(
-                sky_coeffs_lvl,
-                gain_params,
-                n_outer=n_outer,
-                sky_maxiter=sky_maxiter,
-                verbose=verbose,
-            )
+                if verbose:
+                    print(f"  → loss after nside={nside_lvl}: {loss:.4e}")
 
+                # Upscale flux map for next level (also used on early exit)
+                if not is_final:
+                    flux_map_final = np.array(sky_coeffs_lvl) @ A_sky_np.T
+                    flux_map_final = np.stack(
+                        [hp.ud_grade(flux_map_final[:, f], final_nside)
+                         for f in range(self.nfreq)],
+                        axis=1,
+                    )  # (npix_final, nfreq)
+
+                if stop.stop:
+                    break   # exit level loop; upscaling handled below
+
+        finally:
+            _StopFitFlag.restore(old_handler)
+
+        # ---- if stopped at a coarse level, upscale sky to final nside ------
+        if stop.stop and sky_coeffs_lvl.shape[0] != hp.nside2npix(final_nside):
             if verbose:
-                print(f"  → loss after nside={nside_lvl}: {loss:.4e}")
+                print(f"[progressive] Upscaling sky from nside={nside_lvl} "
+                      f"→ nside={final_nside} before returning.")
+            sky_coeffs_lvl = jnp.array(
+                dpss_project(flux_map_final, A_sky_np), dtype=DTYPE_R
+            )
+            loss = float(self._jit_loss({"sky_coeffs": sky_coeffs_lvl, **gain_params}))
 
-            # Upscale flux map for next level (or return at final level)
-            if not is_final:
-                # Reconstruct flux map from optimised coefficients at this level
-                flux_map_final = np.array(sky_coeffs_lvl) @ np.array(self.A_sky).T
-                # ud_grade back to final nside (fills in missing detail with nearest-neighbour)
-                flux_map_final = np.stack(
-                    [hp.ud_grade(flux_map_final[:, f], final_nside) for f in range(self.nfreq)],
-                    axis=1,
-                )  # (npix_final, nfreq)
-
-        # sky_coeffs_lvl is now at final_nside (sub_cal is self for last level)
         return sky_coeffs_lvl, gain_params, loss
 
     def fit_lbfgs(self, params, maxiter: int = 30, tol: float = 1e-7):
