@@ -464,10 +464,14 @@ class Calibrator:
                 least once every *N* non-sky steps.  ``0`` disables the cap.
             ``'beam_max'`` (int, default 0): hard cap — force a beam step at
                 least once every *N* non-beam steps.  ``0`` disables the cap.
+            ``'beam_polish_max'`` (int, default 25): hard cap — force beam
+                polish after at most *N* beam dirty steps since the last
+                polish.  ``0`` disables the cap.
             ``'polish_sky'`` (int, default 0): L-BFGS sky polish every *N*
                 steps (cadence-only, not adaptive).
             ``'polish_beam'`` (int, default 0): additional fixed-cadence beam
-                polish every *N* beam steps (OR'd with the adaptive trigger).
+                polish every *N* beam steps counted from zero (OR'd with the
+                adaptive and cap triggers).
         beam_aa_start : int
             Beam steps before Anderson acceleration is enabled for beam
             iterations.  Default of 1 skips AA on the very first beam step
@@ -475,13 +479,14 @@ class Calibrator:
         """
         if solve_every is None:
             solve_every = {}
-        gains_max_every   = solve_every.get('gains',       1)
-        sky_max_every     = solve_every.get('sky_max',     0)
-        beam_max_every    = solve_every.get('beam_max',    0)
-        _gains_enabled    = (gains_max_every != 0)
-        _beam_enabled     = (solve_every.get('beam',       1) != 0)
-        polish_sky_every  = solve_every.get('polish_sky',  0)
-        polish_beam_every = solve_every.get('polish_beam', 0)
+        gains_max_every      = solve_every.get('gains',          1)
+        sky_max_every        = solve_every.get('sky_max',        0)
+        beam_max_every       = solve_every.get('beam_max',       0)
+        beam_polish_max_every = solve_every.get('beam_polish_max', 25)
+        _gains_enabled       = (gains_max_every != 0)
+        _beam_enabled        = (solve_every.get('beam',          1) != 0)
+        polish_sky_every     = solve_every.get('polish_sky',     0)
+        polish_beam_every    = solve_every.get('polish_beam',    0)
 
         if beam_anderson_history is None:
             beam_anderson_history = anderson_history
@@ -507,19 +512,22 @@ class Calibrator:
         beam_aa_step = 0
 
         # Efficiency tracking: EMA of Δloss / second per step type.
-        _eff_sky         = None   # sky dirty efficiency
-        _eff_beam        = None   # beam dirty efficiency
-        _eff_gains       = None   # gains efficiency
-        _polish_eff_beam = None   # beam polish efficiency (set after first polish)
+        _eff_sky          = None   # sky dirty efficiency
+        _eff_beam         = None   # beam dirty efficiency
+        _eff_gains        = None   # gains efficiency
+        _eff_beam_polish  = None   # beam polish efficiency (set after first polish)
 
-        _n_sky    = 0   # sky steps taken
-        _n_beam   = 0   # beam steps taken
-        _n_gains  = 0   # gains steps taken
+        _n_sky          = 0   # sky steps taken
+        _n_beam         = 0   # beam steps taken
+        _n_gains        = 0   # gains steps taken
+        _n_beam_polish  = 0   # beam polish steps taken
 
         # Steps-since-last for each type; used to enforce hard caps.
-        _n_since_sky   = 0
-        _n_since_beam  = 0
-        _n_since_gains = 0
+        _n_since_sky              = 0
+        _n_since_beam             = 0
+        _n_since_gains            = 0
+        _n_since_beam_polish      = 0  # total steps (any type) since last beam polish
+        _n_beam_since_beam_polish = 0  # beam dirty steps since last polish (cadence)
 
         # True when beam_coeffs has been dirty-updated but cache not yet synced.
         # The cached-beam JIT (_jit_loss, _jit_val_grad) must not be called
@@ -567,10 +575,12 @@ class Calibrator:
                 if stop.stop:
                     break
 
-                # --- Choose step type (adaptive 3-way: sky / beam / gains) ---
+                _n_since_beam_polish += 1
+
+                # --- Choose step type (adaptive 4-way: sky/beam/gains/beam_polish) ---
                 # Hard caps: any type that is overdue gets forced.  When more
                 # than one is overdue, pick the most-starved (highest overage
-                # ratio); ties broken sky > beam > gains.
+                # ratio); ties broken sky > beam > gains > beam_polish.
                 _overdue = {}
                 if sky_max_every > 0 and _n_since_sky >= sky_max_every:
                     _overdue['sky']   = _n_since_sky   / sky_max_every
@@ -578,11 +588,18 @@ class Calibrator:
                     _overdue['beam']  = _n_since_beam  / beam_max_every
                 if _gains_enabled and gains_max_every > 0 and _n_since_gains >= gains_max_every:
                     _overdue['gains'] = _n_since_gains / gains_max_every
+                if _beam_enabled and beam_polish_max_every > 0 and _n_since_beam_polish >= beam_polish_max_every:
+                    _overdue['beam_polish'] = _n_since_beam_polish / beam_polish_max_every
+                if (_beam_enabled and polish_beam_every > 0
+                        and _n_beam_since_beam_polish > 0
+                        and _n_beam_since_beam_polish % polish_beam_every == 0):
+                    _overdue['beam_polish'] = max(_overdue.get('beam_polish', 0.0), 1.0)
 
                 if _overdue:
                     _step_type = max(_overdue, key=_overdue.get)
                 # Warm-up: collect one measurement per type before going adaptive.
                 # Gains first: sky and beam benefit from calibrated gains.
+                # beam_polish excluded from warm-up — first fires via hard cap only.
                 elif _eff_gains is None and _gains_enabled:
                     _step_type = 'gains'
                 elif _eff_sky is None:
@@ -596,10 +613,14 @@ class Calibrator:
                         _cands['beam']  = _eff_beam or 0.0
                     if _gains_enabled:
                         _cands['gains'] = _eff_gains or 0.0
+                    # beam_polish enters adaptive pool only after first measurement
+                    if _beam_enabled and _eff_beam_polish is not None:
+                        _cands['beam_polish'] = _eff_beam_polish or 0.0
                     _step_type = max(_cands, key=_cands.get)
 
-                _do_sky   = (_step_type == 'sky')
-                _do_gains = (_step_type == 'gains')
+                _do_sky         = (_step_type == 'sky')
+                _do_gains       = (_step_type == 'gains')
+                _do_beam_polish = (_step_type == 'beam_polish')
 
                 # ============================================================
                 # GAINS STEP
@@ -732,14 +753,15 @@ class Calibrator:
                                     loss_next = loss_cand
                                     used_aa   = True
 
-                    beam_coeffs         = beam_next
-                    loss                = loss_next
-                    beam_aa_step       += 1
-                    _n_beam            += 1
-                    _n_since_sky       += 1
-                    _n_since_beam       = 0
-                    _n_since_gains     += 1
-                    _beam_dirty_pending = True
+                    beam_coeffs               = beam_next
+                    loss                      = loss_next
+                    beam_aa_step             += 1
+                    _n_beam                  += 1
+                    _n_since_sky             += 1
+                    _n_since_beam             = 0
+                    _n_since_gains           += 1
+                    _n_beam_since_beam_polish += 1
+                    _beam_dirty_pending       = True
 
                     dt    = max(_time.perf_counter() - t_step, 1e-3)
                     dloss = max(0.0, loss_pre - loss)
@@ -752,64 +774,47 @@ class Calibrator:
                         print(f'    [beam {tag} {_n_beam - 1:03d}]: '
                               f'loss={loss:.4e}  eff={eff:.2e} Δloss/s')
 
-                    # --- Beam polish trigger ---
-                    _do_polish = False
-                    _reason    = ''
-
-                    # Cost-aware: fire when estimated polish efficiency > dirty
-                    # efficiency.  Only active after at least one polish.
-                    if _polish_eff_beam is not None:
-                        dirty_eff = max(_eff_sky or 0.0, _eff_beam or 0.0)
-                        if _polish_eff_beam > dirty_eff:
-                            _do_polish = True
-                            _reason = (f'cost-aware (polish={_polish_eff_beam:.2e}'
-                                       f' > dirty={dirty_eff:.2e} Δloss/s)')
-
-                    # Fallback before first polish: relative-improvement threshold.
-                    if (not _do_polish and _polish_eff_beam is None
-                            and beam_polish_rel_tol is not None):
-                        beam_rel = dloss / (loss_pre + 1e-30)
-                        if beam_rel < beam_polish_rel_tol:
-                            _do_polish = True
-                            _reason = (f'adaptive (rel_impr={beam_rel:.3f}'
-                                       f' < {beam_polish_rel_tol})')
-
-                    # Fixed-cadence trigger (always active, OR'd with above).
-                    if (not _do_polish and polish_beam_every > 0
-                            and _n_beam % polish_beam_every == 0):
-                        _do_polish = True
-                        _reason = 'cadence'
-
-                    if _do_polish:
-                        if _beam_dirty_pending:
-                            _sync_beam_cache()
-                        loss_pre_polish = loss
-                        t_polish = _time.perf_counter()
-                        if verbose:
-                            print(f'    [polish_beam ({_reason})]: '
-                                  f'starting L-BFGS beam polish ...')
-                        bp, loss = self.fit_beam_only(
-                            {'sky_coeffs': sky_coeffs,
-                             'beam_coeffs': beam_coeffs,
-                             **gain_params},
-                            maxiter=beam_polish_maxiter, tol=1e-7,
-                        )
-                        beam_coeffs = bp['beam_coeffs']
-                        # fit_beam_only updates the cache and recompiles internally.
-                        dt_polish    = max(_time.perf_counter() - t_polish, 1e-3)
-                        dloss_polish = max(0.0, loss_pre_polish - loss)
-                        polish_eff   = dloss_polish / dt_polish
-                        _polish_eff_beam = (
-                            polish_eff if _polish_eff_beam is None
-                            else eff_alpha * polish_eff + (1.0 - eff_alpha) * _polish_eff_beam
-                        )
-                        # Reset beam AA and force re-measurement of beam efficiency
-                        # (the fixed-point map has shifted after polish).
-                        beam_hist_g.clear(); beam_hist_f.clear(); beam_aa_step = 0
-                        _eff_beam = None
-                        if verbose:
-                            print(f'    [polish_beam]: loss={loss:.4e}  '
-                                  f'polish_eff={polish_eff:.2e} Δloss/s')
+                # ============================================================
+                # BEAM POLISH STEP
+                # ============================================================
+                elif _do_beam_polish:
+                    if _beam_dirty_pending:
+                        _sync_beam_cache()
+                    t_step   = _time.perf_counter()
+                    loss_pre = loss
+                    if verbose:
+                        print(f'    [beam_polish {_n_beam_polish:03d}]: '
+                              f'starting L-BFGS beam polish ...')
+                    bp, loss = self.fit_beam_only(
+                        {'sky_coeffs': sky_coeffs,
+                         'beam_coeffs': beam_coeffs,
+                         **gain_params},
+                        maxiter=beam_polish_maxiter, tol=1e-7,
+                    )
+                    beam_coeffs = bp['beam_coeffs']
+                    # fit_beam_only updates the cache and recompiles internally.
+                    dt    = max(_time.perf_counter() - t_step, 1e-3)
+                    dloss = max(0.0, loss_pre - loss)
+                    eff   = dloss / dt
+                    # Fast-decay, slow-rise EMA: immediately believe a lower
+                    # measurement to avoid consecutive polish cascade.
+                    if _eff_beam_polish is None:
+                        _eff_beam_polish = eff
+                    else:
+                        _ema = eff_alpha * eff + (1.0 - eff_alpha) * _eff_beam_polish
+                        _eff_beam_polish = min(_ema, eff)
+                    # Reset beam AA and re-measure beam efficiency from scratch.
+                    beam_hist_g.clear(); beam_hist_f.clear(); beam_aa_step = 0
+                    _eff_beam = None
+                    _n_beam_polish            += 1
+                    _n_since_beam_polish       = 0
+                    _n_beam_since_beam_polish  = 0
+                    _n_since_sky              += 1
+                    _n_since_beam             += 1
+                    _n_since_gains            += 1
+                    if verbose:
+                        print(f'    [beam_polish {_n_beam_polish - 1:03d}]: '
+                              f'loss={loss:.4e}  eff={eff:.2e} Δloss/s')
 
                 # --- Optional sky polish (cadence only) ---
                 if polish_sky_every > 0 and (step + 1) % polish_sky_every == 0:
@@ -827,11 +832,13 @@ class Calibrator:
 
                 if verbose:
                     elapsed = _time.perf_counter() - _t0
-                    eff_s = f'{_eff_sky:.2e}'   if _eff_sky   is not None else ' N/A  '
-                    eff_b = f'{_eff_beam:.2e}'  if _eff_beam  is not None else ' N/A  '
-                    eff_g = f'{_eff_gains:.2e}' if _eff_gains is not None else ' N/A  '
-                    print(f'  step {step:04d} [{_step_type:<5}]: loss={loss:.4e}'
-                          f'  eff[sky={eff_s} beam={eff_b} gains={eff_g}]  t={elapsed:.1f}s')
+                    eff_s  = f'{_eff_sky:.2e}'          if _eff_sky          is not None else ' N/A  '
+                    eff_b  = f'{_eff_beam:.2e}'         if _eff_beam         is not None else ' N/A  '
+                    eff_g  = f'{_eff_gains:.2e}'        if _eff_gains        is not None else ' N/A  '
+                    eff_bp = f'{_eff_beam_polish:.2e}'  if _eff_beam_polish  is not None else ' N/A  '
+                    print(f'  step {step:04d} [{_step_type:<11}]: loss={loss:.4e}'
+                          f'  eff[sky={eff_s} beam={eff_b} gains={eff_g} polish={eff_bp}]'
+                          f'  t={elapsed:.1f}s')
 
                 if stop.stop:
                     break
