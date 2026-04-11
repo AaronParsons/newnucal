@@ -420,11 +420,9 @@ class Calibrator:
         beam_aa_max_weight: float = 10.0,
         sky_block_len: int = 1,
         beam_block_len: int = 1,
-        gains_every_cycle: int | None = None,
         polish_maxiter: int = 5,
         zenith_cut_scale: float | None = None,
         solve_every: dict | None = None,
-        beam_maxiter: int = 3,
         beam_step_size: float = 0.5,
         beam_sky_reg: float = 1e-3,
         verbose: bool = False,
@@ -447,9 +445,6 @@ class Calibrator:
             Number of consecutive sky dirty steps per cycle.
         beam_block_len : int
             Number of consecutive beam dirty steps per scheduled beam cycle.
-        gains_every_cycle : int or None
-            If given, overrides ``solve_every['gains']`` and solves gains every
-            ``gains_every_cycle`` cycles.
         solve_every : dict or None
             Controls how often gains / beam / polish blocks are triggered. Keys:
 
@@ -462,7 +457,7 @@ class Calibrator:
         """
         if solve_every is None:
             solve_every = {}
-        gains_every = gains_every_cycle if gains_every_cycle is not None else solve_every.get('gains', 1)
+        gains_every = solve_every.get('gains', 1)
         beam_every = solve_every.get('beam', 1)
         polish_every = solve_every.get('polish', 0)
 
@@ -491,6 +486,16 @@ class Calibrator:
             old_handler = None
         if zenith_cut_scale is not None:
             self.fwd.precompute_time_geometry(self.rot_matrices, zenith_cut_scale=zenith_cut_scale)
+
+        # Persist Anderson histories across cycles. These should only be reset
+        # when the underlying fixed-point map changes substantially (for example
+        # after a polish step), not merely because a new cycle starts.
+        sky_hist_g = []
+        sky_hist_f = []
+        beam_hist_g = []
+        beam_hist_f = []
+        sky_aa_step = 0
+        beam_aa_step = 0
 
         def _full_params(sky, beam, gains):
             return {'sky_coeffs': sky, 'beam_coeffs': beam, **gains}
@@ -524,8 +529,6 @@ class Calibrator:
                         print(f'    [gains]: loss={_gl:.4e}')
 
                 # --- sky block ---
-                sky_hist_g = []
-                sky_hist_f = []
                 sky_block_used_aa = 0
                 for j in range(max(0, sky_block_len)):
                     sky_plain, loss_plain = _sky_plain_step(sky_coeffs, gain_params)
@@ -544,7 +547,7 @@ class Calibrator:
                             sky_hist_g.pop(0)
                             sky_hist_f.pop(0)
 
-                        if j >= aa_start and len(sky_hist_f) >= 2:
+                        if sky_aa_step >= aa_start and len(sky_hist_f) >= 2:
                             F = np.stack(sky_hist_f, axis=0)
                             beta = self._anderson_coeffs(F, ridge=aa_ridge)
                             if np.all(np.isfinite(beta)) and float(np.max(np.abs(beta))) <= aa_max_weight:
@@ -562,6 +565,7 @@ class Calibrator:
                     gain_params = gain_next
                     loss = loss_next
                     sky_block_used_aa += int(used_anderson)
+                    sky_aa_step += 1
                     if verbose:
                         tag = 'AA' if used_anderson else 'plain'
                         print(f'    [sky {tag} {j:02d}]: loss={loss:.4e}')
@@ -573,8 +577,6 @@ class Calibrator:
                 # --- beam block ---
                 beam_block_used_aa = 0
                 if beam_every > 0 and cyc % beam_every == 0 and beam_block_len > 0:
-                    beam_hist_g = []
-                    beam_hist_f = []
                     for j in range(max(0, beam_block_len)):
                         beam_plain, loss_plain_beam = _beam_plain_step(sky_coeffs, beam_coeffs, gain_params)
                         beam_next = beam_plain
@@ -591,7 +593,7 @@ class Calibrator:
                                 beam_hist_g.pop(0)
                                 beam_hist_f.pop(0)
 
-                            if j >= beam_aa_start and len(beam_hist_f) >= 2:
+                            if beam_aa_step >= beam_aa_start and len(beam_hist_f) >= 2:
                                 F = np.stack(beam_hist_f, axis=0)
                                 beta = self._anderson_coeffs(F, ridge=beam_aa_ridge)
                                 if np.all(np.isfinite(beta)) and float(np.max(np.abs(beta))) <= beam_aa_max_weight:
@@ -606,6 +608,7 @@ class Calibrator:
                         beam_coeffs = beam_next
                         loss = loss_beam_next
                         beam_block_used_aa += int(used_beam_anderson)
+                        beam_aa_step += 1
                         if verbose:
                             btag = 'AA' if used_beam_anderson else 'plain'
                             print(f'    [beam {btag} {j:02d}]: loss={loss:.4e}')
