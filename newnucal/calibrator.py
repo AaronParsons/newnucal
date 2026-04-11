@@ -79,17 +79,32 @@ class Calibrator:
 
         self._jit_loss = jax.jit(self._loss)
         self._jit_val_grad = jax.jit(jax.value_and_grad(self._loss))
+        self._jit_loss_variable_beam = jax.jit(self._loss_variable_beam)
 
     def _loss(self, params):
         vis_model = self.fwd.simulate(params['sky_coeffs'], self.rot_matrices)
         vis_cal = apply_gains(vis_model, params['log_amp'], params['phase'], params['phi'], self.bls)
         return jnp.mean(jnp.abs(self.data - vis_cal) ** 2)
 
-    def calc_loss(self, params):
+    def _loss_variable_beam(self, params):
+        vis_model = self.fwd.simulate_variable_beam(
+            params['sky_coeffs'], params['beam_coeffs'], self.rot_matrices
+        )
+        vis_cal = apply_gains(vis_model, params['log_amp'], params['phase'], params['phi'], self.bls)
+        return jnp.mean(jnp.abs(self.data - vis_cal) ** 2)
+
+    def calc_loss(self, params, explicit_beam: bool = False):
+        if explicit_beam:
+            return float(self._jit_loss_variable_beam(params))
         return float(self._jit_loss(params))
 
-    def simulate(self, params):
-        vis_model = self.fwd.simulate(params['sky_coeffs'], self.rot_matrices)
+    def simulate(self, params, explicit_beam: bool = False):
+        if explicit_beam:
+            vis_model = self.fwd.simulate_variable_beam(
+                params['sky_coeffs'], params['beam_coeffs'], self.rot_matrices
+            )
+        else:
+            vis_model = self.fwd.simulate(params['sky_coeffs'], self.rot_matrices)
         return apply_gains(vis_model, params['log_amp'], params['phase'], params['phi'], self.bls)
 
     def init_params(self):
@@ -113,6 +128,14 @@ class Calibrator:
         inv = self._invert_gains(params)
         data_cal = apply_gains(self.data, inv['log_amp'], inv['phase'], inv['phi'], self.bls)
         vis_model = self.fwd.simulate(params['sky_coeffs'], self.rot_matrices)
+        return data_cal - vis_model
+
+    def calibrated_residual_variable_beam(self, params):
+        inv = self._invert_gains(params)
+        data_cal = apply_gains(self.data, inv['log_amp'], inv['phase'], inv['phi'], self.bls)
+        vis_model = self.fwd.simulate_variable_beam(
+            params['sky_coeffs'], params['beam_coeffs'], self.rot_matrices
+        )
         return data_cal - vis_model
 
     # ------------------------------------------------------------------
@@ -193,9 +216,11 @@ class Calibrator:
         return gain_params, loss
 
     def _recompile_jit(self):
-        """Recompile loss JIT functions after precomputed arrays change (e.g. beam update)."""
+        """Recompile cached-beam JIT functions after precomputed arrays change."""
         self._jit_loss = jax.jit(self._loss)
         self._jit_val_grad = jax.jit(jax.value_and_grad(self._loss))
+        self._jit_loss_variable_beam = jax.jit(self._loss_variable_beam)
+        self._jit_loss_variable_beam = jax.jit(self._loss_variable_beam)
 
     def fit_beam_only(self, params, maxiter: int = 10, tol: float = 1e-7):
         """L-BFGS on beam_coeffs with sky and gains held fixed.
@@ -254,64 +279,48 @@ class Calibrator:
         sky_reg: float = 1e-3,
         verbose: bool = False,
     ):
-        """Dirty-map beam update: backproject residuals through the sky model.
+        """Dirty-map beam update using explicit beam coefficients.
 
-        Dual of :meth:`fit_sky_dirty`.  With sky and gains held fixed, forms the
-        matched-filter beam correction via
-        :meth:`~newnucal.simulate.ForwardModel.accumulate_beam_update`, applies
-        it, updates the ForwardModel beam cache, and recompiles the JIT functions.
-
-        Parameters
-        ----------
-        params : dict
-            Must include ``sky_coeffs``, ``beam_coeffs``, ``log_amp``,
-            ``phase``, ``phi``.
-        n_iter : int
-            Number of dirty beam steps.
-        step_size : float
-            Multiplies the matched-filter update (``< 1`` for damping).
-        sky_reg : float
-            Regularisation in the sky-matched-filter denominator.
-        verbose : bool
-
-        Returns
-        -------
-        params : dict — updated with new ``beam_coeffs``
-        loss : float
+        This version avoids mutating the ForwardModel cache and recompiling JITs
+        on every inner beam step.  Candidate beam states are evaluated through
+        the explicit-beam forward path and the cache is updated only once at the
+        end with the best accepted beam.
         """
         sky_coeffs  = params['sky_coeffs']
         gain_params = {k: params[k] for k in ('log_amp', 'phase', 'phi')}
         beam_coeffs = params['beam_coeffs']
 
-        best_bc   = beam_coeffs
-        best_loss = float(self._jit_loss(params))
+        best_bc = beam_coeffs
+        best_loss = float(self._jit_loss_variable_beam(
+            {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params}
+        ))
+        current_bc = beam_coeffs
 
         for i in range(n_iter):
-            resid = self.calibrated_residual(
-                {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params}
+            resid = self.calibrated_residual_variable_beam(
+                {'sky_coeffs': sky_coeffs, 'beam_coeffs': current_bc, **gain_params}
             )
             delta_bc = self.fwd.accumulate_beam_update(
                 sky_coeffs, resid, step_size=step_size, sky_reg=sky_reg,
             )
-            new_bc = beam_coeffs + delta_bc
-            self.fwd.update_beam_cache(new_bc)
-            self._recompile_jit()
-            loss = float(self._jit_loss(
-                {'sky_coeffs': sky_coeffs, 'beam_coeffs': new_bc, **gain_params}
+            trial_bc = current_bc + delta_bc
+            loss = float(self._jit_loss_variable_beam(
+                {'sky_coeffs': sky_coeffs, 'beam_coeffs': trial_bc, **gain_params}
             ))
             if loss < best_loss:
                 best_loss = loss
-                best_bc   = new_bc
-                beam_coeffs = new_bc
+                best_bc = trial_bc
+                current_bc = trial_bc
             else:
                 if verbose:
                     print('    WARNING: beam dirty loss increased, reverting')
-                self.fwd.update_beam_cache(best_bc)
-                self._recompile_jit()
                 break
             if verbose:
                 print(f'    dirty beam iter {i:03d}: loss={loss:.4e}')
 
+        # Synchronize cached beam once at the end.
+        self.fwd.update_beam_cache(best_bc)
+        self._recompile_jit()
         return {**params, 'beam_coeffs': best_bc}, best_loss
 
     def fit_sky_only(self, sky_coeffs, gain_params, maxiter: int = 30, tol: float = 1e-7):
@@ -369,6 +378,14 @@ class Calibrator:
         return jnp.array(np.asarray(vec, dtype=np.float32).reshape(shape), dtype=DTYPE_R)
 
     @staticmethod
+    def _flatten_beam_coeffs(beam_coeffs):
+        return np.asarray(beam_coeffs, dtype=np.float64).ravel()
+
+    @staticmethod
+    def _unflatten_beam_coeffs(vec, shape):
+        return jnp.array(np.asarray(vec, dtype=np.float32).reshape(shape), dtype=DTYPE_R)
+
+    @staticmethod
     def _anderson_coeffs(residual_rows, ridge: float = 1e-8):
         """Solve min ||sum_i beta_i f_i|| subject to sum_i beta_i = 1."""
         n = residual_rows.shape[0]
@@ -396,6 +413,11 @@ class Calibrator:
         aa_damping: float = 0.5,
         aa_ridge: float = 1e-8,
         aa_max_weight: float = 10.0,
+        beam_anderson_history: int | None = None,
+        beam_aa_start: int = 2,
+        beam_aa_damping: float = 0.5,
+        beam_aa_ridge: float = 1e-8,
+        beam_aa_max_weight: float = 10.0,
         polish_maxiter: int = 5,
         zenith_cut_scale: float | None = None,
         solve_every: dict | None = None,
@@ -449,9 +471,22 @@ class Calibrator:
         beam_every   = solve_every.get('beam',   0)
         polish_every = solve_every.get('polish', 0)
 
+        if beam_anderson_history is None:
+            beam_anderson_history = anderson_history
+        if beam_aa_start is None:
+            beam_aa_start = aa_start
+        if beam_aa_damping is None:
+            beam_aa_damping = aa_damping
+        if beam_aa_ridge is None:
+            beam_aa_ridge = aa_ridge
+        if beam_aa_max_weight is None:
+            beam_aa_max_weight = aa_max_weight
+
         sky_coeffs  = params['sky_coeffs']
         gain_params = {k: params[k] for k in ('log_amp', 'phase', 'phi')}
         beam_coeffs = params.get('beam_coeffs', self.fwd.beam_coeffs)
+        self.fwd.update_beam_cache(beam_coeffs)
+        self._recompile_jit()
 
         if _stop_flag is None:
             stop = _StopFitFlag()
@@ -464,6 +499,8 @@ class Calibrator:
 
         history_g = []
         history_f = []
+        beam_history_g = []
+        beam_history_f = []
 
         def _full_params():
             return {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params}
@@ -533,21 +570,58 @@ class Calibrator:
                         print(f'    [polish]: loss={loss:.4e}')
 
                 # --- Beam solve (if scheduled) ---
+                beam_used_anderson = False
                 if beam_every > 0 and (i + 1) % beam_every == 0:
                     if verbose:
                         print(f'    [beam]: starting dirty beam solve ...')
-                    bp, loss = self.fit_beam_dirty(
+                    bp, loss_plain_beam = self.fit_beam_dirty(
                         {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params},
-                        n_iter=beam_maxiter, step_size=beam_step_size,
+                        n_iter=1, step_size=beam_step_size,
                         sky_reg=beam_sky_reg, verbose=verbose,
                     )
-                    beam_coeffs = bp['beam_coeffs']
+                    beam_plain = bp['beam_coeffs']
+                    beam_next = beam_plain
+                    loss_beam_next = loss_plain_beam
+
+                    if beam_anderson_history and beam_anderson_history > 0:
+                        x_vec = self._flatten_beam_coeffs(beam_coeffs)
+                        g_vec = self._flatten_beam_coeffs(beam_plain)
+                        f_vec = g_vec - x_vec
+                        beam_history_g.append(g_vec.copy())
+                        beam_history_f.append(f_vec.copy())
+                        if len(beam_history_g) > beam_anderson_history:
+                            beam_history_g.pop(0)
+                            beam_history_f.pop(0)
+
+                        if i >= beam_aa_start and len(beam_history_f) >= 2:
+                            F = np.stack(beam_history_f, axis=0)
+                            beta = self._anderson_coeffs(F, ridge=beam_aa_ridge)
+                            if np.all(np.isfinite(beta)) and float(np.max(np.abs(beta))) <= beam_aa_max_weight:
+                                g_mix = np.tensordot(beta, np.stack(beam_history_g, axis=0), axes=1)
+                                beam_aa = self._unflatten_beam_coeffs(g_mix, beam_coeffs.shape)
+                                beam_cand = ((1.0 - beam_aa_damping) * beam_plain + beam_aa_damping * beam_aa).astype(DTYPE_R)
+                                loss_cand = float(self._jit_loss_variable_beam(
+                                    {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_cand, **gain_params}
+                                ))
+                                if loss_cand < loss_plain_beam:
+                                    beam_next = beam_cand
+                                    loss_beam_next = loss_cand
+                                    beam_used_anderson = True
+                                    self.fwd.update_beam_cache(beam_next)
+                                    self._recompile_jit()
+                    beam_coeffs = beam_next
+                    loss = loss_beam_next
                     if verbose:
-                        print(f'    [beam]: loss={loss:.4e}')
+                        btag = 'AA' if beam_used_anderson else 'plain'
+                        print(f'    [beam {btag}]: loss={loss:.4e}')
 
                 if verbose:
                     tag = 'AA' if used_anderson else 'plain'
-                    print(f'  iter {i:04d} [{tag}]: loss={loss:.4e}')
+                    if beam_every > 0 and (i + 1) % beam_every == 0:
+                        btag = 'AA' if beam_used_anderson else 'plain'
+                        print(f'  iter {i:04d} [sky:{tag} beam:{btag}]: loss={loss:.4e}')
+                    else:
+                        print(f'  iter {i:04d} [sky:{tag}]: loss={loss:.4e}')
                 if stop.stop:
                     break
         finally:
@@ -606,6 +680,8 @@ class Calibrator:
         sky_coeffs  = params['sky_coeffs']
         gain_params = {k: params[k] for k in ('log_amp', 'phase', 'phi')}
         beam_coeffs = params.get('beam_coeffs', self.fwd.beam_coeffs)
+        self.fwd.update_beam_cache(beam_coeffs)
+        self._recompile_jit()
 
         if _stop_flag is None:
             stop = _StopFitFlag()

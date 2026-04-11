@@ -536,6 +536,27 @@ class ForwardModel:
     # Beam update helpers
     # ------------------------------------------------------------------
 
+    def beam_spec_horizon_from_coeffs(self, beam_coeffs):
+        """Return beam_spec × horizon arrays for explicit *beam_coeffs*.
+
+        Useful for beam-optimization code paths that want to evaluate candidate
+        beams without mutating the cached beam state.  Shape is
+        ``(ntime, npix_sky, nfreq)``.
+        """
+        if not self._geom_ready:
+            raise RuntimeError('Call precompute_time_geometry() first.')
+        bc_np = np.asarray(beam_coeffs, dtype=np.float32)
+        ab_np = np.asarray(self.A_beam)
+        beam_spec_horizon_all = []
+        for i in range(len(self._interp_px_all)):
+            px   = self._interp_px_all[i]
+            wgt  = self._interp_wgt_all[i]
+            horiz = np.asarray(self._horizon_all[i])
+            bi = np.sum(wgt[:, :, None] * bc_np[px], axis=0)
+            bs = (bi @ ab_np.T) * horiz[:, None]
+            beam_spec_horizon_all.append(bs)
+        return jnp.array(np.stack(beam_spec_horizon_all), dtype=DTYPE_R)
+
     def update_beam_cache(self, beam_coeffs):
         """Recompute :attr:`_beam_spec_horizon_all` from new *beam_coeffs*.
 
