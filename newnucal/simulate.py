@@ -114,8 +114,7 @@ class ForwardModel:
         self._geom_ready = False
         self._topo_all = None
         self._horizon_all = None
-        self._beam_px_all = None
-        self._beam_wgts_all = None
+        self._beam_spec_horizon_all = None
         self._src_x_all = None
         self._src_y_all = None
         self._src_z_all = None
@@ -165,7 +164,7 @@ class ForwardModel:
         self.eq_coords = jnp.array(eq_full[:, mask], dtype=DTYPE_R)
         # Invalidate geometry
         self._geom_ready = False
-        for attr in ('_topo_all', '_horizon_all', '_beam_px_all', '_beam_wgts_all',
+        for attr in ('_topo_all', '_horizon_all', '_beam_spec_horizon_all',
                      '_src_x_all', '_src_y_all', '_src_z_all'):
             setattr(self, attr, None)
         self._zenith_cut_active = False
@@ -220,8 +219,7 @@ class ForwardModel:
 
         topo_all = []
         horizon_all = []
-        beam_px_all = []
-        beam_wgts_all = []
+        beam_spec_horizon_all = []
         src_x_all = []
         src_y_all = []
         src_z_all = []
@@ -232,6 +230,9 @@ class ForwardModel:
         zenith_src_y_list     = [] if cos_theta_cut is not None else None
         zenith_src_z_list     = [] if cos_theta_cut is not None else None
 
+        # Extract beam arrays once outside the loop for efficiency
+        bc_np = np.asarray(self.beam_coeffs)   # (npix_beam, nmodes_beam)
+        ab_np = np.asarray(self.A_beam)         # (nfreq, nmodes_beam)
         eta_np = np.asarray(self._eta, dtype=np.float32)
         for i in range(ntime):
             topo = np.array(rot_ms[i] @ self.eq_coords, dtype=np.float32)
@@ -243,36 +244,32 @@ class ForwardModel:
             px = np.array(px, dtype=np.int32)
             wgts = np.array(wgts, dtype=np.float32)
 
+            # Beam spec × horizon for all pixels.  This precomputed array is
+            # used by _simulate_one_precomputed and apparent_sky_update_one_time,
+            # removing the beam gather and matmul from the JIT hot path.
+            bi_np = np.sum(wgts[:, :, None] * bc_np[px], axis=0)   # (npix_sky, nmodes_beam)
+            bs_np = (bi_np @ ab_np.T) * horizon[:, None]             # (npix_sky, nfreq)
+            beam_spec_horizon_all.append(bs_np)
+
             src_x = np.repeat(topo[0], ndelay).astype(np.float32) * two_pi
             src_y = np.repeat(topo[1], ndelay).astype(np.float32) * two_pi
             src_z = np.tile(eta_np, npix).astype(np.float32) * two_pi
 
             topo_all.append(topo)
             horizon_all.append(horizon)
-            beam_px_all.append(px)
-            beam_wgts_all.append(wgts)
             src_x_all.append(src_x)
             src_y_all.append(src_y)
             src_z_all.append(src_z)
 
             if cos_theta_cut is not None:
-                # Pixels within zenith cut radius (horizon mask already folded in via
-                # beam_spec × horizon below, so we keep all zenith-cut pixels here).
+                # Pixels within zenith cut radius.
                 active = (topo[2] > cos_theta_cut)
                 px_idx = np.where(active)[0].astype(np.int32)
                 zenith_px_idx_list.append(px_idx)
 
-                # Precompute beam_spec × horizon for active pixels so that
-                # _simulate_one_zenith never touches beam_coeffs or px arrays
-                # inside JIT (avoiding slow XLA constant-folding of large gathers).
-                # px/wgts have shape (4, npix_sky); select active columns.
-                px_z    = px[:, px_idx]     # (4, npix_active)
-                wgts_z  = wgts[:, px_idx]   # (4, npix_active)
-                horiz_z = horizon[px_idx]   # (npix_active,)
-                bc_np   = np.asarray(self.beam_coeffs)  # (npix_beam, nmodes_beam)
-                bi_np   = np.sum(wgts_z[:, :, None] * bc_np[px_z], axis=0)  # (npix_active, nmodes_beam)
-                bs_np   = (bi_np @ np.asarray(self.A_beam).T) * horiz_z[:, None]  # (npix_active, nfreq)
-                zenith_beam_spec_list.append(jnp.array(bs_np, dtype=DTYPE_R))
+                # Reuse bs_np from above — just select active pixels.
+                # Active pixels all have horizon=1, so no extra masking needed.
+                zenith_beam_spec_list.append(jnp.array(bs_np[px_idx], dtype=DTYPE_R))
 
                 # Variable-length NUFFT source coords for active pixels
                 src_xm = src_x.reshape(npix, ndelay)[px_idx].ravel()
@@ -284,8 +281,7 @@ class ForwardModel:
 
         self._topo_all = jnp.array(np.stack(topo_all), dtype=DTYPE_R)
         self._horizon_all = jnp.array(np.stack(horizon_all), dtype=DTYPE_R)
-        self._beam_px_all = jnp.array(np.stack(beam_px_all), dtype=jnp.int32)
-        self._beam_wgts_all = jnp.array(np.stack(beam_wgts_all), dtype=DTYPE_R)
+        self._beam_spec_horizon_all = jnp.array(np.stack(beam_spec_horizon_all), dtype=DTYPE_R)
         self._src_x_all = jnp.array(np.stack(src_x_all), dtype=DTYPE_R)
         self._src_y_all = jnp.array(np.stack(src_y_all), dtype=DTYPE_R)
         self._src_z_all = jnp.array(np.stack(src_z_all), dtype=DTYPE_R)
@@ -354,15 +350,12 @@ class ForwardModel:
     def _forward_components_from_cache(self, sky_coeffs, tind):
         topo = self._topo_all[tind]
         horizon = self._horizon_all[tind]
-        px = self._beam_px_all[tind]
-        wgts = self._beam_wgts_all[tind]
-        beam_interp = jnp.sum(wgts[:, :, None] * self.beam_coeffs[px], axis=0)
-        sky_spec = sky_coeffs @ self.A_sky.T
-        beam_spec = beam_interp @ self.A_beam.T
-        W = sky_spec * beam_spec * horizon[:, None]
+        beam_spec_h = self._beam_spec_horizon_all[tind]   # (npix_sky, nfreq), already * horizon
+        sky_spec = sky_coeffs @ self.A_sky.T               # (npix_sky, nfreq)
+        W = sky_spec * beam_spec_h
         W_eta_full = jnp.fft.fft(W, axis=1) * self._phase_full[None, :]
         W_eta = W_eta_full[:, self._eta_idx]
-        return topo, horizon, beam_interp, beam_spec, W, W_eta
+        return topo, horizon, beam_spec_h, W, W_eta
 
     def forward_components_one_time(self, sky_coeffs, tind):
         if not self._geom_ready:
@@ -370,7 +363,7 @@ class ForwardModel:
         return self._forward_components_from_cache(sky_coeffs, tind)
 
     def _simulate_one_precomputed(self, sky_coeffs, tind):
-        _, _, _, _, _, W_eta = self._forward_components_from_cache(sky_coeffs, tind)
+        _, _, _, _, W_eta = self._forward_components_from_cache(sky_coeffs, tind)
         vis_flat = nufft3(
             W_eta.ravel().astype(DTYPE_C),
             self._src_x_all[tind], self._src_y_all[tind], self._src_z_all[tind],
@@ -379,12 +372,6 @@ class ForwardModel:
             eps=self.eps,
         )
         return vis_flat.reshape(self.nfreq, self.nbls)
-
-    def _simulate_one(self, sky_coeffs, rot_m):
-        if not self._geom_ready:
-            self.precompute_time_geometry(rot_m[None, ...])
-            return self._simulate_one_precomputed(sky_coeffs, 0)
-        raise RuntimeError('_simulate_one() requires precomputed geometry; use simulate().')
 
     def simulate(self, sky_coeffs, rot_matrices):
         if self._jit_one is None:
@@ -420,34 +407,20 @@ class ForwardModel:
     def apparent_sky_update_one_time(
         self,
         residual_fb,
-        sky_coeffs,
         tind,
         step_size: float = 1.0,
         beam_reg: float = 1e-3,
     ):
         """Form a beam-weighted apparent-sky correction for one time."""
         dirty_pf = self.dirty_apparent_sky_one_time(residual_fb, tind)
-        _, horizon, beam_interp, beam_spec, _, _ = self._forward_components_from_cache(sky_coeffs, tind)
-        beam_spec = beam_spec * horizon[:, None]
-        weight = jnp.abs(beam_spec) ** 2
-        delta_app = step_size * jnp.conj(beam_spec.astype(DTYPE_C)) * dirty_pf / (weight.astype(DTYPE_C) + beam_reg)
+        beam_spec_h = self._beam_spec_horizon_all[tind]   # (npix_sky, nfreq), already * horizon
+        weight = jnp.abs(beam_spec_h) ** 2
+        delta_app = step_size * jnp.conj(beam_spec_h.astype(DTYPE_C)) * dirty_pf / (weight.astype(DTYPE_C) + beam_reg)
         return delta_app, weight
-
-    def apparent_to_equatorial_one_time(self, app_pf, tind):
-        """Map a one-time apparent-sky update to the equatorial sky grid.
-
-        In the current implementation the apparent sky update is already indexed
-        by equatorial sky pixels, because the forward model rotates equatorial
-        sky pixels into topocentric coordinates rather than regridding onto a
-        topocentric HEALPix mesh. This method is kept as a hook for future
-        resampling schemes.
-        """
-        return app_pf
 
     def accumulate_equatorial_sky_update(
         self,
         residual_vis,
-        sky_coeffs,
         step_size: float = 1.0,
         beam_reg: float = 1e-3,
     ):
@@ -455,13 +428,11 @@ class ForwardModel:
         num = jnp.zeros((self.npix_sky, self.nfreq), dtype=DTYPE_C)
         den = jnp.zeros((self.npix_sky, self.nfreq), dtype=DTYPE_R)
         for tind in range(int(residual_vis.shape[0])):
-            delta_app, weight_app = self.apparent_sky_update_one_time(
-                residual_vis[tind], sky_coeffs, tind, step_size=step_size, beam_reg=beam_reg
+            delta_eq, weight_eq = self.apparent_sky_update_one_time(
+                residual_vis[tind], tind, step_size=step_size, beam_reg=beam_reg
             )
-            delta_eq = self.apparent_to_equatorial_one_time(delta_app, tind)
-            weight_eq = self.apparent_to_equatorial_one_time(weight_app, tind).real.astype(DTYPE_R)
             num = num + weight_eq.astype(DTYPE_C) * delta_eq
-            den = den + weight_eq
+            den = den + weight_eq.real.astype(DTYPE_R)
         delta_eq_pf = num / (den.astype(DTYPE_C) + 1e-6)
         delta_eq_pf = delta_eq_pf / residual_vis.shape[0]  # divide by ntimes
         delta_coeffs = (delta_eq_pf.real @ self.A_sky).astype(DTYPE_R)

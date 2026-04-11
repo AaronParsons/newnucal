@@ -472,28 +472,19 @@ class TestFitMethodZenithCut:
     def test_fit_alternating_dirty_restores_cut(self, cal_and_params):
         cal, params = cal_and_params
         assert not cal.fwd._zenith_cut_active
-        sky, gp, _ = cal.fit_alternating_dirty(
-            params['sky_coeffs'], {k: params[k] for k in ('log_amp', 'phase', 'phi')},
-            n_outer=1, zenith_cut_scale=1.0,
-        )
+        _, _ = cal.fit_alternating_dirty(params, n_outer=1, zenith_cut_scale=1.0)
         assert not cal.fwd._zenith_cut_active, (
             "fit_alternating_dirty did not restore zenith cut after returning"
         )
 
     def test_fit_alternating_dirty_anderson_restores_cut(self, cal_and_params):
         cal, params = cal_and_params
-        sky, gp, _ = cal.fit_alternating_dirty_anderson(
-            params['sky_coeffs'], {k: params[k] for k in ('log_amp', 'phase', 'phi')},
-            n_outer=1, zenith_cut_scale=1.0,
-        )
+        _, _ = cal.fit_alternating_dirty(params, n_outer=1, anderson_history=4, zenith_cut_scale=1.0)
         assert not cal.fwd._zenith_cut_active
 
     def test_fit_alternating_restores_cut(self, cal_and_params):
         cal, params = cal_and_params
-        sky, gp, _ = cal.fit_alternating(
-            params['sky_coeffs'], {k: params[k] for k in ('log_amp', 'phase', 'phi')},
-            n_outer=1, zenith_cut_scale=1.0,
-        )
+        _, _ = cal.fit_alternating(params, n_outer=1, zenith_cut_scale=1.0)
         assert not cal.fwd._zenith_cut_active
 
     def test_cut_is_active_during_fit(self, cal_and_params):
@@ -512,10 +503,7 @@ class TestFitMethodZenithCut:
         import types
         cal.fit_gains_linear = types.MethodType(patched, cal)
 
-        cal.fit_alternating_dirty(
-            params['sky_coeffs'], {k: params[k] for k in ('log_amp', 'phase', 'phi')},
-            n_outer=1, zenith_cut_scale=1.0,
-        )
+        cal.fit_alternating_dirty(params, n_outer=1, zenith_cut_scale=1.0)
         assert any(active_flags), "Zenith cut was never active during fit"
         assert not cal.fwd._zenith_cut_active, "Zenith cut not restored after fit"
 
@@ -525,10 +513,7 @@ class TestFitMethodZenithCut:
         cal.apply_zenith_cut(scale=1.0)
         assert cal.fwd._zenith_cut_active
 
-        cal.fit_alternating_dirty(
-            params['sky_coeffs'], {k: params[k] for k in ('log_amp', 'phase', 'phi')},
-            n_outer=1,          # no zenith_cut_scale → default None
-        )
+        cal.fit_alternating_dirty(params, n_outer=1)  # no zenith_cut_scale → default None
         # State should be unchanged (still active)
         assert cal.fwd._zenith_cut_active, (
             "fit_alternating_dirty cleared zenith cut when scale=None"
