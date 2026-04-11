@@ -418,6 +418,9 @@ class Calibrator:
         beam_aa_damping: float = 0.5,
         beam_aa_ridge: float = 1e-8,
         beam_aa_max_weight: float = 10.0,
+        sky_block_len: int = 1,
+        beam_block_len: int = 1,
+        gains_every_cycle: int | None = None,
         polish_maxiter: int = 5,
         zenith_cut_scale: float | None = None,
         solve_every: dict | None = None,
@@ -427,48 +430,40 @@ class Calibrator:
         verbose: bool = False,
         _stop_flag=None,
     ):
-        """Alternating dirty-map minimisation, optionally with Anderson acceleration.
+        """Alternating dirty-map minimisation with sky/beam ping-pong blocks.
+
+        Each *cycle* optionally re-solves gains, then performs a short block of
+        sky dirty-map updates followed by a short block of beam dirty-map
+        updates.  Anderson acceleration is applied independently within each
+        block, so sky and beam each see a locally consistent fixed-point map.
 
         Parameters
         ----------
         params : dict with keys ``sky_coeffs``, ``beam_coeffs``, ``log_amp``,
-            ``phase``, ``phi``
+            ``phase``, ``phi``.
         n_iter : int
-            Total number of iterations.  The sky receives one dirty-map update
-            per iteration.
+            Number of outer *cycles*.
+        sky_block_len : int
+            Number of consecutive sky dirty steps per cycle.
+        beam_block_len : int
+            Number of consecutive beam dirty steps per scheduled beam cycle.
+        gains_every_cycle : int or None
+            If given, overrides ``solve_every['gains']`` and solves gains every
+            ``gains_every_cycle`` cycles.
         solve_every : dict or None
-            Controls how often non-sky components are updated.  Keys:
+            Controls how often gains / beam / polish blocks are triggered. Keys:
 
             ``'gains'`` (int, default 1)
-                Solve gains every *N* iterations.  ``0`` disables gain
-                solving entirely.
-            ``'beam'`` (int, default 0)
-                Solve beam every *N* iterations using
-                :meth:`fit_beam_dirty`.  ``0`` (default) disables beam solving.
+                Solve gains every *N* cycles.
+            ``'beam'`` (int, default 1)
+                Run a beam block every *N* cycles.  ``0`` disables beam solving.
             ``'polish'`` (int, default 0)
-                Run an L-BFGS sky polish (``polish_maxiter`` steps via
-                :meth:`fit_sky_only`) every *N* iterations, followed by
-                a gain re-solve.  ``0`` (default) disables polishing.
-
-            Example: ``solve_every={'gains': 1, 'beam': 5, 'polish': 10}``.
-        anderson_history : int
-            Number of iterates to keep for Anderson acceleration on the
-            sky fixed-point map.  ``0`` disables Anderson.
-        zenith_cut_scale : float or None
-            If given, enable a per-time dynamic zenith cut during this fit.
-            Automatically removed on return, even if interrupted.
-
-        Returns
-        -------
-        params : dict
-            Updated parameters with keys ``sky_coeffs``, ``beam_coeffs``,
-            ``log_amp``, ``phase``, ``phi``.
-        loss : float
+                Run an L-BFGS sky polish every *N* cycles after the dirty blocks.
         """
         if solve_every is None:
             solve_every = {}
-        gains_every  = solve_every.get('gains',  1)
-        beam_every   = solve_every.get('beam',   0)
+        gains_every = gains_every_cycle if gains_every_cycle is not None else solve_every.get('gains', 1)
+        beam_every = solve_every.get('beam', 1)
         polish_every = solve_every.get('polish', 0)
 
         if beam_anderson_history is None:
@@ -482,7 +477,7 @@ class Calibrator:
         if beam_aa_max_weight is None:
             beam_aa_max_weight = aa_max_weight
 
-        sky_coeffs  = params['sky_coeffs']
+        sky_coeffs = params['sky_coeffs']
         gain_params = {k: params[k] for k in ('log_amp', 'phase', 'phi')}
         beam_coeffs = params.get('beam_coeffs', self.fwd.beam_coeffs)
         self.fwd.update_beam_cache(beam_coeffs)
@@ -497,131 +492,144 @@ class Calibrator:
         if zenith_cut_scale is not None:
             self.fwd.precompute_time_geometry(self.rot_matrices, zenith_cut_scale=zenith_cut_scale)
 
-        history_g = []
-        history_f = []
-        beam_history_g = []
-        beam_history_f = []
+        def _full_params(sky, beam, gains):
+            return {'sky_coeffs': sky, 'beam_coeffs': beam, **gains}
 
-        def _full_params():
-            return {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params}
+        def _sky_plain_step(sky, gains):
+            best_loss = float(self._jit_loss({'sky_coeffs': sky, 'beam_coeffs': beam_coeffs, **gains}))
+            resid = self.calibrated_residual({'sky_coeffs': sky, 'beam_coeffs': beam_coeffs, **gains})
+            delta = self.fwd.accumulate_equatorial_sky_update(resid, step_size=step_size, beam_reg=beam_reg)
+            sky_trial = (sky + delta).astype(DTYPE_R)
+            loss_trial = float(self._jit_loss({'sky_coeffs': sky_trial, 'beam_coeffs': beam_coeffs, **gains}))
+            if loss_trial < best_loss:
+                return sky_trial, loss_trial
+            return sky, best_loss
+
+        def _beam_plain_step(sky, beam, gains):
+            resid = self.calibrated_residual_variable_beam({'sky_coeffs': sky, 'beam_coeffs': beam, **gains})
+            delta_bc = self.fwd.accumulate_beam_update(sky, resid, step_size=beam_step_size, sky_reg=beam_sky_reg)
+            beam_trial = (beam + delta_bc).astype(DTYPE_R)
+            loss_trial = float(self._jit_loss_variable_beam({'sky_coeffs': sky, 'beam_coeffs': beam_trial, **gains}))
+            loss_curr = float(self._jit_loss_variable_beam({'sky_coeffs': sky, 'beam_coeffs': beam, **gains}))
+            if loss_trial < loss_curr:
+                return beam_trial, loss_trial
+            return beam, loss_curr
 
         try:
-            loss = float(self._jit_loss(_full_params()))
-            for i in range(n_iter):
-                # --- Gain solve (if scheduled) ---
-                if gains_every > 0 and i % gains_every == 0:
+            loss = float(self._jit_loss(_full_params(sky_coeffs, beam_coeffs, gain_params)))
+            for cyc in range(n_iter):
+                if gains_every > 0 and cyc % gains_every == 0:
                     gain_params, _gl = self.fit_gains_linear(sky_coeffs)
                     if verbose:
                         print(f'    [gains]: loss={_gl:.4e}')
 
-                # --- Sky dirty update (every step) ---
-                sky_plain, loss_plain = self.fit_sky_dirty(
-                    sky_coeffs, gain_params,
-                    n_iter=1, step_size=step_size,
-                    beam_reg=beam_reg, momentum=momentum, verbose=verbose,
-                )
-                gain_plain = gain_params
+                # --- sky block ---
+                sky_hist_g = []
+                sky_hist_f = []
+                sky_block_used_aa = 0
+                for j in range(max(0, sky_block_len)):
+                    sky_plain, loss_plain = _sky_plain_step(sky_coeffs, gain_params)
+                    sky_next = sky_plain
+                    gain_next = gain_params
+                    loss_next = loss_plain
+                    used_anderson = False
 
-                sky_next = sky_plain
-                gain_next = gain_plain
-                loss_next = loss_plain
-                used_anderson = False
+                    if anderson_history > 0:
+                        x_vec = self._flatten_sky_coeffs(sky_coeffs)
+                        g_vec = self._flatten_sky_coeffs(sky_plain)
+                        f_vec = g_vec - x_vec
+                        sky_hist_g.append(g_vec.copy())
+                        sky_hist_f.append(f_vec.copy())
+                        if len(sky_hist_g) > anderson_history:
+                            sky_hist_g.pop(0)
+                            sky_hist_f.pop(0)
 
-                if anderson_history > 0:
-                    x_vec = self._flatten_sky_coeffs(sky_coeffs)
-                    g_vec = self._flatten_sky_coeffs(sky_plain)
-                    f_vec = g_vec - x_vec
-                    history_g.append(g_vec.copy())
-                    history_f.append(f_vec.copy())
-                    if len(history_g) > anderson_history:
-                        history_g.pop(0)
-                        history_f.pop(0)
+                        if j >= aa_start and len(sky_hist_f) >= 2:
+                            F = np.stack(sky_hist_f, axis=0)
+                            beta = self._anderson_coeffs(F, ridge=aa_ridge)
+                            if np.all(np.isfinite(beta)) and float(np.max(np.abs(beta))) <= aa_max_weight:
+                                g_mix = np.tensordot(beta, np.stack(sky_hist_g, axis=0), axes=1)
+                                sky_aa = self._unflatten_sky_coeffs(g_mix, sky_coeffs.shape)
+                                sky_cand = ((1.0 - aa_damping) * sky_plain + aa_damping * sky_aa).astype(DTYPE_R)
+                                gain_cand, _ = self.fit_gains_linear(sky_cand)
+                                loss_cand = float(self._jit_loss(_full_params(sky_cand, beam_coeffs, gain_cand)))
+                                if loss_cand < loss_plain:
+                                    sky_next = sky_cand
+                                    gain_next = gain_cand
+                                    loss_next = loss_cand
+                                    used_anderson = True
+                    sky_coeffs = sky_next
+                    gain_params = gain_next
+                    loss = loss_next
+                    sky_block_used_aa += int(used_anderson)
+                    if verbose:
+                        tag = 'AA' if used_anderson else 'plain'
+                        print(f'    [sky {tag} {j:02d}]: loss={loss:.4e}')
+                    if stop.stop:
+                        break
+                if stop.stop:
+                    break
 
-                    if i >= aa_start and len(history_f) >= 2:
-                        F = np.stack(history_f, axis=0)
-                        beta = self._anderson_coeffs(F, ridge=aa_ridge)
-                        if np.all(np.isfinite(beta)) and float(np.max(np.abs(beta))) <= aa_max_weight:
-                            g_mix = np.tensordot(beta, np.stack(history_g, axis=0), axes=1)
-                            sky_aa = self._unflatten_sky_coeffs(g_mix, sky_coeffs.shape)
-                            sky_cand = ((1.0 - aa_damping) * sky_plain + aa_damping * sky_aa).astype(DTYPE_R)
-                            gain_cand, _ = self.fit_gains_linear(sky_cand)
-                            loss_cand = float(self._jit_loss(
-                                {'sky_coeffs': sky_cand, 'beam_coeffs': beam_coeffs, **gain_cand}
-                            ))
-                            if loss_cand < loss_plain:
-                                sky_next = sky_cand
-                                gain_next = gain_cand
-                                loss_next = loss_cand
-                                used_anderson = True
+                # --- beam block ---
+                beam_block_used_aa = 0
+                if beam_every > 0 and cyc % beam_every == 0 and beam_block_len > 0:
+                    beam_hist_g = []
+                    beam_hist_f = []
+                    for j in range(max(0, beam_block_len)):
+                        beam_plain, loss_plain_beam = _beam_plain_step(sky_coeffs, beam_coeffs, gain_params)
+                        beam_next = beam_plain
+                        loss_beam_next = loss_plain_beam
+                        used_beam_anderson = False
 
-                sky_coeffs = sky_next
-                gain_params = gain_next
-                loss = loss_next
+                        if beam_anderson_history and beam_anderson_history > 0:
+                            x_vec = self._flatten_beam_coeffs(beam_coeffs)
+                            g_vec = self._flatten_beam_coeffs(beam_plain)
+                            f_vec = g_vec - x_vec
+                            beam_hist_g.append(g_vec.copy())
+                            beam_hist_f.append(f_vec.copy())
+                            if len(beam_hist_g) > beam_anderson_history:
+                                beam_hist_g.pop(0)
+                                beam_hist_f.pop(0)
 
-                # --- Polish sky with L-BFGS (if scheduled) ---
-                if polish_every > 0 and (i + 1) % polish_every == 0:
+                            if j >= beam_aa_start and len(beam_hist_f) >= 2:
+                                F = np.stack(beam_hist_f, axis=0)
+                                beta = self._anderson_coeffs(F, ridge=beam_aa_ridge)
+                                if np.all(np.isfinite(beta)) and float(np.max(np.abs(beta))) <= beam_aa_max_weight:
+                                    g_mix = np.tensordot(beta, np.stack(beam_hist_g, axis=0), axes=1)
+                                    beam_aa = self._unflatten_beam_coeffs(g_mix, beam_coeffs.shape)
+                                    beam_cand = ((1.0 - beam_aa_damping) * beam_plain + beam_aa_damping * beam_aa).astype(DTYPE_R)
+                                    loss_cand = float(self._jit_loss_variable_beam(_full_params(sky_coeffs, beam_cand, gain_params)))
+                                    if loss_cand < loss_plain_beam:
+                                        beam_next = beam_cand
+                                        loss_beam_next = loss_cand
+                                        used_beam_anderson = True
+                        beam_coeffs = beam_next
+                        loss = loss_beam_next
+                        beam_block_used_aa += int(used_beam_anderson)
+                        if verbose:
+                            btag = 'AA' if used_beam_anderson else 'plain'
+                            print(f'    [beam {btag} {j:02d}]: loss={loss:.4e}')
+                        if stop.stop:
+                            break
+                    # sync cached beam once per beam block
+                    self.fwd.update_beam_cache(beam_coeffs)
+                    self._recompile_jit()
+                    if stop.stop:
+                        break
+
+                # --- optional polish per cycle ---
+                if polish_every > 0 and (cyc + 1) % polish_every == 0:
                     if verbose:
                         print(f'    [polish]: starting L-BFGS sky polish ...')
-                    sky_coeffs, loss = self.fit_sky_only(
-                        sky_coeffs, gain_params, maxiter=polish_maxiter, tol=1e-7
-                    )
+                    sky_coeffs, loss = self.fit_sky_only(sky_coeffs, gain_params, maxiter=polish_maxiter, tol=1e-7)
                     gain_params, _ = self.fit_gains_linear(sky_coeffs)
                     if verbose:
                         print(f'    [polish]: loss={loss:.4e}')
 
-                # --- Beam solve (if scheduled) ---
-                beam_used_anderson = False
-                if beam_every > 0 and (i + 1) % beam_every == 0:
-                    if verbose:
-                        print(f'    [beam]: starting dirty beam solve ...')
-                    bp, loss_plain_beam = self.fit_beam_dirty(
-                        {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params},
-                        n_iter=1, step_size=beam_step_size,
-                        sky_reg=beam_sky_reg, verbose=verbose,
-                    )
-                    beam_plain = bp['beam_coeffs']
-                    beam_next = beam_plain
-                    loss_beam_next = loss_plain_beam
-
-                    if beam_anderson_history and beam_anderson_history > 0:
-                        x_vec = self._flatten_beam_coeffs(beam_coeffs)
-                        g_vec = self._flatten_beam_coeffs(beam_plain)
-                        f_vec = g_vec - x_vec
-                        beam_history_g.append(g_vec.copy())
-                        beam_history_f.append(f_vec.copy())
-                        if len(beam_history_g) > beam_anderson_history:
-                            beam_history_g.pop(0)
-                            beam_history_f.pop(0)
-
-                        if i >= beam_aa_start and len(beam_history_f) >= 2:
-                            F = np.stack(beam_history_f, axis=0)
-                            beta = self._anderson_coeffs(F, ridge=beam_aa_ridge)
-                            if np.all(np.isfinite(beta)) and float(np.max(np.abs(beta))) <= beam_aa_max_weight:
-                                g_mix = np.tensordot(beta, np.stack(beam_history_g, axis=0), axes=1)
-                                beam_aa = self._unflatten_beam_coeffs(g_mix, beam_coeffs.shape)
-                                beam_cand = ((1.0 - beam_aa_damping) * beam_plain + beam_aa_damping * beam_aa).astype(DTYPE_R)
-                                loss_cand = float(self._jit_loss_variable_beam(
-                                    {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_cand, **gain_params}
-                                ))
-                                if loss_cand < loss_plain_beam:
-                                    beam_next = beam_cand
-                                    loss_beam_next = loss_cand
-                                    beam_used_anderson = True
-                                    self.fwd.update_beam_cache(beam_next)
-                                    self._recompile_jit()
-                    beam_coeffs = beam_next
-                    loss = loss_beam_next
-                    if verbose:
-                        btag = 'AA' if beam_used_anderson else 'plain'
-                        print(f'    [beam {btag}]: loss={loss:.4e}')
-
                 if verbose:
-                    tag = 'AA' if used_anderson else 'plain'
-                    if beam_every > 0 and (i + 1) % beam_every == 0:
-                        btag = 'AA' if beam_used_anderson else 'plain'
-                        print(f'  iter {i:04d} [sky:{tag} beam:{btag}]: loss={loss:.4e}')
-                    else:
-                        print(f'  iter {i:04d} [sky:{tag}]: loss={loss:.4e}')
+                    print(f'  cycle {cyc:04d}: loss={loss:.4e} '
+                          f'[sky_AA={sky_block_used_aa}/{max(0, sky_block_len)} '
+                          f'beam_AA={beam_block_used_aa}/{max(0, beam_block_len) if beam_every > 0 and cyc % beam_every == 0 else 0}]')
                 if stop.stop:
                     break
         finally:
