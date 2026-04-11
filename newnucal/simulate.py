@@ -105,6 +105,9 @@ class ForwardModel:
         self._tgt_y = jnp.array(tgt_y, dtype=DTYPE_R)
         self._tgt_z = jnp.array(tgt_z, dtype=DTYPE_R)
 
+        # Beam diameter for FWHM-based zenith cut (metres; None if unavailable)
+        self._beam_diameter = getattr(getattr(beam_model, 'beam', None), 'diameter', None)
+
         self.A_sky = None
         self._jit_one = None
 
@@ -117,17 +120,103 @@ class ForwardModel:
         self._src_y_all = None
         self._src_z_all = None
 
+        # Per-time zenith-cut state (populated by precompute_time_geometry)
+        self._zenith_cut_active = False
+        self._zenith_px_idx_list    = None   # list[np.ndarray(npix_t,)]
+        self._zenith_beam_spec_list = None   # list[jnp.ndarray(npix_t, nfreq)] precomputed beam×horizon
+        self._zenith_src_x_list     = None   # list[jnp.ndarray(npix_t*ndelay,)]
+        self._zenith_src_y_list     = None
+        self._zenith_src_z_list     = None
+
+    # ------------------------------------------------------------------
+    # Pixel masking helpers
+    # ------------------------------------------------------------------
+
+    def build_ever_visible_mask(self, rot_matrices):
+        """
+        Return a boolean array of shape (npix_sky,) that is True for every
+        sky pixel above the horizon (topo_z > 0) at any of the given times.
+
+        Call this before :meth:`apply_pixel_mask`.
+        """
+        rot_ms = np.asarray(rot_matrices, dtype=np.float32)
+        eq = np.asarray(self.eq_coords)   # (3, npix)
+        ever_visible = np.zeros(eq.shape[1], dtype=bool)
+        for i in range(rot_ms.shape[0]):
+            ever_visible |= (rot_ms[i] @ eq)[2] > 0
+        return ever_visible
+
+    def apply_pixel_mask(self, mask):
+        """
+        Permanently restrict the sky model to the pixels selected by *mask*.
+
+        After this call ``npix_sky`` equals ``mask.sum()`` and sky-coefficient
+        arrays must have that many rows.  The precomputed geometry is
+        invalidated; call :meth:`precompute_time_geometry` again.
+
+        Parameters
+        ----------
+        mask : array_like of bool, shape (npix_sky_full,)
+        """
+        mask = np.asarray(mask, dtype=bool)
+        self._pixel_mask = mask
+        self._pixel_indices = np.where(mask)[0].astype(np.int32)
+        eq_full = np.asarray(self.eq_coords)   # (3, npix_full)
+        self.eq_coords = jnp.array(eq_full[:, mask], dtype=DTYPE_R)
+        # Invalidate geometry
+        self._geom_ready = False
+        for attr in ('_topo_all', '_horizon_all', '_beam_px_all', '_beam_wgts_all',
+                     '_src_x_all', '_src_y_all', '_src_z_all'):
+            setattr(self, attr, None)
+        self._zenith_cut_active = False
+        return self
+
     def set_sky_dpss(self, A_sky):
         self.A_sky = jnp.array(A_sky, dtype=DTYPE_R)
         self._jit_one = jax.jit(self._simulate_one_precomputed)
 
-    def precompute_time_geometry(self, rot_matrices):
-        """Precompute time-only geometry and interpolation operators."""
+    def precompute_time_geometry(self, rot_matrices, zenith_cut_scale=None):
+        """Precompute time-only geometry and interpolation operators.
+
+        Parameters
+        ----------
+        rot_matrices : array_like, shape (ntime, 3, 3)
+        zenith_cut_scale : float or None
+            If given, enable a per-time dynamic zenith cut.  Only pixels
+            within ``zenith_cut_scale × FWHM`` of zenith are included in
+            each time step's NUFFT.  FWHM is the Airy-beam first-null
+            width (1.22 λ/D) evaluated at the *lowest* frequency (widest
+            beam).  Requires the beam to have a ``diameter`` attribute.
+            ``scale=1`` keeps everything inside one FWHM; ``scale=0.5``
+            keeps only the inner half-beam.  When active, ``simulate``
+            uses a Python loop rather than vmap so that each time step
+            passes only its active source points to the NUFFT.
+        """
+        # Reset zenith-cut state
+        self._zenith_cut_active = False
+        self._zenith_px_idx_list = None
+        self._zenith_src_x_list = None
+        self._zenith_src_y_list = None
+        self._zenith_src_z_list = None
+
         rot_ms = jnp.array(rot_matrices, dtype=DTYPE_R)
         ntime = int(rot_ms.shape[0])
         npix = self.npix_sky
         ndelay = self.ndelay_eff
         two_pi = 2.0 * np.pi
+
+        # Zenith-cut threshold: cos(theta_cut) = cos(scale * FWHM)
+        cos_theta_cut = None
+        if zenith_cut_scale is not None:
+            if self._beam_diameter is None:
+                raise ValueError(
+                    'zenith_cut_scale requires the beam model to have a '
+                    '"diameter" attribute (e.g. AiryBeam).'
+                )
+            nu_min = float(self.freqs.min())
+            fwhm_rad = 1.22 * C / (nu_min * self._beam_diameter)
+            theta_cut = zenith_cut_scale * fwhm_rad
+            cos_theta_cut = float(np.cos(theta_cut))
 
         topo_all = []
         horizon_all = []
@@ -136,6 +225,12 @@ class ForwardModel:
         src_x_all = []
         src_y_all = []
         src_z_all = []
+
+        zenith_px_idx_list    = [] if cos_theta_cut is not None else None
+        zenith_beam_spec_list = [] if cos_theta_cut is not None else None
+        zenith_src_x_list     = [] if cos_theta_cut is not None else None
+        zenith_src_y_list     = [] if cos_theta_cut is not None else None
+        zenith_src_z_list     = [] if cos_theta_cut is not None else None
 
         eta_np = np.asarray(self._eta, dtype=np.float32)
         for i in range(ntime):
@@ -160,6 +255,33 @@ class ForwardModel:
             src_y_all.append(src_y)
             src_z_all.append(src_z)
 
+            if cos_theta_cut is not None:
+                # Pixels within zenith cut radius (horizon mask already folded in via
+                # beam_spec × horizon below, so we keep all zenith-cut pixels here).
+                active = (topo[2] > cos_theta_cut)
+                px_idx = np.where(active)[0].astype(np.int32)
+                zenith_px_idx_list.append(px_idx)
+
+                # Precompute beam_spec × horizon for active pixels so that
+                # _simulate_one_zenith never touches beam_coeffs or px arrays
+                # inside JIT (avoiding slow XLA constant-folding of large gathers).
+                # px/wgts have shape (4, npix_sky); select active columns.
+                px_z    = px[:, px_idx]     # (4, npix_active)
+                wgts_z  = wgts[:, px_idx]   # (4, npix_active)
+                horiz_z = horizon[px_idx]   # (npix_active,)
+                bc_np   = np.asarray(self.beam_coeffs)  # (npix_beam, nmodes_beam)
+                bi_np   = np.sum(wgts_z[:, :, None] * bc_np[px_z], axis=0)  # (npix_active, nmodes_beam)
+                bs_np   = (bi_np @ np.asarray(self.A_beam).T) * horiz_z[:, None]  # (npix_active, nfreq)
+                zenith_beam_spec_list.append(jnp.array(bs_np, dtype=DTYPE_R))
+
+                # Variable-length NUFFT source coords for active pixels
+                src_xm = src_x.reshape(npix, ndelay)[px_idx].ravel()
+                src_ym = src_y.reshape(npix, ndelay)[px_idx].ravel()
+                src_zm = src_z.reshape(npix, ndelay)[px_idx].ravel()
+                zenith_src_x_list.append(jnp.array(src_xm, dtype=DTYPE_R))
+                zenith_src_y_list.append(jnp.array(src_ym, dtype=DTYPE_R))
+                zenith_src_z_list.append(jnp.array(src_zm, dtype=DTYPE_R))
+
         self._topo_all = jnp.array(np.stack(topo_all), dtype=DTYPE_R)
         self._horizon_all = jnp.array(np.stack(horizon_all), dtype=DTYPE_R)
         self._beam_px_all = jnp.array(np.stack(beam_px_all), dtype=jnp.int32)
@@ -167,8 +289,67 @@ class ForwardModel:
         self._src_x_all = jnp.array(np.stack(src_x_all), dtype=DTYPE_R)
         self._src_y_all = jnp.array(np.stack(src_y_all), dtype=DTYPE_R)
         self._src_z_all = jnp.array(np.stack(src_z_all), dtype=DTYPE_R)
+
+        if cos_theta_cut is not None:
+            self._zenith_cut_active = True
+            self._zenith_px_idx_list    = zenith_px_idx_list
+            self._zenith_beam_spec_list = zenith_beam_spec_list
+            self._zenith_src_x_list     = zenith_src_x_list
+            self._zenith_src_y_list     = zenith_src_y_list
+            self._zenith_src_z_list     = zenith_src_z_list
+
         self._geom_ready = True
+        # Invalidate any cached JIT compilation: the precomputed arrays are
+        # captured by value in the trace, so a fresh jit is needed after each
+        # geometry recompute to avoid stale compiled code.
+        if self.A_sky is not None:
+            self._jit_one = jax.jit(self._simulate_one_precomputed)
         return self
+
+    def _simulate_one_zenith(self, sky_coeffs, tind):
+        """Forward model for one time step restricted to the per-time zenith-cut pixels.
+
+        Uses variable-length source arrays; must be called from a Python loop
+        (not vmap) because array sizes differ across time steps.
+
+        ``beam_spec × horizon`` is precomputed during ``precompute_time_geometry``
+        so this function only performs a gather + matmul on ``sky_coeffs``, avoiding
+        large constant-gather operations that trigger slow XLA constant folding.
+        """
+        px_idx    = self._zenith_px_idx_list[tind]       # numpy (npix_active,)
+        beam_spec = self._zenith_beam_spec_list[tind]    # (npix_active, nfreq) precomputed const
+
+        # sky_coeffs[px_idx] is a gather with constant indices but dynamic data →
+        # XLA does NOT constant-fold this; it stays dynamic throughout.
+        sky_spec = sky_coeffs[px_idx] @ self.A_sky.T    # (npix_active, nfreq)
+        W = sky_spec * beam_spec                         # (npix_active, nfreq) dynamic
+
+        W_eta_full = jnp.fft.fft(W, axis=1) * self._phase_full[None, :]
+        W_eta = W_eta_full[:, self._eta_idx]             # (npix_active, ndelay)
+
+        vis_flat = nufft3(
+            W_eta.ravel().astype(DTYPE_C),
+            self._zenith_src_x_list[tind],
+            self._zenith_src_y_list[tind],
+            self._zenith_src_z_list[tind],
+            self._tgt_x, self._tgt_y, self._tgt_z,
+            iflag=1,
+            eps=self.eps,
+        )
+        return vis_flat.reshape(self.nfreq, self.nbls)
+
+    def _simulate_loop(self, sky_coeffs):
+        """Simulate all time steps using per-time zenith-cut pixel lists.
+
+        The Python loop is unrolled by JAX's tracing when this is jit-compiled,
+        so each time step's source coordinates (fixed numpy arrays) become
+        compile-time constants, enabling gradient computation through
+        sky_coeffs while still passing only the active pixels to each NUFFT.
+        """
+        return jnp.stack([
+            self._simulate_one_zenith(sky_coeffs, t)
+            for t in range(len(self._zenith_px_idx_list))
+        ])
 
     def _forward_components_from_cache(self, sky_coeffs, tind):
         topo = self._topo_all[tind]
@@ -210,6 +391,8 @@ class ForwardModel:
             raise RuntimeError('Call set_sky_dpss() before simulate().')
         if (not self._geom_ready) or (self._topo_all.shape[0] != rot_matrices.shape[0]):
             self.precompute_time_geometry(rot_matrices)
+        if self._zenith_cut_active:
+            return self._simulate_loop(sky_coeffs)
         inds = jnp.arange(rot_matrices.shape[0], dtype=jnp.int32)
         return jax.vmap(lambda tind: self._jit_one(sky_coeffs, tind))(inds)
 
@@ -286,7 +469,8 @@ class ForwardModel:
 
     @property
     def npix_sky(self) -> int:
-        return healpy.nside2npix(self.sky_nside)
+        # eq_coords has shape (3, npix_active); reflects any applied pixel mask
+        return int(self.eq_coords.shape[1])
 
     @property
     def nfreq(self) -> int:

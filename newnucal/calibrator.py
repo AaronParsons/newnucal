@@ -115,6 +115,45 @@ class Calibrator:
         vis_model = self.fwd.simulate(sky_coeffs, self.rot_matrices)
         return data_cal - vis_model
 
+    # ------------------------------------------------------------------
+    # Pixel-cut helpers
+    # ------------------------------------------------------------------
+
+    def apply_horizon_cut(self):
+        """Remove sky pixels that are never above the horizon.
+
+        Permanently reduces ``npix_sky``; call *before* initialising sky
+        coefficients.  Returns the number of pixels retained.
+        """
+        mask = self.fwd.build_ever_visible_mask(self.rot_matrices)
+        self.fwd.apply_pixel_mask(mask)
+        self.fwd.precompute_time_geometry(self.rot_matrices)
+        n_keep = int(mask.sum())
+        n_drop = int((~mask).sum())
+        print(f'  Horizon cut: {n_keep} pixels retained, {n_drop} removed.')
+        return n_keep
+
+    def apply_zenith_cut(self, scale=1.0):
+        """Enable a per-time dynamic zenith cut at *scale* × beam FWHM.
+
+        Pixels within ``scale × 1.22 λ_max / D`` of zenith are included
+        at each time step; the rest are skipped in the NUFFT.  ``scale=1``
+        keeps the full primary-beam footprint at the lowest frequency;
+        smaller values restrict to the inner beam.
+
+        Calling this re-runs ``precompute_time_geometry``; any previously
+        applied horizon cut is preserved.
+        """
+        self.fwd.precompute_time_geometry(self.rot_matrices, zenith_cut_scale=scale)
+        counts = [len(px) for px in self.fwd._zenith_px_idx_list]
+        print(f'  Zenith cut (scale={scale}): '
+              f'{min(counts)}–{max(counts)} pixels per time step '
+              f'(mean {sum(counts)/len(counts):.0f}).')
+
+    def disable_zenith_cut(self):
+        """Remove the dynamic zenith cut and revert to the full pixel set."""
+        self.fwd.precompute_time_geometry(self.rot_matrices, zenith_cut_scale=None)
+
     def fit_gains_linear(self, sky_coeffs):
         import numpy as np
 
@@ -258,6 +297,7 @@ class Calibrator:
         aa_max_weight: float = 10.0,
         polish_every: int = 0,
         polish_maxiter: int = 5,
+        zenith_cut_scale: float | None = None,
         verbose: bool = False,
         _stop_flag=None,
     ):
@@ -267,6 +307,14 @@ class Calibrator:
             sky -> fit_gains_linear(sky) -> fit_sky_dirty(...) -> new sky
         with acceptance based on the actual loss. If the accelerated candidate
         is not better than the plain outer step, the plain step is kept.
+
+        Parameters
+        ----------
+        zenith_cut_scale : float or None
+            If given, enable a per-time dynamic zenith cut during this fit
+            (see :meth:`apply_zenith_cut`).  The cut is automatically removed
+            and the full horizon-visible pixel set restored when the fit
+            returns, even if interrupted.
         """
         if _stop_flag is None:
             stop = _StopFitFlag()
@@ -274,6 +322,9 @@ class Calibrator:
         else:
             stop = _stop_flag
             old_handler = None
+
+        if zenith_cut_scale is not None:
+            self.fwd.precompute_time_geometry(self.rot_matrices, zenith_cut_scale=zenith_cut_scale)
 
         history_g = []
         history_f = []
@@ -338,6 +389,8 @@ class Calibrator:
         finally:
             if _stop_flag is None:
                 _StopFitFlag.restore(old_handler)
+            if zenith_cut_scale is not None:
+                self.fwd.precompute_time_geometry(self.rot_matrices, zenith_cut_scale=None)
         return sky_coeffs, gain_params, loss
 
     def fit_alternating_dirty(
@@ -351,15 +404,27 @@ class Calibrator:
         momentum: float = 0.0,
         polish_every: int = 0,
         polish_maxiter: int = 5,
+        zenith_cut_scale: float | None = None,
         verbose: bool = False,
         _stop_flag=None,
     ):
+        """Alternating dirty-map minimisation.
+
+        Parameters
+        ----------
+        zenith_cut_scale : float or None
+            If given, enable a per-time dynamic zenith cut during this fit.
+            Automatically removed and the full horizon-visible pixel set
+            restored on return, even if interrupted.
+        """
         if _stop_flag is None:
             stop = _StopFitFlag()
             old_handler = _StopFitFlag.install(stop)
         else:
             stop = _stop_flag
             old_handler = None
+        if zenith_cut_scale is not None:
+            self.fwd.precompute_time_geometry(self.rot_matrices, zenith_cut_scale=zenith_cut_scale)
         try:
             loss = float(self._jit_loss({'sky_coeffs': sky_coeffs, **gain_params}))
             for i in range(n_outer):
@@ -382,6 +447,8 @@ class Calibrator:
         finally:
             if _stop_flag is None:
                 _StopFitFlag.restore(old_handler)
+            if zenith_cut_scale is not None:
+                self.fwd.precompute_time_geometry(self.rot_matrices, zenith_cut_scale=None)
         return sky_coeffs, gain_params, loss
 
     def fit_alternating(
@@ -391,15 +458,27 @@ class Calibrator:
         n_outer: int = 10,
         sky_maxiter: int = 10,
         sky_tol: float = 1e-7,
+        zenith_cut_scale: float | None = None,
         verbose: bool = False,
         _stop_flag=None,
     ):
+        """Alternating L-BFGS sky / linear-gain minimisation.
+
+        Parameters
+        ----------
+        zenith_cut_scale : float or None
+            If given, enable a per-time dynamic zenith cut during this fit.
+            Automatically removed and the full horizon-visible pixel set
+            restored on return, even if interrupted.
+        """
         if _stop_flag is None:
             stop = _StopFitFlag()
             old_handler = _StopFitFlag.install(stop)
         else:
             stop = _stop_flag
             old_handler = None
+        if zenith_cut_scale is not None:
+            self.fwd.precompute_time_geometry(self.rot_matrices, zenith_cut_scale=zenith_cut_scale)
         try:
             loss = float(self._jit_loss({'sky_coeffs': sky_coeffs, **gain_params}))
             for i in range(n_outer):
@@ -412,6 +491,8 @@ class Calibrator:
         finally:
             if _stop_flag is None:
                 _StopFitFlag.restore(old_handler)
+            if zenith_cut_scale is not None:
+                self.fwd.precompute_time_geometry(self.rot_matrices, zenith_cut_scale=None)
         return sky_coeffs, gain_params, loss
 
     def fit_lbfgs(self, params, maxiter: int = 30, tol: float = 1e-7):
