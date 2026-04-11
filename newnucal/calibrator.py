@@ -246,6 +246,74 @@ class Calibrator:
         loss = float(beam_loss(new_beam))
         return new_params, loss
 
+    def fit_beam_dirty(
+        self,
+        params,
+        n_iter: int = 3,
+        step_size: float = 0.5,
+        sky_reg: float = 1e-3,
+        verbose: bool = False,
+    ):
+        """Dirty-map beam update: backproject residuals through the sky model.
+
+        Dual of :meth:`fit_sky_dirty`.  With sky and gains held fixed, forms the
+        matched-filter beam correction via
+        :meth:`~newnucal.simulate.ForwardModel.accumulate_beam_update`, applies
+        it, updates the ForwardModel beam cache, and recompiles the JIT functions.
+
+        Parameters
+        ----------
+        params : dict
+            Must include ``sky_coeffs``, ``beam_coeffs``, ``log_amp``,
+            ``phase``, ``phi``.
+        n_iter : int
+            Number of dirty beam steps.
+        step_size : float
+            Multiplies the matched-filter update (``< 1`` for damping).
+        sky_reg : float
+            Regularisation in the sky-matched-filter denominator.
+        verbose : bool
+
+        Returns
+        -------
+        params : dict — updated with new ``beam_coeffs``
+        loss : float
+        """
+        sky_coeffs  = params['sky_coeffs']
+        gain_params = {k: params[k] for k in ('log_amp', 'phase', 'phi')}
+        beam_coeffs = params['beam_coeffs']
+
+        best_bc   = beam_coeffs
+        best_loss = float(self._jit_loss(params))
+
+        for i in range(n_iter):
+            resid = self.calibrated_residual(
+                {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params}
+            )
+            delta_bc = self.fwd.accumulate_beam_update(
+                sky_coeffs, resid, step_size=step_size, sky_reg=sky_reg,
+            )
+            new_bc = beam_coeffs + delta_bc
+            self.fwd.update_beam_cache(new_bc)
+            self._recompile_jit()
+            loss = float(self._jit_loss(
+                {'sky_coeffs': sky_coeffs, 'beam_coeffs': new_bc, **gain_params}
+            ))
+            if loss < best_loss:
+                best_loss = loss
+                best_bc   = new_bc
+                beam_coeffs = new_bc
+            else:
+                if verbose:
+                    print('    WARNING: beam dirty loss increased, reverting')
+                self.fwd.update_beam_cache(best_bc)
+                self._recompile_jit()
+                break
+            if verbose:
+                print(f'    dirty beam iter {i:03d}: loss={loss:.4e}')
+
+        return {**params, 'beam_coeffs': best_bc}, best_loss
+
     def fit_sky_only(self, sky_coeffs, gain_params, maxiter: int = 30, tol: float = 1e-7):
         inv_gain_params = {
             'log_amp': -gain_params['log_amp'],
@@ -331,8 +399,9 @@ class Calibrator:
         polish_maxiter: int = 5,
         zenith_cut_scale: float | None = None,
         solve_every: dict | None = None,
-        beam_maxiter: int = 10,
-        beam_tol: float = 1e-7,
+        beam_maxiter: int = 3,
+        beam_step_size: float = 0.5,
+        beam_sky_reg: float = 1e-3,
         verbose: bool = False,
         _stop_flag=None,
     ):
@@ -353,7 +422,7 @@ class Calibrator:
                 solving entirely.
             ``'beam'`` (int, default 0)
                 Solve beam every *N* iterations using
-                :meth:`fit_beam_only`.  ``0`` (default) disables beam solving.
+                :meth:`fit_beam_dirty`.  ``0`` (default) disables beam solving.
             ``'polish'`` (int, default 0)
                 Run an L-BFGS sky polish (``polish_maxiter`` steps via
                 :meth:`fit_sky_only`) every *N* iterations, followed by
@@ -466,10 +535,11 @@ class Calibrator:
                 # --- Beam solve (if scheduled) ---
                 if beam_every > 0 and (i + 1) % beam_every == 0:
                     if verbose:
-                        print(f'    [beam]: starting L-BFGS beam solve ...')
-                    bp, loss = self.fit_beam_only(
+                        print(f'    [beam]: starting dirty beam solve ...')
+                    bp, loss = self.fit_beam_dirty(
                         {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params},
-                        maxiter=beam_maxiter, tol=beam_tol,
+                        n_iter=beam_maxiter, step_size=beam_step_size,
+                        sky_reg=beam_sky_reg, verbose=verbose,
                     )
                     beam_coeffs = bp['beam_coeffs']
                     if verbose:

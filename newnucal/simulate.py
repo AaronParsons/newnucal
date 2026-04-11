@@ -450,6 +450,88 @@ class ForwardModel:
         delta_coeffs = (delta_eq_pf.real @ self.A_sky).astype(DTYPE_R)
         return delta_coeffs
 
+    def accumulate_beam_update(
+        self,
+        sky_coeffs,
+        residual_vis,
+        step_size: float = 1.0,
+        sky_reg: float = 1e-3,
+    ):
+        """Accumulate a global beam-coefficient update from all times.
+
+        Dual of :meth:`accumulate_equatorial_sky_update`.  With sky and gains
+        held fixed, this backprojects the gain-calibrated residuals through the
+        sky model to estimate the beam-coefficient correction that best reduces
+        the residual.
+
+        Math sketch (one time step *t*, pixel *p*, frequency *f*):
+
+        * Backproject: ``dirty[p,f] = NUFFT^H(r[t]) → IFFT → pixel×freq``
+        * Matched filter in sky: ``δb[p,f] = step_size · sky^* · dirty / (|sky|² + reg)``
+        * Project to beam DPSS: ``δbᵢ[p,m] = real(δb[p,:]) · horizon[p] @ A_beam``
+        * Adjoint scatter to beam pixels:
+          ``δbc[q,m] += wgt[k,p] · |sky|² · δbᵢ[p,m]``  for each neighbour *k*
+
+        Accumulate numerator/denominator over all times, then normalise.
+
+        Parameters
+        ----------
+        sky_coeffs : array_like, shape (npix_sky, nmodes_sky)
+        residual_vis : array_like, shape (ntime, nfreq, nbls)
+            Gain-calibrated residual ``data_cal − vis_model`` (no gain factor).
+        step_size : float
+        sky_reg : float
+            Regularisation added to ``|sky_spec|²`` denominator (prevents
+            blow-up where the sky is faint).
+
+        Returns
+        -------
+        delta_bc : jnp.ndarray, shape (npix_beam, nmodes_beam)
+        """
+        ab_np = np.asarray(self.A_beam, dtype=np.float32)   # (nfreq, nmodes_beam)
+
+        # Sky spectrum in pixel × frequency space (complex for matched filter)
+        sky_spec = np.asarray(
+            (jnp.array(sky_coeffs) @ self.A_sky.T).astype(DTYPE_C)
+        )                                                    # (npix_sky, nfreq)
+        sky_weight = (sky_spec.real ** 2 + sky_spec.imag ** 2).astype(
+            np.float32
+        )                                                    # |sky_spec|² (npix_sky, nfreq)
+        # Per-pixel sky power (summed over frequency) used to weight the scatter
+        sky_pow = sky_weight.sum(axis=1)                     # (npix_sky,)
+
+        num = np.zeros((self.npix_beam, self.nmodes_beam), dtype=np.float32)
+        den = np.zeros(self.npix_beam, dtype=np.float32)
+
+        ntime = int(residual_vis.shape[0])
+        for tind in range(ntime):
+            # Backproject residuals to apparent pixel×frequency map (complex)
+            dirty_pf = np.asarray(
+                self.dirty_apparent_sky_one_time(residual_vis[tind], tind)
+            )                                                # (npix_sky, nfreq)
+            horizon = np.asarray(self._horizon_all[tind])   # (npix_sky,)
+
+            # Matched-filter update in apparent-beam space
+            delta_bsf = (
+                step_size * np.conj(sky_spec) * dirty_pf / (sky_weight + sky_reg)
+            )                                                # (npix_sky, nfreq) complex
+
+            # Project real part onto beam DPSS, masked by horizon
+            delta_bi = (np.real(delta_bsf) * horizon[:, None]) @ ab_np
+            # (npix_sky, nmodes_beam)
+
+            # Adjoint scatter-add: sky pixel → its 4 beam-pixel neighbours
+            px  = self._interp_px_all[tind]   # (4, npix_sky) int32
+            wgt = self._interp_wgt_all[tind]  # (4, npix_sky) float32
+            for k in range(4):
+                w_k = wgt[k] * sky_pow         # (npix_sky,) scatter weight
+                np.add.at(num, px[k], w_k[:, None] * delta_bi)
+                np.add.at(den, px[k], w_k)
+
+        delta_bc = num / (den[:, None] + 1e-6)
+        delta_bc /= ntime
+        return jnp.array(delta_bc, dtype=DTYPE_R)
+
     # ------------------------------------------------------------------
     # Beam update helpers
     # ------------------------------------------------------------------
