@@ -97,7 +97,7 @@ class Calibrator:
         nmodes_sky = self.A_sky.shape[1]
         return {
             'sky_coeffs': jnp.zeros((npix_sky, nmodes_sky), dtype=DTYPE_R),
-            **init_gain_params(self.nfreq),
+            **init_gain_params(self.ntime, self.nfreq),
         }
 
     def init_sky_from_flux(self, flux):
@@ -155,23 +155,38 @@ class Calibrator:
 
     def fit_gains_linear(self, sky_coeffs):
         vis_model = jax.jit(self.fwd.simulate)(sky_coeffs, self.rot_matrices)
-        num = jnp.sum(self.data * jnp.conj(vis_model), axis=0)
-        den = jnp.sum(jnp.abs(vis_model) ** 2, axis=0)
-        g_opt = np.array(num / (den + 1e-30))
-        w = np.array(den)
-        log_g = np.log(g_opt)
+        # Per-time optimal complex gain: data · conj(model) / |model|²
+        # Shape: (ntime, nfreq, nbls)
+        den = np.array(jnp.abs(vis_model) ** 2)          # (ntime, nfreq, nbls), weights
+        g_opt = np.array(self.data * jnp.conj(vis_model)) / (den + 1e-30)
+        log_g = np.log(g_opt + 0j)                        # complex log, (ntime, nfreq, nbls)
+
+        # log_amp: baseline-weighted mean of Re(log g) per (time, freq)
+        w_sum = den.sum(axis=2) + 1e-30                   # (ntime, nfreq)
+        log_amp = (den * np.real(log_g)).sum(axis=2) / w_sum  # (ntime, nfreq)
+
+        # phase and phi: weighted lstsq over baselines, independently per (time, freq)
+        # Design matrix X: (nbls, 3) — [1, bl_E, bl_N]
         bls = np.array(self.bls)
-        w_sum = w.sum(axis=1) + 1e-30
-        log_amp = (w * np.real(log_g)).sum(axis=1) / w_sum
-        X = np.column_stack([np.ones(self.nbls), bls[:, 0], bls[:, 1]])
-        theta = np.empty((3, self.nfreq), dtype=np.float64)
-        for f in range(self.nfreq):
-            sw = np.sqrt(w[f] + 1e-30)
-            theta[:, f] = np.linalg.lstsq(X * sw[:, None], np.imag(log_g[f]) * sw, rcond=None)[0]
+        X = np.column_stack([np.ones(self.nbls), bls[:, 0], bls[:, 1]])  # (nbls, 3)
+
+        # Xy[t, f, k] = sum_b X[b, k] * den[t, f, b] * Im(log_g[t, f, b])
+        Xy = np.einsum('bk,tfb->tfk', X, den * np.imag(log_g))   # (ntime, nfreq, 3)
+        # XTX[t, f, k, l] = sum_b X[b, k] * den[t, f, b] * X[b, l]
+        XTX = np.einsum('bk,tfb,bl->tfkl', X, den, X)             # (ntime, nfreq, 3, 3)
+        XTX += 1e-10 * np.eye(3)                                   # regularise
+
+        # Solve all (time, freq) systems at once via numpy broadcasting.
+        # Add trailing dim so solve sees (..., 3, 1) not (..., 3) — required
+        # by numpy ≥2.0 which no longer treats b.ndim == a.ndim-1 as a vector.
+        theta = np.linalg.solve(XTX, Xy[..., None])[..., 0]       # (ntime, nfreq, 3)
+
         gain_params = {
-            'log_amp': jnp.array(log_amp, dtype=jnp.float32),
-            'phase': jnp.array(theta[0], dtype=jnp.float32),
-            'phi': jnp.array(theta[1:], dtype=jnp.float32),
+            'log_amp': jnp.array(log_amp, dtype=jnp.float32),             # (ntime, nfreq)
+            'phase':   jnp.array(theta[:, :, 0], dtype=jnp.float32),      # (ntime, nfreq)
+            'phi':     jnp.array(                                           # (ntime, 2, nfreq)
+                theta[:, :, 1:].transpose(0, 2, 1), dtype=jnp.float32
+            ),
         }
         loss = float(self._jit_loss({'sky_coeffs': sky_coeffs, **gain_params}))
         return gain_params, loss
