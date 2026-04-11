@@ -223,6 +223,8 @@ class ForwardModel:
         src_x_all = []
         src_y_all = []
         src_z_all = []
+        interp_px_all = []
+        interp_wgt_all = []
 
         zenith_px_idx_list    = [] if cos_theta_cut is not None else None
         zenith_beam_spec_list = [] if cos_theta_cut is not None else None
@@ -243,6 +245,11 @@ class ForwardModel:
             px, wgts = get_interp_weights(topo_th, topo_ph, self.beam_nside)
             px = np.array(px, dtype=np.int32)
             wgts = np.array(wgts, dtype=np.float32)
+
+            # Store interpolation stencil for beam solving (update_beam_cache /
+            # simulate_variable_beam).  px/wgts shape: (4, npix_sky).
+            interp_px_all.append(px)
+            interp_wgt_all.append(wgts)
 
             # Beam spec × horizon for all pixels.  This precomputed array is
             # used by _simulate_one_precomputed and apparent_sky_update_one_time,
@@ -285,6 +292,11 @@ class ForwardModel:
         self._src_x_all = jnp.array(np.stack(src_x_all), dtype=DTYPE_R)
         self._src_y_all = jnp.array(np.stack(src_y_all), dtype=DTYPE_R)
         self._src_z_all = jnp.array(np.stack(src_z_all), dtype=DTYPE_R)
+        # Bilinear stencil for beam solving — list of (4, npix_sky) numpy arrays,
+        # one per time step.  Kept as a list so that beam solving can be done with
+        # a per-time Python loop without stacking into a single large array.
+        self._interp_px_all  = interp_px_all   # list[np.ndarray(4, npix_sky), int32]
+        self._interp_wgt_all = interp_wgt_all  # list[np.ndarray(4, npix_sky), float32]
 
         if cos_theta_cut is not None:
             self._zenith_cut_active = True
@@ -438,10 +450,114 @@ class ForwardModel:
         delta_coeffs = (delta_eq_pf.real @ self.A_sky).astype(DTYPE_R)
         return delta_coeffs
 
+    # ------------------------------------------------------------------
+    # Beam update helpers
+    # ------------------------------------------------------------------
+
+    def update_beam_cache(self, beam_coeffs):
+        """Recompute :attr:`_beam_spec_horizon_all` from new *beam_coeffs*.
+
+        Cheaper than a full :meth:`precompute_time_geometry` call because the
+        NUFFT source coordinates and interpolation stencil are already stored.
+        After this call :attr:`_jit_one` is recompiled so subsequent
+        :meth:`simulate` calls use the updated beam.
+
+        Parameters
+        ----------
+        beam_coeffs : array_like, shape (npix_beam, nmodes_beam)
+        """
+        if not self._geom_ready:
+            raise RuntimeError('Call precompute_time_geometry() first.')
+        bc_np = np.asarray(beam_coeffs, dtype=np.float32)
+        ab_np = np.asarray(self.A_beam)
+        ntime = len(self._interp_px_all)
+        beam_spec_horizon_all = []
+        for i in range(ntime):
+            px   = self._interp_px_all[i]   # (4, npix_sky)
+            wgt  = self._interp_wgt_all[i]  # (4, npix_sky)
+            horiz = np.asarray(self._horizon_all[i])  # (npix_sky,)
+            bi = np.sum(wgt[:, :, None] * bc_np[px], axis=0)  # (npix_sky, nmodes_beam)
+            bs = (bi @ ab_np.T) * horiz[:, None]               # (npix_sky, nfreq)
+            beam_spec_horizon_all.append(bs)
+        self._beam_spec_horizon_all = jnp.array(
+            np.stack(beam_spec_horizon_all), dtype=DTYPE_R
+        )
+        self.beam_coeffs = jnp.array(bc_np, dtype=DTYPE_R)
+        # Invalidate compiled simulation so the new precomputed beam is used.
+        if self.A_sky is not None:
+            self._jit_one = jax.jit(self._simulate_one_precomputed)
+
+    def _simulate_one_variable_beam(self, sky_coeffs, beam_coeffs, tind):
+        """Forward model for one time step with *beam_coeffs* as a traced input.
+
+        Differentiable w.r.t. both *sky_coeffs* and *beam_coeffs* via JAX AD.
+        Uses the bilinear stencil stored during :meth:`precompute_time_geometry`.
+        Only supports the non-zenith-cut path.
+        """
+        px  = self._interp_px_all[tind]   # numpy (4, npix_sky) — static indices
+        wgt = jnp.array(self._interp_wgt_all[tind])  # (4, npix_sky)
+        # Interpolate beam coeffs to sky-pixel positions.
+        # beam_coeffs[px] gathers with static indices — JAX differentiates via scatter-add.
+        bi = jnp.sum(wgt[:, :, None] * beam_coeffs[px], axis=0)   # (npix_sky, nmodes_beam)
+        beam_spec_h = (bi @ self.A_beam.T) * self._horizon_all[tind][:, None]  # (npix_sky, nfreq)
+        sky_spec = sky_coeffs @ self.A_sky.T                        # (npix_sky, nfreq)
+        W = sky_spec * beam_spec_h
+        W_eta_full = jnp.fft.fft(W, axis=1) * self._phase_full[None, :]
+        W_eta = W_eta_full[:, self._eta_idx]
+        vis_flat = nufft3(
+            W_eta.ravel().astype(DTYPE_C),
+            self._src_x_all[tind], self._src_y_all[tind], self._src_z_all[tind],
+            self._tgt_x, self._tgt_y, self._tgt_z,
+            iflag=1,
+            eps=self.eps,
+        )
+        return vis_flat.reshape(self.nfreq, self.nbls)
+
+    def simulate_variable_beam(self, sky_coeffs, beam_coeffs, rot_matrices):
+        """Simulate all time steps with *beam_coeffs* as a differentiable input.
+
+        Unlike :meth:`simulate`, this path computes the beam interpolation
+        on-the-fly inside the computation graph, making the output differentiable
+        w.r.t. *beam_coeffs*.  The Python loop is unrolled by JAX when JIT-compiled
+        (e.g. by jaxopt), so no Python overhead appears in gradient computation.
+
+        The zenith-cut optimisation is not supported here; the full pixel set is
+        always used.
+
+        Parameters
+        ----------
+        sky_coeffs : array_like, shape (npix_sky, nmodes_sky)
+        beam_coeffs : array_like, shape (npix_beam, nmodes_beam)
+        rot_matrices : array_like, shape (ntime, 3, 3)  — passed for API symmetry
+
+        Returns
+        -------
+        vis : jnp.ndarray, shape (ntime, nfreq, nbls)
+        """
+        if not self._geom_ready:
+            raise RuntimeError('Call precompute_time_geometry() first.')
+        ntime = len(self._interp_px_all)
+        return jnp.stack([
+            self._simulate_one_variable_beam(sky_coeffs, beam_coeffs, t)
+            for t in range(ntime)
+        ])
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
     @property
     def npix_sky(self) -> int:
         # eq_coords has shape (3, npix_active); reflects any applied pixel mask
         return int(self.eq_coords.shape[1])
+
+    @property
+    def npix_beam(self) -> int:
+        return int(self.beam_coeffs.shape[0])
+
+    @property
+    def nmodes_beam(self) -> int:
+        return int(self.beam_coeffs.shape[1])
 
     @property
     def nfreq(self) -> int:

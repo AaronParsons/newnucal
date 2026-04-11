@@ -96,7 +96,8 @@ class Calibrator:
         npix_sky = self.fwd.npix_sky
         nmodes_sky = self.A_sky.shape[1]
         return {
-            'sky_coeffs': jnp.zeros((npix_sky, nmodes_sky), dtype=DTYPE_R),
+            'sky_coeffs':  jnp.zeros((npix_sky, nmodes_sky), dtype=DTYPE_R),
+            'beam_coeffs': jnp.array(self.fwd.beam_coeffs),
             **init_gain_params(self.ntime, self.nfreq),
         }
 
@@ -191,16 +192,59 @@ class Calibrator:
         loss = float(self._jit_loss({'sky_coeffs': sky_coeffs, **gain_params}))
         return gain_params, loss
 
-    def fit_gains_only(self, sky_coeffs, gain_params, maxiter: int = 60, tol: float = 1e-9):
-        vis_model = jax.jit(self.fwd.simulate)(sky_coeffs, self.rot_matrices)
+    def _recompile_jit(self):
+        """Recompile loss JIT functions after precomputed arrays change (e.g. beam update)."""
+        self._jit_loss = jax.jit(self._loss)
+        self._jit_val_grad = jax.jit(jax.value_and_grad(self._loss))
 
-        def gain_loss(gp):
-            vis_cal = apply_gains(vis_model, gp['log_amp'], gp['phase'], gp['phi'], self.bls)
+    def fit_beam_only(self, params, maxiter: int = 10, tol: float = 1e-7):
+        """L-BFGS on beam_coeffs with sky and gains held fixed.
+
+        Uses :meth:`~newnucal.simulate.ForwardModel.simulate_variable_beam` so
+        the loss is differentiable w.r.t. *beam_coeffs* via JAX AD.  After the
+        solve the ForwardModel's precomputed beam cache is updated and the
+        calibrator's JIT functions are recompiled so subsequent sky/gain solves
+        use the new beam.
+
+        Parameters
+        ----------
+        params : dict
+            Must include ``sky_coeffs``, ``beam_coeffs``, ``log_amp``, ``phase``,
+            ``phi``.
+        maxiter : int
+        tol : float
+
+        Returns
+        -------
+        params : dict — updated with new ``beam_coeffs``
+        loss : float
+        """
+        sky_coeffs = params['sky_coeffs']
+        gain_params = {k: params[k] for k in ('log_amp', 'phase', 'phi')}
+        bls = self.bls
+
+        def beam_loss(bc):
+            vis_model = self.fwd.simulate_variable_beam(sky_coeffs, bc, self.rot_matrices)
+            vis_cal = apply_gains(
+                vis_model, gain_params['log_amp'], gain_params['phase'],
+                gain_params['phi'], bls,
+            )
             return jnp.mean(jnp.abs(self.data - vis_cal) ** 2)
 
-        solver = LBFGS(fun=gain_loss, tol=tol, maxiter=maxiter, verbose=False, linesearch='backtracking', increase_factor=5, history_size=20, jit=True)
-        result = solver.run(gain_params)
-        return result.params, float(result.state.value)
+        solver = LBFGS(
+            fun=beam_loss, tol=tol, maxiter=maxiter, verbose=False,
+            linesearch='backtracking', increase_factor=5, history_size=10, jit=True,
+        )
+        result = solver.run(params['beam_coeffs'])
+        new_beam = result.params
+
+        # Update the precomputed cache so sky/gain solves see the new beam.
+        self.fwd.update_beam_cache(new_beam)
+        self._recompile_jit()
+
+        new_params = {**params, 'beam_coeffs': new_beam}
+        loss = float(beam_loss(new_beam))
+        return new_params, loss
 
     def fit_sky_only(self, sky_coeffs, gain_params, maxiter: int = 30, tol: float = 1e-7):
         inv_gain_params = {
@@ -224,7 +268,7 @@ class Calibrator:
         self,
         sky_coeffs,
         gain_params,
-        n_minor: int = 3,
+        n_iter: int = 3,
         step_size: float = 0.5,
         beam_reg: float = 1e-3,
         momentum: float = 0.0,
@@ -233,7 +277,7 @@ class Calibrator:
         velocity = jnp.zeros_like(sky_coeffs)
         best_sky = sky_coeffs
         best_loss = float(self._jit_loss({'sky_coeffs': sky_coeffs, **gain_params}))
-        for i in range(n_minor):
+        for i in range(n_iter):
             resid = self.calibrated_residual({'sky_coeffs': sky_coeffs, **gain_params})
             delta = self.fwd.accumulate_equatorial_sky_update(resid, step_size=step_size, beam_reg=beam_reg)
             velocity = momentum * velocity + delta
@@ -245,7 +289,7 @@ class Calibrator:
             else:
                 print('    WARNING: loss increased')
             if verbose:
-                print(f'    dirty minor {i:03d}: loss={loss:.4e}')
+                print(f'    dirty iter {i:03d}: loss={loss:.4e}')
         return best_sky, best_loss
 
     @staticmethod
@@ -275,8 +319,7 @@ class Calibrator:
     def fit_alternating_dirty(
         self,
         params,
-        n_outer: int = 10,
-        n_minor: int = 3,
+        n_iter: int = 30,
         step_size: float = 0.5,
         beam_reg: float = 1e-3,
         momentum: float = 0.0,
@@ -285,9 +328,11 @@ class Calibrator:
         aa_damping: float = 0.5,
         aa_ridge: float = 1e-8,
         aa_max_weight: float = 10.0,
-        polish_every: int = 0,
         polish_maxiter: int = 5,
         zenith_cut_scale: float | None = None,
+        solve_every: dict | None = None,
+        beam_maxiter: int = 10,
+        beam_tol: float = 1e-7,
         verbose: bool = False,
         _stop_flag=None,
     ):
@@ -295,25 +340,49 @@ class Calibrator:
 
         Parameters
         ----------
-        params : dict with keys ``sky_coeffs``, ``log_amp``, ``phase``, ``phi``
+        params : dict with keys ``sky_coeffs``, ``beam_coeffs``, ``log_amp``,
+            ``phase``, ``phi``
+        n_iter : int
+            Total number of iterations.  The sky receives one dirty-map update
+            per iteration.
+        solve_every : dict or None
+            Controls how often non-sky components are updated.  Keys:
+
+            ``'gains'`` (int, default 1)
+                Solve gains every *N* iterations.  ``0`` disables gain
+                solving entirely.
+            ``'beam'`` (int, default 0)
+                Solve beam every *N* iterations using
+                :meth:`fit_beam_only`.  ``0`` (default) disables beam solving.
+            ``'polish'`` (int, default 0)
+                Run an L-BFGS sky polish (``polish_maxiter`` steps via
+                :meth:`fit_sky_only`) every *N* iterations, followed by
+                a gain re-solve.  ``0`` (default) disables polishing.
+
+            Example: ``solve_every={'gains': 1, 'beam': 5, 'polish': 10}``.
         anderson_history : int
-            Number of outer iterates to keep for Anderson acceleration.
-            ``0`` (default) disables Anderson and uses plain alternating updates.
-            Set to a positive value (e.g. 4) to enable Anderson acceleration on
-            the sky fixed-point map: sky → fit_gains_linear → fit_sky_dirty → new sky.
+            Number of iterates to keep for Anderson acceleration on the
+            sky fixed-point map.  ``0`` disables Anderson.
         zenith_cut_scale : float or None
             If given, enable a per-time dynamic zenith cut during this fit.
-            Automatically removed and the full horizon-visible pixel set
-            restored on return, even if interrupted.
+            Automatically removed on return, even if interrupted.
 
         Returns
         -------
         params : dict
-            Updated parameters with keys ``sky_coeffs``, ``log_amp``, ``phase``, ``phi``.
+            Updated parameters with keys ``sky_coeffs``, ``beam_coeffs``,
+            ``log_amp``, ``phase``, ``phi``.
         loss : float
         """
-        sky_coeffs = params['sky_coeffs']
+        if solve_every is None:
+            solve_every = {}
+        gains_every  = solve_every.get('gains',  1)
+        beam_every   = solve_every.get('beam',   0)
+        polish_every = solve_every.get('polish', 0)
+
+        sky_coeffs  = params['sky_coeffs']
         gain_params = {k: params[k] for k in ('log_amp', 'phase', 'phi')}
+        beam_coeffs = params.get('beam_coeffs', self.fwd.beam_coeffs)
 
         if _stop_flag is None:
             stop = _StopFitFlag()
@@ -327,14 +396,22 @@ class Calibrator:
         history_g = []
         history_f = []
 
+        def _full_params():
+            return {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params}
+
         try:
-            loss = float(self._jit_loss(params))
-            for i in range(n_outer):
-                # Plain outer step: update gains, then update sky
-                gain_params, _ = self.fit_gains_linear(sky_coeffs)
+            loss = float(self._jit_loss(_full_params()))
+            for i in range(n_iter):
+                # --- Gain solve (if scheduled) ---
+                if gains_every > 0 and i % gains_every == 0:
+                    gain_params, _gl = self.fit_gains_linear(sky_coeffs)
+                    if verbose:
+                        print(f'    [gains]: loss={_gl:.4e}')
+
+                # --- Sky dirty update (every step) ---
                 sky_plain, loss_plain = self.fit_sky_dirty(
                     sky_coeffs, gain_params,
-                    n_minor=n_minor, step_size=step_size,
+                    n_iter=1, step_size=step_size,
                     beam_reg=beam_reg, momentum=momentum, verbose=verbose,
                 )
                 gain_plain = gain_params
@@ -362,7 +439,9 @@ class Calibrator:
                             sky_aa = self._unflatten_sky_coeffs(g_mix, sky_coeffs.shape)
                             sky_cand = ((1.0 - aa_damping) * sky_plain + aa_damping * sky_aa).astype(DTYPE_R)
                             gain_cand, _ = self.fit_gains_linear(sky_cand)
-                            loss_cand = float(self._jit_loss({'sky_coeffs': sky_cand, **gain_cand}))
+                            loss_cand = float(self._jit_loss(
+                                {'sky_coeffs': sky_cand, 'beam_coeffs': beam_coeffs, **gain_cand}
+                            ))
                             if loss_cand < loss_plain:
                                 sky_next = sky_cand
                                 gain_next = gain_cand
@@ -373,15 +452,32 @@ class Calibrator:
                 gain_params = gain_next
                 loss = loss_next
 
-                if polish_every and ((i + 1) % polish_every == 0):
+                # --- Polish sky with L-BFGS (if scheduled) ---
+                if polish_every > 0 and (i + 1) % polish_every == 0:
+                    if verbose:
+                        print(f'    [polish]: starting L-BFGS sky polish ...')
                     sky_coeffs, loss = self.fit_sky_only(
                         sky_coeffs, gain_params, maxiter=polish_maxiter, tol=1e-7
                     )
                     gain_params, _ = self.fit_gains_linear(sky_coeffs)
+                    if verbose:
+                        print(f'    [polish]: loss={loss:.4e}')
+
+                # --- Beam solve (if scheduled) ---
+                if beam_every > 0 and (i + 1) % beam_every == 0:
+                    if verbose:
+                        print(f'    [beam]: starting L-BFGS beam solve ...')
+                    bp, loss = self.fit_beam_only(
+                        {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params},
+                        maxiter=beam_maxiter, tol=beam_tol,
+                    )
+                    beam_coeffs = bp['beam_coeffs']
+                    if verbose:
+                        print(f'    [beam]: loss={loss:.4e}')
 
                 if verbose:
                     tag = 'AA' if used_anderson else 'plain'
-                    print(f'  outer {i:03d} [{tag}]: loss={loss:.4e}')
+                    print(f'  iter {i:04d} [{tag}]: loss={loss:.4e}')
                 if stop.stop:
                     break
         finally:
@@ -389,15 +485,18 @@ class Calibrator:
                 _StopFitFlag.restore(old_handler)
             if zenith_cut_scale is not None:
                 self.fwd.precompute_time_geometry(self.rot_matrices, zenith_cut_scale=None)
-        return {'sky_coeffs': sky_coeffs, **gain_params}, loss
+        return {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params}, loss
 
     def fit_alternating(
         self,
         params,
-        n_outer: int = 10,
+        n_iter: int = 10,
         sky_maxiter: int = 10,
         sky_tol: float = 1e-7,
         zenith_cut_scale: float | None = None,
+        solve_every: dict | None = None,
+        beam_maxiter: int = 10,
+        beam_tol: float = 1e-7,
         verbose: bool = False,
         _stop_flag=None,
     ):
@@ -405,19 +504,38 @@ class Calibrator:
 
         Parameters
         ----------
-        params : dict with keys ``sky_coeffs``, ``log_amp``, ``phase``, ``phi``
+        params : dict with keys ``sky_coeffs``, ``beam_coeffs``, ``log_amp``,
+            ``phase``, ``phi``
+        n_iter : int
+            Number of iterations.  The sky is updated (L-BFGS) every
+            iteration.
+        solve_every : dict or None
+            Controls how often non-sky components are updated.  Keys:
+
+            ``'gains'`` (int, default 1)
+                Solve gains every *N* iterations.
+            ``'beam'`` (int, default 0)
+                Solve beam every *N* iterations using
+                :meth:`fit_beam_only`.  ``0`` (default) disables beam solving.
         zenith_cut_scale : float or None
             If given, enable a per-time dynamic zenith cut during this fit.
-            Automatically removed and the full horizon-visible pixel set
-            restored on return, even if interrupted.
+            Automatically removed on return, even if interrupted.
 
         Returns
         -------
         params : dict
+            Updated parameters with keys ``sky_coeffs``, ``beam_coeffs``,
+            ``log_amp``, ``phase``, ``phi``.
         loss : float
         """
-        sky_coeffs = params['sky_coeffs']
+        if solve_every is None:
+            solve_every = {}
+        gains_every = solve_every.get('gains', 1)
+        beam_every  = solve_every.get('beam',  0)
+
+        sky_coeffs  = params['sky_coeffs']
         gain_params = {k: params[k] for k in ('log_amp', 'phase', 'phi')}
+        beam_coeffs = params.get('beam_coeffs', self.fwd.beam_coeffs)
 
         if _stop_flag is None:
             stop = _StopFitFlag()
@@ -429,11 +547,40 @@ class Calibrator:
             self.fwd.precompute_time_geometry(self.rot_matrices, zenith_cut_scale=zenith_cut_scale)
         try:
             loss = float(self._jit_loss(params))
-            for i in range(n_outer):
-                sky_coeffs, _ = self.fit_sky_only(sky_coeffs, gain_params, maxiter=sky_maxiter, tol=sky_tol)
-                gain_params, loss = self.fit_gains_linear(sky_coeffs)
+            for i in range(n_iter):
+                # --- Sky L-BFGS update (every step) ---
                 if verbose:
-                    print(f'  outer {i:03d}: loss={loss:.4e}')
+                    print(f'    [sky]: starting L-BFGS sky solve ...')
+                sky_coeffs, _sl = self.fit_sky_only(
+                    sky_coeffs, gain_params, maxiter=sky_maxiter, tol=sky_tol
+                )
+                if verbose:
+                    print(f'    [sky]: loss={_sl:.4e}')
+
+                # --- Gain solve (if scheduled) ---
+                if gains_every > 0 and (i + 1) % gains_every == 0:
+                    gain_params, loss = self.fit_gains_linear(sky_coeffs)
+                    if verbose:
+                        print(f'    [gains]: loss={loss:.4e}')
+                else:
+                    loss = float(self._jit_loss(
+                        {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params}
+                    ))
+
+                # --- Beam solve (if scheduled) ---
+                if beam_every > 0 and (i + 1) % beam_every == 0:
+                    if verbose:
+                        print(f'    [beam]: starting L-BFGS beam solve ...')
+                    bp, loss = self.fit_beam_only(
+                        {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params},
+                        maxiter=beam_maxiter, tol=beam_tol,
+                    )
+                    beam_coeffs = bp['beam_coeffs']
+                    if verbose:
+                        print(f'    [beam]: loss={loss:.4e}')
+
+                if verbose:
+                    print(f'  iter {i:04d}: loss={loss:.4e}')
                 if stop.stop:
                     break
         finally:
@@ -441,7 +588,7 @@ class Calibrator:
                 _StopFitFlag.restore(old_handler)
             if zenith_cut_scale is not None:
                 self.fwd.precompute_time_geometry(self.rot_matrices, zenith_cut_scale=None)
-        return {'sky_coeffs': sky_coeffs, **gain_params}, loss
+        return {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params}, loss
 
     def fit_lbfgs(self, params, maxiter: int = 30, tol: float = 1e-7):
         solver = LBFGS(fun=self._loss, tol=tol, maxiter=maxiter, verbose=False, linesearch='backtracking', increase_factor=5, history_size=10, jit=True)
@@ -477,3 +624,11 @@ class Calibrator:
     @property
     def nbls(self) -> int:
         return int(self.data.shape[2])
+
+    @property
+    def npix_beam(self) -> int:
+        return self.fwd.npix_beam
+
+    @property
+    def nmodes_beam(self) -> int:
+        return self.fwd.nmodes_beam
