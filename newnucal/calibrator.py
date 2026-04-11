@@ -3,6 +3,7 @@ Calibrator — ties together ForwardModel, gain parameters, and optimisation.
 """
 
 import signal as _signal
+import time as _time
 
 import numpy as np
 import jax
@@ -421,6 +422,7 @@ class Calibrator:
         sky_block_len: int = 1,
         beam_block_len: int = 1,
         polish_maxiter: int = 5,
+        beam_polish_maxiter: int = 5,
         zenith_cut_scale: float | None = None,
         solve_every: dict | None = None,
         beam_step_size: float = 0.5,
@@ -452,14 +454,19 @@ class Calibrator:
                 Solve gains every *N* cycles.
             ``'beam'`` (int, default 1)
                 Run a beam block every *N* cycles.  ``0`` disables beam solving.
-            ``'polish'`` (int, default 0)
-                Run an L-BFGS sky polish every *N* cycles after the dirty blocks.
+            ``'polish_sky'`` (int, default 0)
+                Run an L-BFGS sky polish (``polish_maxiter`` steps) every *N*
+                cycles, followed by a linear gain re-solve.
+            ``'polish_beam'`` (int, default 0)
+                Run an L-BFGS beam polish (``beam_polish_maxiter`` steps) every
+                *N* cycles.
         """
         if solve_every is None:
             solve_every = {}
-        gains_every = solve_every.get('gains', 1)
-        beam_every = solve_every.get('beam', 1)
-        polish_every = solve_every.get('polish', 0)
+        gains_every       = solve_every.get('gains',       1)
+        beam_every        = solve_every.get('beam',        1)
+        polish_sky_every  = solve_every.get('polish_sky',  0)
+        polish_beam_every = solve_every.get('polish_beam', 0)
 
         if beam_anderson_history is None:
             beam_anderson_history = anderson_history
@@ -522,6 +529,7 @@ class Calibrator:
 
         try:
             loss = float(self._jit_loss(_full_params(sky_coeffs, beam_coeffs, gain_params)))
+            _t0 = _time.perf_counter()
             for cyc in range(n_iter):
                 if gains_every > 0 and cyc % gains_every == 0:
                     gain_params, _gl = self.fit_gains_linear(sky_coeffs)
@@ -620,19 +628,33 @@ class Calibrator:
                     if stop.stop:
                         break
 
-                # --- optional polish per cycle ---
-                if polish_every > 0 and (cyc + 1) % polish_every == 0:
+                # --- optional sky polish ---
+                if polish_sky_every > 0 and (cyc + 1) % polish_sky_every == 0:
                     if verbose:
-                        print(f'    [polish]: starting L-BFGS sky polish ...')
+                        print(f'    [polish_sky]: starting L-BFGS sky polish ...')
                     sky_coeffs, loss = self.fit_sky_only(sky_coeffs, gain_params, maxiter=polish_maxiter, tol=1e-7)
                     gain_params, _ = self.fit_gains_linear(sky_coeffs)
                     if verbose:
-                        print(f'    [polish]: loss={loss:.4e}')
+                        print(f'    [polish_sky]: loss={loss:.4e}')
+
+                # --- optional beam polish ---
+                if polish_beam_every > 0 and (cyc + 1) % polish_beam_every == 0:
+                    if verbose:
+                        print(f'    [polish_beam]: starting L-BFGS beam polish ...')
+                    bp, loss = self.fit_beam_only(
+                        {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params},
+                        maxiter=beam_polish_maxiter, tol=1e-7,
+                    )
+                    beam_coeffs = bp['beam_coeffs']
+                    if verbose:
+                        print(f'    [polish_beam]: loss={loss:.4e}')
 
                 if verbose:
+                    elapsed = _time.perf_counter() - _t0
                     print(f'  cycle {cyc:04d}: loss={loss:.4e} '
                           f'[sky_AA={sky_block_used_aa}/{max(0, sky_block_len)} '
-                          f'beam_AA={beam_block_used_aa}/{max(0, beam_block_len) if beam_every > 0 and cyc % beam_every == 0 else 0}]')
+                          f'beam_AA={beam_block_used_aa}/{max(0, beam_block_len) if beam_every > 0 and cyc % beam_every == 0 else 0}] '
+                          f't={elapsed:.1f}s')
                 if stop.stop:
                     break
         finally:
@@ -704,6 +726,7 @@ class Calibrator:
             self.fwd.precompute_time_geometry(self.rot_matrices, zenith_cut_scale=zenith_cut_scale)
         try:
             loss = float(self._jit_loss(params))
+            _t0 = _time.perf_counter()
             for i in range(n_iter):
                 # --- Sky L-BFGS update (every step) ---
                 if verbose:
@@ -737,7 +760,8 @@ class Calibrator:
                         print(f'    [beam]: loss={loss:.4e}')
 
                 if verbose:
-                    print(f'  iter {i:04d}: loss={loss:.4e}')
+                    elapsed = _time.perf_counter() - _t0
+                    print(f'  iter {i:04d}: loss={loss:.4e}  t={elapsed:.1f}s')
                 if stop.stop:
                     break
         finally:
