@@ -1,26 +1,9 @@
 """
 Forward visibility simulation.
 
-ForwardModel maps sky DPSS coefficients → model visibilities via:
-
-  1. Rotate equatorial sky-pixel unit vectors to topocentric frame  (R(t) @ eq)
-  2. Apply horizon mask  (topo_z > 0)
-  3. Interpolate beam DPSS coefficients at rotated sky-pixel positions
-     using bilinear HEALPix interpolation (healjax)
-  4. Reconstruct per-pixel sky and beam spectra, multiply, apply horizon mask:
-       W[p, f] = sky(ν_f, p) * beam(ν_f, p, t) * horizon[p]
-  5. DFT W over the frequency axis → delay domain:
-       W_η[p, m] = FFT_f{W[p, f]}[m] * exp(-2πi η_m ν_0) / nfreq
-     so that  W[p, f] = Σ_m W_η[p, m] exp(2πi η_m ν_f)  exactly.
-  6. jax_finufft.nufft3 (type-3, non-uniform → non-uniform):
-
-       sources : (2π * topo_x_p, 2π * topo_y_p, 2π * η_m)  per (pixel, delay)
-       targets : (b_x * ν / c,   b_y * ν / c,   ν)          per (freq, baseline)
-
-     computes  V[f,b] = Σ_{p,m} W_η[p,m] exp(2πi ν_f (η_m + b·topo_p / c))
-                      = Σ_p W[p,f] exp(2πi ν_f b·topo_p / c)   (exact)
-
-Time loop uses jax.lax.scan over pre-computed rotation matrices.
+ForwardModel maps sky DPSS coefficients → model visibilities via a 3-D type-3
+NUFFT in (l, m, eta). This version also exposes adjoint/backprojection helpers
+for dirty-map sky updates.
 """
 
 import numpy as np
@@ -50,21 +33,12 @@ class ForwardModel:
     JAX forward visibility simulation using a 3-D type-3 NUFFT.
 
     The sky and beam are represented in arbitrary spectral bases (currently
-    DPSS).  Per time step, the sky × beam spectral product is transformed to
-    the delay domain via FFT, producing source weights W_η[p, m].  A single
-    type-3 NUFFT then maps all (pixel, delay) sources to all (freq, baseline)
-    targets simultaneously.
+    DPSS). Per time step, the sky × beam product is transformed to the delay
+    domain via FFT and mapped to visibilities with a single type-3 NUFFT.
 
-    Parameters
-    ----------
-    array : HERAArray
-    sky_nside : int
-        HEALPix resolution for the sky model.
-    beam_model : BeamModel
-    freqs : array_like, shape (nfreq,)
-        Frequency array in Hz.  Must match beam_model.freqs.
-    eps : float
-        NUFFT accuracy parameter.
+    In addition to the forward model, this class provides adjoint helpers for
+    dirty-map style sky updates. These helpers intentionally form the adjoint
+    of the current forward operator; they are not exact inverses.
     """
 
     def __init__(
@@ -74,179 +48,241 @@ class ForwardModel:
         beam_model: BeamModel,
         freqs,
         eps: float = 1e-6,
+        eta_max: float | None = None,
+        eta_padding: float = 0.0,
     ):
         self.array = array
         self.sky_nside = sky_nside
         self.beam_nside = beam_model.nside
         self.eps = eps
+        self.eta_max = eta_max
+        self.eta_padding = float(eta_padding)
 
         freqs_np = np.asarray(freqs, dtype=np.float64)
         self.freqs = jnp.array(freqs_np, dtype=DTYPE_R)
 
-        # Beam model (fixed)
-        self.A_beam = jnp.array(beam_model.A_beam, dtype=DTYPE_R)       # (nfreq, nmodes_beam)
-        self.beam_coeffs = jnp.array(beam_model.coeffs, dtype=DTYPE_R)  # (npix_beam, nmodes_beam)
+        self.A_beam = jnp.array(beam_model.A_beam, dtype=DTYPE_R)
+        self.beam_coeffs = jnp.array(beam_model.coeffs, dtype=DTYPE_R)
 
-        # Equatorial unit vectors for all sky pixels
         npix_sky = healpy.nside2npix(sky_nside)
         eq_xyz = np.array(
             healpy.pix2vec(sky_nside, np.arange(npix_sky)), dtype=DTYPE_R_NPY
         )
-        self.eq_coords = jnp.array(eq_xyz)  # (3, npix_sky)
+        self.eq_coords = jnp.array(eq_xyz)
 
-        # ------------------------------------------------------------------
-        # Delay grid and per-mode phase correction — depend only on freqs
-        # ------------------------------------------------------------------
         nfreq = len(freqs_np)
-        dnu   = float(freqs_np[1] - freqs_np[0])
-        nu_0  = float(freqs_np[0])
+        dnu = float(freqs_np[1] - freqs_np[0])
+        nu_0 = float(freqs_np[0])
         m_arr = np.arange(nfreq)
 
-        # η_m = m / (nfreq * Δν)  seconds (m > nfreq/2 are wrapped negative delays)
-        eta_np = m_arr / (nfreq * dnu)
+        # Wrapped FFT delay grid.
+        eta_np = np.fft.fftfreq(nfreq, d=dnu)
+        phase_np = np.exp(-2j * np.pi * eta_np * nu_0) / nfreq
 
-        # After FFT over f, multiply by phase[m] so that
-        #   W[p, f] = Σ_m (FFT(W)[p,m] * phase[m]) * exp(2πi η_m ν_f)
-        phase_np = np.exp(-2j * np.pi * m_arr * nu_0 / (nfreq * dnu)) / nfreq
+        self._eta_full = jnp.array(eta_np.astype(np.float32))
+        self._phase_full = jnp.array(phase_np.astype(np.complex64))
 
-        self._eta   = jnp.array(eta_np.astype(np.float32))      # (nfreq,)
-        self._phase = jnp.array(phase_np.astype(np.complex64))  # (nfreq,)
+        if eta_max is None:
+            eta_idx_np = np.arange(nfreq, dtype=np.int32)
+        else:
+            support = np.abs(eta_np) <= (float(eta_max) + self.eta_padding)
+            eta_idx_np = np.where(support)[0].astype(np.int32)
+            if eta_idx_np.size == 0:
+                raise ValueError('Delay support mask kept zero bins.')
 
-        # ------------------------------------------------------------------
-        # NUFFT target coordinates — fixed across all time steps
-        # ------------------------------------------------------------------
-        #   tgt[f * nbls + b] = (ν_f * b_x/c,  ν_f * b_y/c,  ν_f)
-        bls_np = np.asarray(array.bls, dtype=np.float64)  # (nbls, 3)
-        nbls   = bls_np.shape[0]
-        tgt_x  = (freqs_np[:, None] * bls_np[None, :, 0] / C).ravel()
-        tgt_y  = (freqs_np[:, None] * bls_np[None, :, 1] / C).ravel()
-        tgt_z  = np.repeat(freqs_np, nbls)   # ν_f repeated for each baseline
+        self._eta_idx = jnp.array(eta_idx_np, dtype=jnp.int32)
+        self._eta = self._eta_full[self._eta_idx]
+        self._phase = self._phase_full[self._eta_idx]
+        self.ndelay_eff = int(eta_idx_np.size)
+
+        bls_np = np.asarray(array.bls, dtype=np.float64)
+        nbls = bls_np.shape[0]
+        tgt_x = (freqs_np[:, None] * bls_np[None, :, 0] / C).ravel()
+        tgt_y = (freqs_np[:, None] * bls_np[None, :, 1] / C).ravel()
+        tgt_z = np.repeat(freqs_np, nbls)
 
         self._tgt_x = jnp.array(tgt_x, dtype=DTYPE_R)
         self._tgt_y = jnp.array(tgt_y, dtype=DTYPE_R)
         self._tgt_z = jnp.array(tgt_z, dtype=DTYPE_R)
 
-        # Sky DPSS matrix — set by set_sky_dpss()
-        self.A_sky    = None
-        self._jit_one = None  # compiled after set_sky_dpss
+        self.A_sky = None
+        self._jit_one = None
 
-    # ------------------------------------------------------------------
-    # Sky DPSS matrix setter
-    # ------------------------------------------------------------------
+        self._geom_ready = False
+        self._topo_all = None
+        self._horizon_all = None
+        self._beam_px_all = None
+        self._beam_wgts_all = None
+        self._src_x_all = None
+        self._src_y_all = None
+        self._src_z_all = None
 
     def set_sky_dpss(self, A_sky):
-        """
-        Set the sky DPSS matrix and recompile the JIT-compiled step.
+        self.A_sky = jnp.array(A_sky, dtype=DTYPE_R)
+        self._jit_one = jax.jit(self._simulate_one_precomputed)
 
-        Parameters
-        ----------
-        A_sky : array_like, shape (nfreq, nmodes_sky)
-        """
-        self.A_sky    = jnp.array(A_sky, dtype=DTYPE_R)
-        self._jit_one = jax.jit(self._simulate_one)
+    def precompute_time_geometry(self, rot_matrices):
+        """Precompute time-only geometry and interpolation operators."""
+        rot_ms = jnp.array(rot_matrices, dtype=DTYPE_R)
+        ntime = int(rot_ms.shape[0])
+        npix = self.npix_sky
+        ndelay = self.ndelay_eff
+        two_pi = 2.0 * np.pi
 
-    # ------------------------------------------------------------------
-    # Core simulation (single time step) — pure JAX, differentiable
-    # ------------------------------------------------------------------
+        topo_all = []
+        horizon_all = []
+        beam_px_all = []
+        beam_wgts_all = []
+        src_x_all = []
+        src_y_all = []
+        src_z_all = []
 
-    def _simulate_one(self, sky_coeffs, rot_m):
-        """
-        Simulate visibilities for a single integration.
+        eta_np = np.asarray(self._eta, dtype=np.float32)
+        for i in range(ntime):
+            topo = np.array(rot_ms[i] @ self.eq_coords, dtype=np.float32)
+            horizon = (topo[2] > 0).astype(np.float32)
+            topo_th, topo_ph = healjax.vec2ang(
+                jnp.array(topo[0]), jnp.array(topo[1]), jnp.array(topo[2])
+            )
+            px, wgts = get_interp_weights(topo_th, topo_ph, self.beam_nside)
+            px = np.array(px, dtype=np.int32)
+            wgts = np.array(wgts, dtype=np.float32)
 
-        Parameters
-        ----------
-        sky_coeffs : jnp.array, shape (npix_sky, nmodes_sky)
-            DPSS sky coefficients in equatorial coordinates.
-        rot_m : jnp.array, shape (3, 3)
-            Rotation matrix: equatorial → topocentric.
+            src_x = np.repeat(topo[0], ndelay).astype(np.float32) * two_pi
+            src_y = np.repeat(topo[1], ndelay).astype(np.float32) * two_pi
+            src_z = np.tile(eta_np, npix).astype(np.float32) * two_pi
 
-        Returns
-        -------
-        vis : jnp.array, shape (nfreq, nbls), complex64
-        """
-        # 1. Rotate sky pixels to topocentric frame
-        topo = jnp.dot(rot_m, self.eq_coords)  # (3, npix_sky)
+            topo_all.append(topo)
+            horizon_all.append(horizon)
+            beam_px_all.append(px)
+            beam_wgts_all.append(wgts)
+            src_x_all.append(src_x)
+            src_y_all.append(src_y)
+            src_z_all.append(src_z)
 
-        # 2. Horizon mask — multiplicative, keeps shapes static
-        horizon = (topo[2] > 0).astype(DTYPE_R)  # (npix_sky,)
+        self._topo_all = jnp.array(np.stack(topo_all), dtype=DTYPE_R)
+        self._horizon_all = jnp.array(np.stack(horizon_all), dtype=DTYPE_R)
+        self._beam_px_all = jnp.array(np.stack(beam_px_all), dtype=jnp.int32)
+        self._beam_wgts_all = jnp.array(np.stack(beam_wgts_all), dtype=DTYPE_R)
+        self._src_x_all = jnp.array(np.stack(src_x_all), dtype=DTYPE_R)
+        self._src_y_all = jnp.array(np.stack(src_y_all), dtype=DTYPE_R)
+        self._src_z_all = jnp.array(np.stack(src_z_all), dtype=DTYPE_R)
+        self._geom_ready = True
+        return self
 
-        # 3. Interpolate beam DPSS coefficients at topocentric sky positions
-        topo_th, topo_ph = healjax.vec2ang(topo[0], topo[1], topo[2])
-        px, wgts = get_interp_weights(topo_th, topo_ph, self.beam_nside)
-        beam_interp = jnp.sum(
-            wgts[:, :, None] * self.beam_coeffs[px], axis=0
-        )  # (npix_sky, nmodes_beam)
+    def _forward_components_from_cache(self, sky_coeffs, tind):
+        topo = self._topo_all[tind]
+        horizon = self._horizon_all[tind]
+        px = self._beam_px_all[tind]
+        wgts = self._beam_wgts_all[tind]
+        beam_interp = jnp.sum(wgts[:, :, None] * self.beam_coeffs[px], axis=0)
+        sky_spec = sky_coeffs @ self.A_sky.T
+        beam_spec = beam_interp @ self.A_beam.T
+        W = sky_spec * beam_spec * horizon[:, None]
+        W_eta_full = jnp.fft.fft(W, axis=1) * self._phase_full[None, :]
+        W_eta = W_eta_full[:, self._eta_idx]
+        return topo, horizon, beam_interp, beam_spec, W, W_eta
 
-        # 4. Reconstruct per-pixel spectra and form the product
-        sky_spec  = sky_coeffs  @ self.A_sky.T    # (npix_sky, nfreq)
-        beam_spec = beam_interp @ self.A_beam.T   # (npix_sky, nfreq)
-        W = sky_spec * beam_spec * horizon[:, None]  # (npix_sky, nfreq)
+    def forward_components_one_time(self, sky_coeffs, tind):
+        if not self._geom_ready:
+            raise RuntimeError('Call precompute_time_geometry() first.')
+        return self._forward_components_from_cache(sky_coeffs, tind)
 
-        # 5. DFT W over the frequency axis → delay domain
-        #
-        #   W_η[p, m] = FFT_f{W[p, f]}[m] * phase[m]
-        #
-        #   chosen so that  W[p, f] = Σ_m W_η[p, m] exp(2πi η_m ν_f)  exactly,
-        #   where  η_m = m / (nfreq Δν)  and  phase[m] = exp(-2πi η_m ν_0) / nfreq.
-        W_eta = jnp.fft.fft(W, axis=1) * self._phase[None, :]   # (npix_sky, nfreq), complex
-
-        # 6. Source coordinates for NUFFT type-3
-        #    Ordering: pixel p is outer, delay mode m is inner
-        #    → flat index p * nfreq + m
-        two_pi = 2.0 * jnp.pi
-        src_x = jnp.repeat(topo[0], self.nfreq) * two_pi   # (npix * nfreq,)
-        src_y = jnp.repeat(topo[1], self.nfreq) * two_pi
-        src_z = jnp.tile(self._eta, self.npix_sky) * two_pi  # η cycles per pixel
-
-        # 7. Type-3 NUFFT:  non-uniform sources → non-uniform targets
-        #
-        #   f_j = Σ_k c_k exp(i s_k · t_j)            [iflag = +1]
-        #
-        #   = Σ_{p,m} W_η[p,m] exp(i (2π topo_x · b_x ν/c
-        #                             + 2π topo_y · b_y ν/c
-        #                             + 2π η_m · ν))
-        #   = Σ_{p,m} W_η[p,m] exp(2πi ν_f (b·topo_p/c + η_m))
-        #   = Σ_p W[p,f] exp(2πi ν_f b·topo_p/c)   (exact, by construction)
+    def _simulate_one_precomputed(self, sky_coeffs, tind):
+        _, _, _, _, _, W_eta = self._forward_components_from_cache(sky_coeffs, tind)
         vis_flat = nufft3(
             W_eta.ravel().astype(DTYPE_C),
-            src_x, src_y, src_z,
+            self._src_x_all[tind], self._src_y_all[tind], self._src_z_all[tind],
             self._tgt_x, self._tgt_y, self._tgt_z,
             iflag=1,
             eps=self.eps,
-        )  # (nfreq * nbls,)
-
+        )
         return vis_flat.reshape(self.nfreq, self.nbls)
 
-    # ------------------------------------------------------------------
-    # Public interface
-    # ------------------------------------------------------------------
+    def _simulate_one(self, sky_coeffs, rot_m):
+        if not self._geom_ready:
+            self.precompute_time_geometry(rot_m[None, ...])
+            return self._simulate_one_precomputed(sky_coeffs, 0)
+        raise RuntimeError('_simulate_one() requires precomputed geometry; use simulate().')
 
     def simulate(self, sky_coeffs, rot_matrices):
-        """
-        Simulate visibilities over multiple integrations.
-
-        Parameters
-        ----------
-        sky_coeffs : jnp.array, shape (npix_sky, nmodes_sky)
-        rot_matrices : jnp.array, shape (ntime, 3, 3)
-            Pre-computed equatorial → topocentric rotation matrices.
-
-        Returns
-        -------
-        vis : jnp.array, shape (ntime, nfreq, nbls), complex64
-        """
         if self._jit_one is None:
-            raise RuntimeError("Call set_sky_dpss() before simulate().")
+            raise RuntimeError('Call set_sky_dpss() before simulate().')
+        if (not self._geom_ready) or (self._topo_all.shape[0] != rot_matrices.shape[0]):
+            self.precompute_time_geometry(rot_matrices)
+        inds = jnp.arange(rot_matrices.shape[0], dtype=jnp.int32)
+        return jax.vmap(lambda tind: self._jit_one(sky_coeffs, tind))(inds)
 
-        def step(_, rot_m):
-            return None, self._jit_one(sky_coeffs, rot_m)
+    def adjoint_residual_one_time(self, residual_fb, tind):
+        """Backproject one-time residuals to a pixel-delay dirty map."""
+        c = jnp.conj(residual_fb.reshape(-1).astype(DTYPE_C))
+        dirty_flat = nufft3(
+            c,
+            self._tgt_x, self._tgt_y, self._tgt_z,
+            self._src_x_all[tind], self._src_y_all[tind], self._src_z_all[tind],
+            iflag=1,
+            eps=self.eps,
+        )
+        dirty = jnp.conj(dirty_flat.reshape(self.npix_sky, self.ndelay_eff))
+        return dirty / (self.nfreq * self.nbls)
 
-        _, vis = jax.lax.scan(step, None, rot_matrices)
-        return vis  # (ntime, nfreq, nbls)
+    def dirty_apparent_sky_one_time(self, residual_fb, tind):
+        """Backproject one-time residuals to dirty apparent sky in frequency space."""
+        dirty_eta = self.adjoint_residual_one_time(residual_fb, tind)
+        tmp = jnp.zeros((self.npix_sky, self.nfreq), dtype=DTYPE_C)
+        tmp = tmp.at[:, self._eta_idx].set(dirty_eta / self._phase[None, :])
+        dirty_pf = jnp.fft.ifft(tmp, axis=1)
+        return dirty_pf
 
-    # ------------------------------------------------------------------
-    # Properties
-    # ------------------------------------------------------------------
+    def apparent_sky_update_one_time(
+        self,
+        residual_fb,
+        sky_coeffs,
+        tind,
+        step_size: float = 1.0,
+        beam_reg: float = 1e-3,
+    ):
+        """Form a beam-weighted apparent-sky correction for one time."""
+        dirty_pf = self.dirty_apparent_sky_one_time(residual_fb, tind)
+        _, horizon, beam_interp, beam_spec, _, _ = self._forward_components_from_cache(sky_coeffs, tind)
+        beam_spec = beam_spec * horizon[:, None]
+        weight = jnp.abs(beam_spec) ** 2
+        delta_app = step_size * jnp.conj(beam_spec.astype(DTYPE_C)) * dirty_pf / (weight.astype(DTYPE_C) + beam_reg)
+        return delta_app, weight
+
+    def apparent_to_equatorial_one_time(self, app_pf, tind):
+        """Map a one-time apparent-sky update to the equatorial sky grid.
+
+        In the current implementation the apparent sky update is already indexed
+        by equatorial sky pixels, because the forward model rotates equatorial
+        sky pixels into topocentric coordinates rather than regridding onto a
+        topocentric HEALPix mesh. This method is kept as a hook for future
+        resampling schemes.
+        """
+        return app_pf
+
+    def accumulate_equatorial_sky_update(
+        self,
+        residual_vis,
+        sky_coeffs,
+        step_size: float = 1.0,
+        beam_reg: float = 1e-3,
+    ):
+        """Accumulate a global equatorial sky update from all times."""
+        num = jnp.zeros((self.npix_sky, self.nfreq), dtype=DTYPE_C)
+        den = jnp.zeros((self.npix_sky, self.nfreq), dtype=DTYPE_R)
+        for tind in range(int(residual_vis.shape[0])):
+            delta_app, weight_app = self.apparent_sky_update_one_time(
+                residual_vis[tind], sky_coeffs, tind, step_size=step_size, beam_reg=beam_reg
+            )
+            delta_eq = self.apparent_to_equatorial_one_time(delta_app, tind)
+            weight_eq = self.apparent_to_equatorial_one_time(weight_app, tind).real.astype(DTYPE_R)
+            num = num + weight_eq.astype(DTYPE_C) * delta_eq
+            den = den + weight_eq
+        delta_eq_pf = num / (den.astype(DTYPE_C) + 1e-6)
+        delta_eq_pf = delta_eq_pf / residual_vis.shape[0]  # divide by ntimes
+        delta_coeffs = (delta_eq_pf.real @ self.A_sky).astype(DTYPE_R)
+        return delta_coeffs
 
     @property
     def npix_sky(self) -> int:
@@ -266,20 +302,6 @@ class ForwardModel:
 # ---------------------------------------------------------------------------
 
 def compute_rotation_matrices(times, location):
-    """
-    Compute equatorial → topocentric rotation matrices for each time step.
-
-    Uses the same ERFA-based approach as matvis.
-
-    Parameters
-    ----------
-    times : astropy.time.Time, shape (ntime,)
-    location : astropy.coordinates.EarthLocation
-
-    Returns
-    -------
-    rot_matrices : ndarray, shape (ntime, 3, 3), float32
-    """
     from matvis.cpu.coords import CoordinateRotationERFA
     from astropy.coordinates import SkyCoord
     import astropy.units as u
@@ -302,8 +324,7 @@ def compute_rotation_matrices(times, location):
 
 
 def _erfa_rot_matrix(crds, t):
-    """Extract the 3×3 equatorial→topocentric rotation matrix at time t."""
-    obsf   = crds._get_obsf(t, crds.telescope_loc)
+    obsf = crds._get_obsf(t, crds.telescope_loc)
     astrom = crds._apco(obsf)
 
     ce = np.cos(astrom["eral"])
