@@ -157,27 +157,6 @@ class Calibrator:
         print(f'  Horizon cut: {n_keep} pixels retained, {n_drop} removed.')
         return n_keep
 
-    def apply_zenith_cut(self, scale=1.0):
-        """Enable a per-time dynamic zenith cut at *scale* × beam FWHM.
-
-        Pixels within ``scale × 1.22 λ_max / D`` of zenith are included
-        at each time step; the rest are skipped in the NUFFT.  ``scale=1``
-        keeps the full primary-beam footprint at the lowest frequency;
-        smaller values restrict to the inner beam.
-
-        Calling this re-runs ``precompute_time_geometry``; any previously
-        applied horizon cut is preserved.
-        """
-        self.fwd.precompute_time_geometry(self.rot_matrices, zenith_cut_scale=scale)
-        counts = [len(px) for px in self.fwd._zenith_px_idx_list]
-        print(f'  Zenith cut (scale={scale}): '
-              f'{min(counts)}–{max(counts)} pixels per time step '
-              f'(mean {sum(counts)/len(counts):.0f}).')
-
-    def disable_zenith_cut(self):
-        """Remove the dynamic zenith cut and revert to the full pixel set."""
-        self.fwd.precompute_time_geometry(self.rot_matrices, zenith_cut_scale=None)
-
     def fit_gains_linear(self, sky_coeffs):
         vis_model = jax.jit(self.fwd.simulate)(sky_coeffs, self.rot_matrices)
         # Per-time optimal complex gain: data · conj(model) / |model|²
@@ -421,7 +400,6 @@ class Calibrator:
         polish_maxiter: int = 5,
         beam_polish_maxiter: int = 5,
         beam_polish_rel_tol: float | None = None,
-        zenith_cut_scale: float | None = None,
         solve_every: dict | None = None,
         beam_step_size: float = 0.5,
         beam_sky_reg: float = 1e-3,
@@ -503,9 +481,6 @@ class Calibrator:
         else:
             stop = _stop_flag
             old_handler = None
-        if zenith_cut_scale is not None:
-            self.fwd.precompute_time_geometry(self.rot_matrices, zenith_cut_scale=zenith_cut_scale)
-
         sky_hist_g,  sky_hist_f  = [], []
         beam_hist_g, beam_hist_f = [], []
         sky_aa_step  = 0
@@ -846,8 +821,6 @@ class Calibrator:
         finally:
             if _stop_flag is None:
                 _StopFitFlag.restore(old_handler)
-            if zenith_cut_scale is not None:
-                self.fwd.precompute_time_geometry(self.rot_matrices, zenith_cut_scale=None)
 
         return {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params}, loss
 
@@ -857,7 +830,6 @@ class Calibrator:
         n_iter: int = 10,
         sky_maxiter: int = 10,
         sky_tol: float = 1e-7,
-        zenith_cut_scale: float | None = None,
         solve_every: dict | None = None,
         beam_maxiter: int = 10,
         beam_tol: float = 1e-7,
@@ -881,9 +853,6 @@ class Calibrator:
             ``'beam'`` (int, default 0)
                 Solve beam every *N* iterations using
                 :meth:`fit_beam_only`.  ``0`` (default) disables beam solving.
-        zenith_cut_scale : float or None
-            If given, enable a per-time dynamic zenith cut during this fit.
-            Automatically removed on return, even if interrupted.
 
         Returns
         -------
@@ -909,8 +878,6 @@ class Calibrator:
         else:
             stop = _stop_flag
             old_handler = None
-        if zenith_cut_scale is not None:
-            self.fwd.precompute_time_geometry(self.rot_matrices, zenith_cut_scale=zenith_cut_scale)
         try:
             loss = float(self._jit_loss(params))
             _t0 = _time.perf_counter()
@@ -954,8 +921,6 @@ class Calibrator:
         finally:
             if _stop_flag is None:
                 _StopFitFlag.restore(old_handler)
-            if zenith_cut_scale is not None:
-                self.fwd.precompute_time_geometry(self.rot_matrices, zenith_cut_scale=None)
         return {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params}, loss
 
     def fit_lbfgs(self, params, maxiter: int = 30, tol: float = 1e-7):

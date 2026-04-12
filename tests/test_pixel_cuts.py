@@ -1,11 +1,9 @@
 """
 Tests for pixel-cut functionality.
 
-Covers three independent features:
+Covers two independent features:
   1. Static horizon cut  -- build_ever_visible_mask / apply_pixel_mask
-  2. Dynamic zenith cut  -- precompute_time_geometry(zenith_cut_scale=...)
-  3. Calibrator helpers  -- apply_horizon_cut / apply_zenith_cut /
-                            disable_zenith_cut / zenith_cut_scale in fit methods
+  2. Calibrator helpers  -- apply_horizon_cut
 
 All tests that mutate a ForwardModel use function-scoped fixtures so they
 cannot corrupt the shared session-scoped fixtures in conftest.py.
@@ -227,192 +225,7 @@ class TestApplyPixelMask:
 
 
 # =============================================================================
-# 2.  Dynamic zenith cut
-# =============================================================================
-
-class TestZenithCutSetup:
-
-    def test_inactive_by_default(self, fwd, rot2):
-        f, _ = fwd
-        f.precompute_time_geometry(rot2)
-        assert not f._zenith_cut_active
-
-    def test_active_after_cut(self, fwd, rot2):
-        f, _ = fwd
-        f.precompute_time_geometry(rot2, zenith_cut_scale=1.0)
-        assert f._zenith_cut_active
-
-    def test_pixel_lists_populated(self, fwd, rot2):
-        f, _ = fwd
-        f.precompute_time_geometry(rot2, zenith_cut_scale=1.0)
-        assert f._zenith_px_idx_list is not None
-        assert len(f._zenith_px_idx_list) == 2
-        assert len(f._zenith_beam_spec_list) == 2
-        assert len(f._zenith_src_x_list) == 2
-
-    def test_fewer_pixels_than_full(self, fwd, rot2):
-        f, _ = fwd
-        f.precompute_time_geometry(rot2, zenith_cut_scale=1.0)
-        for t in range(2):
-            n_active = len(f._zenith_px_idx_list[t])
-            assert n_active < f.npix_sky, (
-                f"Time {t}: zenith cut kept all {f.npix_sky} pixels"
-            )
-
-    def test_larger_scale_more_pixels(self, fwd, rot2):
-        f, _ = fwd
-        f.precompute_time_geometry(rot2, zenith_cut_scale=0.5)
-        n_tight = [len(px) for px in f._zenith_px_idx_list]
-        f.precompute_time_geometry(rot2, zenith_cut_scale=2.0)
-        n_wide = [len(px) for px in f._zenith_px_idx_list]
-        for t in range(2):
-            assert n_wide[t] >= n_tight[t], (
-                f"Time {t}: wider scale gave fewer pixels ({n_wide[t]} < {n_tight[t]})"
-            )
-
-    def test_pixel_0_included_at_scale_1(self, fwd, rot2):
-        """Pixel 0 (zenith) must always be inside a scale=1.0 cut."""
-        f, _ = fwd
-        f.precompute_time_geometry(rot2, zenith_cut_scale=1.0)
-        for t in range(2):
-            assert 0 in f._zenith_px_idx_list[t], (
-                f"Time {t}: pixel 0 missing from zenith cut at scale=1.0"
-            )
-
-    def test_beam_spec_shape(self, fwd, rot2):
-        f, _ = fwd
-        f.precompute_time_geometry(rot2, zenith_cut_scale=1.0)
-        for t in range(2):
-            npix_t = len(f._zenith_px_idx_list[t])
-            assert f._zenith_beam_spec_list[t].shape == (npix_t, f.nfreq)
-
-    def test_disable_clears_flag(self, fwd, rot2):
-        f, _ = fwd
-        f.precompute_time_geometry(rot2, zenith_cut_scale=1.0)
-        assert f._zenith_cut_active
-        f.precompute_time_geometry(rot2, zenith_cut_scale=None)
-        assert not f._zenith_cut_active
-        assert f._zenith_px_idx_list is None
-
-    def test_requires_beam_diameter(self, array, freqs):
-        """zenith_cut_scale should raise if the beam has no diameter."""
-        from unittest.mock import MagicMock
-        beam = MagicMock()
-        beam.nside = NSIDE_BEAM
-        beam.A_beam = dpss_matrix(freqs, ETA_BEAM)
-        beam.coeffs = np.zeros((healpy.nside2npix(NSIDE_BEAM), beam.A_beam.shape[1]))
-        beam.beam = MagicMock(spec=[])   # no 'diameter' attribute
-        rot = np.eye(3, dtype=np.float32)[None]
-        f = ForwardModel(array, NSIDE_SKY, beam, freqs)
-        f.set_sky_dpss(dpss_matrix(freqs, ETA_SKY))
-        with pytest.raises(ValueError, match="diameter"):
-            f.precompute_time_geometry(rot, zenith_cut_scale=1.0)
-
-
-class TestZenithCutResults:
-
-    def test_output_shape(self, fwd, rot2):
-        f, A = fwd
-        f.precompute_time_geometry(rot2, zenith_cut_scale=1.0)
-        vis = f.simulate(_zero_sky(f, A), rot2)
-        assert vis.shape == (2, f.nfreq, f.nbls)
-
-    def test_zero_sky_gives_zero_vis(self, fwd, rot2):
-        f, A = fwd
-        f.precompute_time_geometry(rot2, zenith_cut_scale=1.0)
-        vis = f.simulate(_zero_sky(f, A), rot2)
-        assert jnp.allclose(vis, 0.0, atol=1e-5)
-
-    def test_zenith_source_nonzero(self, fwd, rot1):
-        f, A = fwd
-        f.precompute_time_geometry(rot1, zenith_cut_scale=1.0)
-        sky = _zenith_sky(f, A, px=0)
-        vis = f.simulate(sky, rot1)
-        assert float(jnp.abs(vis).mean()) > 1e-5
-
-    def test_zenith_source_matches_full_model(self, fwd, rot1):
-        """
-        For a source at pixel 0 (zenith), the zenith-cut model should match
-        the full model to within float32 precision (~1e-3 relative RMS).
-        """
-        f, A = fwd
-        sky = _zenith_sky(f, A, px=0)
-
-        f.precompute_time_geometry(rot1)
-        vis_full = f.simulate(sky, rot1)
-
-        f.precompute_time_geometry(rot1, zenith_cut_scale=1.0)
-        assert f._zenith_cut_active
-        vis_cut = f.simulate(sky, rot1)
-
-        rms_err = float(jnp.sqrt(jnp.mean(jnp.abs(vis_full - vis_cut) ** 2)))
-        rms_sig = float(jnp.sqrt(jnp.mean(jnp.abs(vis_full) ** 2))) + 1e-30
-        assert rms_err / rms_sig < 1e-2, (
-            f"Zenith-cut model relative error {rms_err/rms_sig:.3e} > 1e-2"
-        )
-
-    def test_excluded_source_near_zero(self, fwd, rot1):
-        """
-        A source well below the zenith cut should produce near-zero visibilities.
-        Uses a very tight scale (0.05) so only a handful of pixels near zenith
-        are included; any pixel with zenith angle > ~5° is excluded.
-        """
-        f, A = fwd
-        f.precompute_time_geometry(rot1, zenith_cut_scale=0.05)
-        active_0 = set(f._zenith_px_idx_list[0].tolist())
-
-        # Find a pixel above the horizon (eq_z > 0) that is NOT in the cut
-        eq = np.asarray(f.eq_coords)
-        above_horizon = np.where(eq[2] > 0)[0]
-        outside_cut = [px for px in above_horizon if px not in active_0]
-
-        if len(outside_cut) == 0:
-            pytest.skip("No above-horizon pixels outside tight zenith cut at nside=8")
-
-        # Bright source at an excluded pixel
-        px_out = outside_cut[0]
-        flux = np.zeros((f.npix_sky, f.nfreq), dtype=np.float32)
-        flux[px_out] = 100.0
-        sky = jnp.array(dpss_project(flux, A), dtype=jnp.float32)
-
-        vis = f.simulate(sky, rot1)
-        assert float(jnp.abs(vis).max()) < 1e-3, (
-            "Source outside zenith cut leaked into visibilities"
-        )
-
-    def test_output_dtype_complex(self, fwd, rot1):
-        f, A = fwd
-        f.precompute_time_geometry(rot1, zenith_cut_scale=1.0)
-        vis = f.simulate(_zenith_sky(f, A), rot1)
-        assert jnp.issubdtype(vis.dtype, jnp.complexfloating)
-
-    def test_gradient_flows_through_zenith_cut(self, fwd, rot1):
-        """jax.grad should work through _simulate_loop (zenith cut path)."""
-        f, A = fwd
-        f.precompute_time_geometry(rot1, zenith_cut_scale=1.0)
-        sky = _zenith_sky(f, A)
-
-        def loss(sc):
-            return jnp.sum(jnp.abs(f.simulate(sc, rot1)) ** 2).real
-
-        grad = jax.grad(loss)(sky)
-        assert grad.shape == sky.shape
-        assert jnp.isfinite(grad).all(), "Gradient contains non-finite values"
-
-    def test_jit_compiles_with_zenith_cut(self, fwd, rot1):
-        """simulate() should be JIT-compilable under the zenith cut path."""
-        f, A = fwd
-        f.precompute_time_geometry(rot1, zenith_cut_scale=1.0)
-        sky = _zenith_sky(f, A)
-
-        sim_jit = jax.jit(lambda sc: f.simulate(sc, rot1))
-        vis = sim_jit(sky)
-        assert vis.shape == (1, f.nfreq, f.nbls)
-        assert jnp.isfinite(vis).all()
-
-
-# =============================================================================
-# 3.  Calibrator convenience methods
+# 2.  Calibrator convenience methods
 # =============================================================================
 
 class TestCalibratorPixelCuts:
@@ -427,25 +240,6 @@ class TestCalibratorPixelCuts:
         calibrator.apply_horizon_cut()
         assert calibrator.fwd._geom_ready
 
-    def test_apply_zenith_cut_sets_active(self, calibrator):
-        calibrator.apply_zenith_cut(scale=1.0)
-        assert calibrator.fwd._zenith_cut_active
-
-    def test_disable_zenith_cut_clears_active(self, calibrator):
-        calibrator.apply_zenith_cut(scale=1.0)
-        calibrator.disable_zenith_cut()
-        assert not calibrator.fwd._zenith_cut_active
-
-    def test_horizon_then_zenith_cut(self, calibrator):
-        """Horizon cut followed by zenith cut should both take effect."""
-        calibrator.apply_horizon_cut()
-        npix_after_horizon = calibrator.fwd.npix_sky
-        calibrator.apply_zenith_cut(scale=0.5)
-        assert calibrator.fwd._zenith_cut_active
-        for t in range(calibrator.ntime):
-            n_zenith = len(calibrator.fwd._zenith_px_idx_list[t])
-            assert n_zenith <= npix_after_horizon
-
     def test_loss_finite_after_horizon_cut(self, calibrator):
         params = calibrator.init_params()
         calibrator.apply_horizon_cut()
@@ -458,70 +252,7 @@ class TestCalibratorPixelCuts:
 
 
 # =============================================================================
-# 4.  zenith_cut_scale in fit methods
-# =============================================================================
-
-class TestFitMethodZenithCut:
-    """Verify that zenith_cut_scale is applied during the fit and always restored."""
-
-    @pytest.fixture
-    def cal_and_params(self, calibrator):
-        params = calibrator.init_params()
-        return calibrator, params
-
-    def test_fit_alternating_dirty_restores_cut(self, cal_and_params):
-        cal, params = cal_and_params
-        assert not cal.fwd._zenith_cut_active
-        _, _ = cal.fit_alternating_dirty(params, n_iter=1, zenith_cut_scale=1.0)
-        assert not cal.fwd._zenith_cut_active, (
-            "fit_alternating_dirty did not restore zenith cut after returning"
-        )
-
-    def test_fit_alternating_dirty_anderson_restores_cut(self, cal_and_params):
-        cal, params = cal_and_params
-        _, _ = cal.fit_alternating_dirty(params, n_iter=1, anderson_history=4, zenith_cut_scale=1.0)
-        assert not cal.fwd._zenith_cut_active
-
-    def test_fit_alternating_restores_cut(self, cal_and_params):
-        cal, params = cal_and_params
-        _, _ = cal.fit_alternating(params, n_iter=1, zenith_cut_scale=1.0)
-        assert not cal.fwd._zenith_cut_active
-
-    def test_cut_is_active_during_fit(self, cal_and_params):
-        """By checking the pixel count, confirm the cut was active while fitting."""
-        cal, params = cal_and_params
-        # Without zenith cut, simulate uses vmap path (_zenith_cut_active=False)
-        # With it, simulate uses loop path.  We capture the state mid-fit via a side-effect.
-        active_flags = []
-
-        original_fit_gains = cal.fit_gains_linear.__func__
-
-        def patched(self, sky_coeffs):
-            active_flags.append(self.fwd._zenith_cut_active)
-            return original_fit_gains(self, sky_coeffs)
-
-        import types
-        cal.fit_gains_linear = types.MethodType(patched, cal)
-
-        cal.fit_alternating_dirty(params, n_iter=1, zenith_cut_scale=1.0)
-        assert any(active_flags), "Zenith cut was never active during fit"
-        assert not cal.fwd._zenith_cut_active, "Zenith cut not restored after fit"
-
-    def test_no_scale_leaves_state_unchanged(self, cal_and_params):
-        """When zenith_cut_scale=None, the fit must not change zenith cut state."""
-        cal, params = cal_and_params
-        cal.apply_zenith_cut(scale=1.0)
-        assert cal.fwd._zenith_cut_active
-
-        cal.fit_alternating_dirty(params, n_iter=1)  # no zenith_cut_scale → default None
-        # State should be unchanged (still active)
-        assert cal.fwd._zenith_cut_active, (
-            "fit_alternating_dirty cleared zenith cut when scale=None"
-        )
-
-
-# =============================================================================
-# 5.  Anderson acceleration (unit tests for _anderson_coeffs)
+# 3.  Anderson acceleration (unit tests for _anderson_coeffs)
 # =============================================================================
 
 class TestAndersonCoeffs:
