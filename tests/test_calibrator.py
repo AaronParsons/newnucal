@@ -132,3 +132,117 @@ class TestFitGainsLinear:
         gain_params, _ = cal.fit_gains_linear(sky_coeffs_true)
         for key, val in gain_params.items():
             assert val.dtype == jnp.float32, f"{key}: expected float32, got {val.dtype}"
+
+
+
+@pytest.fixture
+def calibrator_rfi_setup(array, beam_model, freqs, rot_matrices, forward_model, sky_coeffs_true):
+    """Return a Calibrator whose data matches the true sky and unity gains."""
+    from newnucal.calibrator import Calibrator
+    vis_true = forward_model.simulate(sky_coeffs_true, jnp.array(rot_matrices))
+    cal = Calibrator(
+        array=array,
+        beam_model=beam_model,
+        sky_nside=NSIDE_SKY,
+        sky_eta_max=ETA_SKY,
+        freqs=freqs,
+        rot_matrices=rot_matrices,
+        data=np.array(vis_true),
+    )
+    params = {
+        'sky_coeffs': sky_coeffs_true,
+        'beam_coeffs': jnp.array(cal.fwd.beam_coeffs),
+        **init_gain_params(cal.ntime, cal.nfreq),
+    }
+    return cal, params
+
+
+class TestRFIWeightedCalibrator:
+
+    def test_calc_loss_decreases_when_bad_channel_is_downweighted(self, calibrator_rfi_setup):
+        cal, params = calibrator_rfi_setup
+        data = np.array(cal.data)
+        data[:, 2, :] += 50.0 + 0.0j
+        cal.data = jnp.array(data, dtype=jnp.complex64)
+
+        cal.set_channel_weights(np.ones((cal.ntime, cal.nfreq), dtype=np.float32))
+        loss_full = cal.calc_loss(params)
+
+        weights = np.ones((cal.ntime, cal.nfreq), dtype=np.float32)
+        weights[:, 2] = 0.01
+        cal.set_channel_weights(weights)
+        loss_downweighted = cal.calc_loss(params)
+
+        assert loss_downweighted < 0.05 * loss_full
+
+    def test_calc_reduced_chi2_near_unity_for_known_noise(self, array, beam_model, freqs, rot_matrices, forward_model, sky_coeffs_true):
+        from newnucal.calibrator import Calibrator
+        rng = np.random.default_rng(123)
+        vis_true = np.array(forward_model.simulate(sky_coeffs_true, jnp.array(rot_matrices)))
+        sigma = 0.05
+        noise = (rng.normal(size=vis_true.shape) + 1j * rng.normal(size=vis_true.shape)) * (sigma / np.sqrt(2.0))
+        data = vis_true + noise.astype(np.complex64)
+
+        cal = Calibrator(
+            array=array,
+            beam_model=beam_model,
+            sky_nside=NSIDE_SKY,
+            sky_eta_max=ETA_SKY,
+            freqs=freqs,
+            rot_matrices=rot_matrices,
+            data=data,
+            inv_noise_var=np.full((len(rot_matrices), len(freqs)), 1.0 / sigma**2, dtype=np.float32),
+        )
+        params = {
+            'sky_coeffs': sky_coeffs_true,
+            'beam_coeffs': jnp.array(cal.fwd.beam_coeffs),
+            **init_gain_params(cal.ntime, cal.nfreq),
+        }
+        red_chi2 = cal.calc_reduced_chi2(params, explicit_beam=True)
+        assert 0.7 < red_chi2 < 1.3, f"Expected reduced chi2 near 1, got {red_chi2:.3f}"
+
+    def test_fit_with_rfi_reweighting_updates_weights_and_tracks_history(self, calibrator_rfi_setup, monkeypatch):
+        cal, params = calibrator_rfi_setup
+        data = np.array(cal.data)
+        # Inject narrowband contamination in one channel across all baselines/times.
+        data[:, 1, :] += 20.0 + 10.0j
+        cal.data = jnp.array(data, dtype=jnp.complex64)
+
+        # Dummy fitter: keep parameters fixed and return the current weighted loss.
+        def _dummy_fit(p, **kwargs):
+            return p, cal.calc_loss(p, explicit_beam=True)
+
+        monkeypatch.setattr(cal, 'dummy_fit', _dummy_fit, raising=False)
+
+        from newnucal.rfi import RFIConfig
+        cfg = RFIConfig(
+            flagged_weight=0.05,
+            min_weight=0.01,
+            max_weight=1.0,
+            smooth_window=5,
+            score_center=1.5,
+            score_slope=2.0,
+            blend=0.0,
+        )
+        init_w = np.ones((cal.ntime, cal.nfreq), dtype=np.float32)
+
+        params_out, state = cal.fit_with_rfi_reweighting(
+            params,
+            initial_channel_weights=init_w,
+            inv_noise_var=np.ones((cal.ntime, cal.nfreq), dtype=np.float32),
+            n_rounds=2,
+            fit_method='dummy_fit',
+            fit_kwargs={},
+            rfi_config=cfg,
+            verbose=False,
+        )
+
+        assert params_out.keys() == params.keys()
+        assert 'channel_weights' in state
+        assert 'history' in state
+        assert len(state['history']) == 2
+        assert state['channel_weights'].shape == (cal.ntime, cal.nfreq)
+        # The contaminated channel should be strongly downweighted.
+        assert float(np.mean(state['channel_weights'][:, 1])) < 0.2
+        # Calibrator should retain the final weights internally too.
+        np.testing.assert_allclose(np.asarray(cal.channel_weights), state['channel_weights'])

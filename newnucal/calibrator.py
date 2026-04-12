@@ -16,6 +16,7 @@ from .beam import BeamModel
 from .dpss import dpss_matrix, dpss_project
 from .simulate import ForwardModel
 from .gains import apply_gains, init_gain_params
+from .rfi import RFIConfig, prepare_initial_channel_weights, update_channel_weights_from_residuals
 
 DTYPE_R = jnp.float32
 DTYPE_C = jnp.complex64
@@ -178,11 +179,15 @@ class Calibrator:
         sky_eigenval_cutoff: float = 1e-9,
         eps: float = 1e-6,
         eta_padding: float = 0.0,
+        channel_weights=None,
+        inv_noise_var=None,
     ):
         self.freqs = jnp.array(freqs, dtype=DTYPE_R)
         self.rot_matrices = jnp.array(rot_matrices, dtype=DTYPE_R)
         self.data = jnp.array(data, dtype=DTYPE_C)
         self.bls = jnp.array(array.bls, dtype=DTYPE_R)
+        self.channel_weights = jnp.ones(self.data.shape[:2], dtype=DTYPE_R)
+        self.inv_noise_var = jnp.ones(self.data.shape[:2], dtype=DTYPE_R)
 
         self.A_sky = dpss_matrix(freqs, sky_eta_max, eigenval_cutoff=sky_eigenval_cutoff)
         self.fwd = ForwardModel(
@@ -201,18 +206,26 @@ class Calibrator:
         self._jit_loss = jax.jit(self._loss)
         self._jit_val_grad = jax.jit(jax.value_and_grad(self._loss))
         self._jit_loss_variable_beam = jax.jit(self._loss_variable_beam)
+        self.set_channel_weights(channel_weights)
+        self.set_inv_noise_var(inv_noise_var)
+
+    def _weighted_mse(self, resid):
+        w = (self.channel_weights * self.inv_noise_var).astype(DTYPE_R)
+        num = jnp.sum(w[:, :, None] * (jnp.abs(resid) ** 2))
+        den = jnp.maximum(jnp.sum(w) * resid.shape[2], 1e-12)
+        return num / den
 
     def _loss(self, params):
         vis_model = self.fwd.simulate(params['sky_coeffs'], self.rot_matrices)
         vis_cal = apply_gains(vis_model, params['log_amp'], params['phase'], params['phi'], self.bls)
-        return jnp.mean(jnp.abs(self.data - vis_cal) ** 2)
+        return self._weighted_mse(self.data - vis_cal)
 
     def _loss_variable_beam(self, params):
         vis_model = self.fwd.simulate_variable_beam(
             params['sky_coeffs'], params['beam_coeffs'], self.rot_matrices
         )
         vis_cal = apply_gains(vis_model, params['log_amp'], params['phase'], params['phi'], self.bls)
-        return jnp.mean(jnp.abs(self.data - vis_cal) ** 2)
+        return self._weighted_mse(self.data - vis_cal)
 
     def calc_loss(self, params, explicit_beam: bool = False):
         if explicit_beam:
@@ -227,6 +240,44 @@ class Calibrator:
         else:
             vis_model = self.fwd.simulate(params['sky_coeffs'], self.rot_matrices)
         return apply_gains(vis_model, params['log_amp'], params['phase'], params['phi'], self.bls)
+
+    def set_channel_weights(self, channel_weights=None):
+        """Set per-time/per-frequency soft reliability weights."""
+        if channel_weights is None:
+            arr = jnp.ones(self.data.shape[:2], dtype=DTYPE_R)
+        else:
+            arr = jnp.array(channel_weights, dtype=DTYPE_R)
+            if arr.ndim == 1:
+                arr = jnp.broadcast_to(arr[None, :], self.data.shape[:2])
+            elif arr.shape != self.data.shape[:2]:
+                raise ValueError(f"channel_weights must have shape {(self.ntime, self.nfreq)} or {(self.nfreq,)}, got {arr.shape}")
+        self.channel_weights = jnp.clip(arr, 0.0, 1.0).astype(DTYPE_R)
+
+    def set_inv_noise_var(self, inv_noise_var=None):
+        """Set per-time/per-frequency inverse noise variance."""
+        if inv_noise_var is None:
+            arr = jnp.ones(self.data.shape[:2], dtype=DTYPE_R)
+        else:
+            arr = jnp.array(inv_noise_var, dtype=DTYPE_R)
+            if arr.ndim == 1:
+                arr = jnp.broadcast_to(arr[None, :], self.data.shape[:2])
+            elif arr.shape != self.data.shape[:2]:
+                raise ValueError(f"inv_noise_var must have shape {(self.ntime, self.nfreq)} or {(self.nfreq,)}, got {arr.shape}")
+        self.inv_noise_var = jnp.clip(arr, 0.0, jnp.inf).astype(DTYPE_R)
+
+    def calc_reduced_chi2(self, params, explicit_beam: bool = False, subtract_params: int = 0):
+        """Approximate reduced chi-squared for the currently trusted channels."""
+        if explicit_beam:
+            vis_model = self.fwd.simulate_variable_beam(
+                params['sky_coeffs'], params['beam_coeffs'], self.rot_matrices
+            )
+        else:
+            vis_model = self.fwd.simulate(params['sky_coeffs'], self.rot_matrices)
+        vis_cal = apply_gains(vis_model, params['log_amp'], params['phase'], params['phi'], self.bls)
+        resid = self.data - vis_cal
+        num = jnp.sum(self.channel_weights[:, :, None] * self.inv_noise_var[:, :, None] * jnp.abs(resid) ** 2)
+        dof = jnp.maximum(jnp.sum(self.channel_weights) * self.nbls - float(subtract_params), 1.0)
+        return float(num / dof)
 
     def init_params(self):
         npix_sky = self.fwd.npix_sky
@@ -249,7 +300,8 @@ class Calibrator:
         inv = self._invert_gains(params)
         data_cal = apply_gains(self.data, inv['log_amp'], inv['phase'], inv['phi'], self.bls)
         vis_model = self.fwd.simulate(params['sky_coeffs'], self.rot_matrices)
-        return data_cal - vis_model
+        resid = data_cal - vis_model
+        return resid * (self.channel_weights * self.inv_noise_var)[:, :, None].astype(DTYPE_C)
 
     def calibrated_residual_variable_beam(self, params):
         inv = self._invert_gains(params)
@@ -257,7 +309,8 @@ class Calibrator:
         vis_model = self.fwd.simulate_variable_beam(
             params['sky_coeffs'], params['beam_coeffs'], self.rot_matrices
         )
-        return data_cal - vis_model
+        resid = data_cal - vis_model
+        return resid * (self.channel_weights * self.inv_noise_var)[:, :, None].astype(DTYPE_C)
 
     # ------------------------------------------------------------------
     # Pixel-cut helpers
@@ -353,7 +406,7 @@ class Calibrator:
                 vis_model, gain_params['log_amp'], gain_params['phase'],
                 gain_params['phi'], bls,
             )
-            return jnp.mean(jnp.abs(self.data - vis_cal) ** 2)
+            return self._weighted_mse(self.data - vis_cal)
 
         solver = LBFGS(
             fun=beam_loss, tol=tol, maxiter=maxiter, verbose=False,
@@ -432,7 +485,7 @@ class Calibrator:
 
         def sky_loss(sc):
             vis_model = self.fwd.simulate(sc, self.rot_matrices)
-            return jnp.mean(jnp.abs(data_cal - vis_model) ** 2)
+            return self._weighted_mse(data_cal - vis_model)
 
         solver = LBFGS(fun=sky_loss, tol=tol, maxiter=maxiter, verbose=False, linesearch='backtracking', increase_factor=5, history_size=10, jit=True)
         result = solver.run(sky_coeffs)
@@ -467,6 +520,66 @@ class Calibrator:
             if verbose:
                 print(f'    dirty iter {i:03d}: loss={loss:.4e}')
         return best_sky, best_loss
+
+    def fit_with_rfi_reweighting(
+        self,
+        params,
+        *,
+        initial_channel_weights=None,
+        initial_flags=None,
+        inv_noise_var=None,
+        n_rounds: int = 3,
+        fit_method: str = 'fit_alternating_dirty',
+        fit_kwargs: dict | None = None,
+        rfi_config: RFIConfig | None = None,
+        verbose: bool = False,
+    ):
+        """Iteratively refit with residual-driven channel reweighting.
+
+        The initial weights should come from an external DPSS/high-pass RFI
+        detector.  After each fit round, residuals are turned into updated soft
+        time/frequency channel weights and the model is refit.
+        """
+        fit_kwargs = {} if fit_kwargs is None else dict(fit_kwargs)
+        cfg = rfi_config or RFIConfig()
+        if inv_noise_var is not None:
+            self.set_inv_noise_var(inv_noise_var)
+        base_weights = prepare_initial_channel_weights(
+            ntime=self.ntime,
+            nfreq=self.nfreq,
+            initial_weights=initial_channel_weights,
+            initial_flags=initial_flags,
+            flagged_weight=cfg.flagged_weight,
+        )
+        self.set_channel_weights(base_weights)
+
+        history = []
+        runner = getattr(self, fit_method)
+        current_weights = np.array(base_weights, copy=True)
+        for iround in range(n_rounds):
+            params, loss = runner(params, **fit_kwargs)
+            resid = np.asarray(self.calibrated_residual_variable_beam(params), dtype=np.complex64)
+            new_weights, diagnostics = update_channel_weights_from_residuals(
+                residual=resid,
+                inv_noise_var=np.asarray(self.inv_noise_var),
+                prior_weights=base_weights,
+                current_weights=current_weights,
+                config=cfg,
+            )
+            current_weights = new_weights
+            self.set_channel_weights(current_weights)
+            chi2_red = self.calc_reduced_chi2(params, explicit_beam=('beam_coeffs' in params))
+            history.append({
+                'round': iround,
+                'loss': float(loss),
+                'reduced_chi2': float(chi2_red),
+                'weights': current_weights.copy(),
+                'diagnostics': diagnostics,
+            })
+            if verbose:
+                flagged_frac = float(np.mean(current_weights < 0.5))
+                print(f'[rfi round {iround:02d}] loss={loss:.4e}  red_chi2={chi2_red:.3f}  frac(w<0.5)={flagged_frac:.3f}')
+        return params, {'channel_weights': current_weights, 'history': history}
 
     def fit_alternating_dirty(
         self,
