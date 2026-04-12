@@ -246,3 +246,110 @@ class TestRFIWeightedCalibrator:
         assert float(np.mean(state['channel_weights'][:, 1])) < 0.2
         # Calibrator should retain the final weights internally too.
         np.testing.assert_allclose(np.asarray(cal.channel_weights), state['channel_weights'])
+
+
+@pytest.fixture
+def calibrator_noisy_setup(array, beam_model, freqs, rot_matrices, forward_model, sky_coeffs_true):
+    """Return (Calibrator, true params, sigma) for noisy data with the true sky/beam."""
+    from newnucal.calibrator import Calibrator
+    rng = np.random.default_rng(2024)
+    vis_true = np.array(forward_model.simulate(sky_coeffs_true, jnp.array(rot_matrices)), dtype=np.complex64)
+    sigma = 0.05
+    noise = (rng.normal(size=vis_true.shape) + 1j * rng.normal(size=vis_true.shape)) * (sigma / np.sqrt(2.0))
+    data = vis_true + noise.astype(np.complex64)
+    cal = Calibrator(
+        array=array,
+        beam_model=beam_model,
+        sky_nside=NSIDE_SKY,
+        sky_eta_max=ETA_SKY,
+        freqs=freqs,
+        rot_matrices=rot_matrices,
+        data=data,
+        noise_sigma=np.full((len(rot_matrices), len(freqs)), sigma, dtype=np.float32),
+    )
+    params = {
+        'sky_coeffs': sky_coeffs_true,
+        'beam_coeffs': jnp.array(cal.fwd.beam_coeffs),
+        **init_gain_params(cal.ntime, cal.nfreq),
+    }
+    return cal, params, sigma
+
+
+class TestResumableAndChi2Tol:
+
+    def test_resuming_preserves_anderson_state(self, calibrator_rfi_setup, monkeypatch):
+        """Running in chunks should match a single continuous resumable run."""
+        import newnucal.calibrator as calmod
+
+        def make_fake_clock(dt=1.0):
+            t = {'v': 0.0}
+            def _fake_perf_counter():
+                t['v'] += dt
+                return t['v']
+            return _fake_perf_counter
+
+        fit_kwargs = dict(
+            sky_step_size=0.2,
+            sky_anderson_history=2,
+            sky_aa_start=1,
+            sky_aa_damping=0.5,
+            solve_every={'gains': 0, 'beam': 0},
+            target_reduced_chi2=None,
+        )
+
+        cal1, params0 = calibrator_rfi_setup
+        monkeypatch.setattr(calmod._time, 'perf_counter', make_fake_clock())
+        state = cal1.init_alternating_dirty_state(params0, **fit_kwargs)
+        state = cal1.run_alternating_dirty_state(state, n_iter=2, verbose=False)
+        state = cal1.run_alternating_dirty_state(state, n_iter=3, verbose=False)
+        resumed_params = state.params
+        resumed_loss = state.loss
+        resumed_step = state.step
+        resumed_hist_len = len(state.sky_acc._hist_g)
+
+        cal2, params0_b = calibrator_rfi_setup
+        monkeypatch.setattr(calmod._time, 'perf_counter', make_fake_clock())
+        one_shot_params, one_shot_loss = cal2.fit_alternating_dirty(
+            params0_b,
+            n_iter=5,
+            verbose=False,
+            **fit_kwargs,
+        )
+
+        assert resumed_step == 5
+        assert resumed_hist_len > 0
+        np.testing.assert_allclose(np.asarray(resumed_params['sky_coeffs']), np.asarray(one_shot_params['sky_coeffs']), rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(np.asarray(resumed_params['beam_coeffs']), np.asarray(one_shot_params['beam_coeffs']), rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(np.asarray(resumed_params['log_amp']), np.asarray(one_shot_params['log_amp']), rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(np.asarray(resumed_params['phase']), np.asarray(one_shot_params['phase']), rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(np.asarray(resumed_params['phi']), np.asarray(one_shot_params['phi']), rtol=1e-6, atol=1e-6)
+        assert resumed_loss == pytest.approx(one_shot_loss, rel=1e-6, abs=1e-6)
+
+    def test_target_reduced_chi2_stops_resumable_fit_early(self, calibrator_noisy_setup, monkeypatch):
+        """Resumable dirty fitting should stop once the target reduced chi^2 is reached."""
+        import newnucal.calibrator as calmod
+        cal, params0, _sigma = calibrator_noisy_setup
+
+        # Deterministic timing for the adaptive scheduler
+        t = {'v': 0.0}
+        def _fake_perf_counter():
+            t['v'] += 1.0
+            return t['v']
+        monkeypatch.setattr(calmod._time, 'perf_counter', _fake_perf_counter)
+
+        state = cal.init_alternating_dirty_state(
+            params0,
+            sky_step_size=0.05,
+            beam_step_size=0.05,
+            sky_anderson_history=0,
+            beam_anderson_history=0,
+            solve_every={'gains': 0, 'beam': 0},
+            target_reduced_chi2=1.5,
+            reduced_chi2_check_every=1,
+        )
+        state = cal.run_alternating_dirty_state(state, n_iter=20, verbose=False)
+
+        assert state.stop_reason == 'target_reduced_chi2'
+        assert state.step < 20
+        assert state.reduced_chi2 is not None
+        assert state.reduced_chi2 <= 1.5
