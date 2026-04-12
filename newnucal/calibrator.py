@@ -181,6 +181,7 @@ class Calibrator:
         eta_padding: float = 0.0,
         channel_weights=None,
         inv_noise_var=None,
+        noise_sigma=None,
     ):
         self.freqs = jnp.array(freqs, dtype=DTYPE_R)
         self.rot_matrices = jnp.array(rot_matrices, dtype=DTYPE_R)
@@ -208,41 +209,64 @@ class Calibrator:
         self._jit_loss_variable_beam = jax.jit(self._loss_variable_beam)
         self.set_channel_weights(channel_weights)
         self.set_inv_noise_var(inv_noise_var)
+        if noise_sigma is not None:
+            self.set_noise_sigma(noise_sigma)
 
-    def _weighted_mse(self, resid):
-        w = (self.channel_weights * self.inv_noise_var).astype(DTYPE_R)
-        num = jnp.sum(w[:, :, None] * (jnp.abs(resid) ** 2))
+    def _effective_weights(self):
+        return (self.channel_weights * self.inv_noise_var).astype(DTYPE_R)
+
+    def _weighted_chi2(self, resid):
+        w = self._effective_weights()
+        return jnp.sum(w[:, :, None] * (jnp.abs(resid) ** 2))
+
+    def _weighted_mean_chi2(self, resid):
+        w = self._effective_weights()
         den = jnp.maximum(jnp.sum(w) * resid.shape[2], 1e-12)
-        return num / den
+        return self._weighted_chi2(resid) / den
 
     def _loss(self, params):
         vis_model = self.fwd.simulate(params['sky_coeffs'], self.rot_matrices)
         vis_cal = apply_gains(vis_model, params['log_amp'], params['phase'], params['phi'], self.bls)
-        return self._weighted_mse(self.data - vis_cal)
+        return self._weighted_chi2(self.data - vis_cal)
 
     def _loss_variable_beam(self, params):
         vis_model = self.fwd.simulate_variable_beam(
             params['sky_coeffs'], params['beam_coeffs'], self.rot_matrices
         )
         vis_cal = apply_gains(vis_model, params['log_amp'], params['phase'], params['phi'], self.bls)
-        return self._weighted_mse(self.data - vis_cal)
+        return self._weighted_chi2(self.data - vis_cal)
 
     def calc_loss(self, params, explicit_beam: bool = False):
         if explicit_beam:
             return float(self._jit_loss_variable_beam(params))
         return float(self._jit_loss(params))
 
-    def simulate(self, params, explicit_beam: bool = False):
-        if explicit_beam:
-            vis_model = self.fwd.simulate_variable_beam(
-                params['sky_coeffs'], params['beam_coeffs'], self.rot_matrices
-            )
-        else:
-            vis_model = self.fwd.simulate(params['sky_coeffs'], self.rot_matrices)
-        return apply_gains(vis_model, params['log_amp'], params['phase'], params['phi'], self.bls)
+    def calc_chi2(self, params, explicit_beam: bool = False):
+        return self.calc_loss(params, explicit_beam=explicit_beam)
+
+    def estimate_num_params(self, params=None):
+        if params is None:
+            return 0
+        npar = 0
+        if 'sky_coeffs' in params and params['sky_coeffs'] is not None:
+            npar += int(np.prod(np.shape(params['sky_coeffs'])))
+        if 'beam_coeffs' in params and params['beam_coeffs'] is not None:
+            npar += int(np.prod(np.shape(params['beam_coeffs'])))
+        for key in ('log_amp', 'phase', 'phi'):
+            if key in params and params[key] is not None:
+                npar += int(np.prod(np.shape(params[key])))
+        return npar
+
 
     def set_channel_weights(self, channel_weights=None):
-        """Set per-time/per-frequency soft reliability weights."""
+        """Set per-time/per-frequency soft reliability weights.
+
+        Parameters
+        ----------
+        channel_weights : array_like or None
+            Shape ``(ntime, nfreq)`` or ``(nfreq,)``. Values are clipped into
+            ``[0, 1]``. ``None`` restores unit weights.
+        """
         if channel_weights is None:
             arr = jnp.ones(self.data.shape[:2], dtype=DTYPE_R)
         else:
@@ -250,7 +274,10 @@ class Calibrator:
             if arr.ndim == 1:
                 arr = jnp.broadcast_to(arr[None, :], self.data.shape[:2])
             elif arr.shape != self.data.shape[:2]:
-                raise ValueError(f"channel_weights must have shape {(self.ntime, self.nfreq)} or {(self.nfreq,)}, got {arr.shape}")
+                raise ValueError(
+                    f"channel_weights must have shape {(self.ntime, self.nfreq)} "
+                    f"or {(self.nfreq,)}, got {arr.shape}"
+                )
         self.channel_weights = jnp.clip(arr, 0.0, 1.0).astype(DTYPE_R)
 
     def set_inv_noise_var(self, inv_noise_var=None):
@@ -262,22 +289,45 @@ class Calibrator:
             if arr.ndim == 1:
                 arr = jnp.broadcast_to(arr[None, :], self.data.shape[:2])
             elif arr.shape != self.data.shape[:2]:
-                raise ValueError(f"inv_noise_var must have shape {(self.ntime, self.nfreq)} or {(self.nfreq,)}, got {arr.shape}")
+                raise ValueError(
+                    f"inv_noise_var must have shape {(self.ntime, self.nfreq)} "
+                    f"or {(self.nfreq,)}, got {arr.shape}"
+                )
         self.inv_noise_var = jnp.clip(arr, 0.0, jnp.inf).astype(DTYPE_R)
 
-    def calc_reduced_chi2(self, params, explicit_beam: bool = False, subtract_params: int = 0):
-        """Approximate reduced chi-squared for the currently trusted channels."""
-        if explicit_beam:
-            vis_model = self.fwd.simulate_variable_beam(
-                params['sky_coeffs'], params['beam_coeffs'], self.rot_matrices
+    def set_noise_sigma(self, noise_sigma=None):
+        """Set per-time/per-frequency noise sigma.
+
+        Parameters
+        ----------
+        noise_sigma : array_like or None
+            Shape ``(ntime, nfreq)`` or ``(nfreq,)``. ``None`` restores unit
+            variance.
+        """
+        if noise_sigma is None:
+            self.set_inv_noise_var(None)
+            return
+        arr = jnp.array(noise_sigma, dtype=DTYPE_R)
+        if arr.ndim == 1:
+            arr = jnp.broadcast_to(arr[None, :], self.data.shape[:2])
+        elif arr.shape != self.data.shape[:2]:
+            raise ValueError(
+                f"noise_sigma must have shape {(self.ntime, self.nfreq)} "
+                f"or {(self.nfreq,)}, got {arr.shape}"
             )
+        arr = jnp.clip(arr, 1e-20, jnp.inf)
+        self.inv_noise_var = (1.0 / (arr ** 2)).astype(DTYPE_R)
+
+    def calc_reduced_chi2(self, params, explicit_beam: bool = False, subtract_params='auto'):
+        """Approximate reduced chi-squared under the current weights/noise model."""
+        chi2 = self.calc_chi2(params, explicit_beam=explicit_beam)
+        if subtract_params == 'auto':
+            npar = self.estimate_num_params(params)
         else:
-            vis_model = self.fwd.simulate(params['sky_coeffs'], self.rot_matrices)
-        vis_cal = apply_gains(vis_model, params['log_amp'], params['phase'], params['phi'], self.bls)
-        resid = self.data - vis_cal
-        num = jnp.sum(self.channel_weights[:, :, None] * self.inv_noise_var[:, :, None] * jnp.abs(resid) ** 2)
-        dof = jnp.maximum(jnp.sum(self.channel_weights) * self.nbls - float(subtract_params), 1.0)
-        return float(num / dof)
+            npar = int(subtract_params)
+        dof = max(float(jnp.sum(self.channel_weights) * self.nbls) - npar, 1.0)
+        return float(chi2 / dof)
+
 
     def init_params(self):
         npix_sky = self.fwd.npix_sky
@@ -406,7 +456,7 @@ class Calibrator:
                 vis_model, gain_params['log_amp'], gain_params['phase'],
                 gain_params['phi'], bls,
             )
-            return self._weighted_mse(self.data - vis_cal)
+            return self._weighted_chi2(self.data - vis_cal)
 
         solver = LBFGS(
             fun=beam_loss, tol=tol, maxiter=maxiter, verbose=False,
@@ -485,7 +535,7 @@ class Calibrator:
 
         def sky_loss(sc):
             vis_model = self.fwd.simulate(sc, self.rot_matrices)
-            return self._weighted_mse(data_cal - vis_model)
+            return self._weighted_chi2(data_cal - vis_model)
 
         solver = LBFGS(fun=sky_loss, tol=tol, maxiter=maxiter, verbose=False, linesearch='backtracking', increase_factor=5, history_size=10, jit=True)
         result = solver.run(sky_coeffs)
@@ -532,6 +582,8 @@ class Calibrator:
         fit_method: str = 'fit_alternating_dirty',
         fit_kwargs: dict | None = None,
         rfi_config: RFIConfig | None = None,
+        target_reduced_chi2: float | None = None,
+        reduced_chi2_check_every: int = 1,
         verbose: bool = False,
     ):
         """Iteratively refit with residual-driven channel reweighting.
@@ -568,7 +620,7 @@ class Calibrator:
             )
             current_weights = new_weights
             self.set_channel_weights(current_weights)
-            chi2_red = self.calc_reduced_chi2(params, explicit_beam=('beam_coeffs' in params))
+            chi2_red = self.calc_reduced_chi2(params, explicit_beam=('beam_coeffs' in params), subtract_params='auto')
             history.append({
                 'round': iround,
                 'loss': float(loss),
@@ -578,7 +630,12 @@ class Calibrator:
             })
             if verbose:
                 flagged_frac = float(np.mean(current_weights < 0.5))
-                print(f'[rfi round {iround:02d}] loss={loss:.4e}  red_chi2={chi2_red:.3f}  frac(w<0.5)={flagged_frac:.3f}')
+                print(f'[rfi round {iround:02d}] chi2={loss:.4e}  red_chi2={chi2_red:.3f}  frac(w<0.5)={flagged_frac:.3f}')
+            if target_reduced_chi2 is not None and ((iround + 1) % max(reduced_chi2_check_every, 1) == 0):
+                if chi2_red <= target_reduced_chi2:
+                    if verbose:
+                        print(f'[rfi round {iround:02d}] target reduced chi^2 reached.')
+                    break
         return params, {'channel_weights': current_weights, 'history': history}
 
     def fit_alternating_dirty(
@@ -603,6 +660,8 @@ class Calibrator:
         beam_lbfgs_maxiter: int = 5,
         solve_every: dict | None = None,
         eff_alpha: float = 0.4,
+        target_reduced_chi2: float | None = None,
+        reduced_chi2_check_every: int = 1,
         verbose: bool = False,
         _stop_flag=None,
     ):
@@ -984,9 +1043,28 @@ class Calibrator:
                     eff_b  = f'{_eff_beam:.2e}'         if _eff_beam         is not None else ' N/A  '
                     eff_g  = f'{_eff_gains:.2e}'        if _eff_gains        is not None else ' N/A  '
                     eff_bp = f'{_eff_beam_lbfgs:.2e}'  if _eff_beam_lbfgs  is not None else ' N/A  '
-                    print(f'  step {step:04d} [{_step_type:<11}]: loss={loss:.4e}'
-                          f'  eff[sky={eff_s} beam={eff_b} gains={eff_g} lbfgs={eff_bp}]'
-                          f'  t={elapsed:.1f}s')
+                    msg = (f'  step {step:04d} [{_step_type:<11}]: chi2={loss:.4e}'
+                           f'  eff[sky={eff_s} beam={eff_b} gains={eff_g} lbfgs={eff_bp}]'
+                           f'  t={elapsed:.1f}s')
+                    if target_reduced_chi2 is not None and ((step + 1) % max(reduced_chi2_check_every, 1) == 0):
+                        chi2r = self.calc_reduced_chi2(
+                            _full_params(sky_coeffs, beam_coeffs, gain_params),
+                            explicit_beam=True,
+                            subtract_params='auto',
+                        )
+                        msg += f'  red_chi2={chi2r:.4f}'
+                    print(msg)
+
+                if target_reduced_chi2 is not None and ((step + 1) % max(reduced_chi2_check_every, 1) == 0):
+                    chi2r = self.calc_reduced_chi2(
+                        _full_params(sky_coeffs, beam_coeffs, gain_params),
+                        explicit_beam=True,
+                        subtract_params='auto',
+                    )
+                    if chi2r <= target_reduced_chi2:
+                        if verbose:
+                            print('  target reduced chi^2 reached.')
+                        break
 
                 if stop.stop:
                     break
@@ -1006,6 +1084,8 @@ class Calibrator:
         solve_every: dict | None = None,
         beam_maxiter: int = 10,
         beam_tol: float = 1e-7,
+        target_reduced_chi2: float | None = None,
+        reduced_chi2_check_every: int = 1,
         verbose: bool = False,
         _stop_flag=None,
     ):
@@ -1088,7 +1168,25 @@ class Calibrator:
 
                 if verbose:
                     elapsed = _time.perf_counter() - _t0
-                    print(f'  iter {i:04d}: loss={loss:.4e}  t={elapsed:.1f}s')
+                    msg = f'  iter {i:04d}: chi2={loss:.4e}  t={elapsed:.1f}s'
+                    if target_reduced_chi2 is not None and ((i + 1) % max(reduced_chi2_check_every, 1) == 0):
+                        chi2r = self.calc_reduced_chi2(
+                            {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params},
+                            explicit_beam=True,
+                            subtract_params='auto',
+                        )
+                        msg += f'  red_chi2={chi2r:.4f}'
+                    print(msg)
+                if target_reduced_chi2 is not None and ((i + 1) % max(reduced_chi2_check_every, 1) == 0):
+                    chi2r = self.calc_reduced_chi2(
+                        {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params},
+                        explicit_beam=True,
+                        subtract_params='auto',
+                    )
+                    if chi2r <= target_reduced_chi2:
+                        if verbose:
+                            print('  target reduced chi^2 reached.')
+                        break
                 if stop.stop:
                     break
         finally:
