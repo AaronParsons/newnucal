@@ -25,6 +25,7 @@ import numpy as np
 import jax.numpy as jnp
 
 DTYPE_R = jnp.float32
+DTYPE_C = jnp.complex64
 
 def apply_gains(vis, log_amp, phase, phi, bls):
     """
@@ -53,7 +54,7 @@ def apply_gains(vis, log_amp, phase, phi, bls):
     phs_grad = jnp.einsum("txf,bx->tfb", phi, bls[:, :2].astype(DTYPE_R))  # (ntime, nfreq, nbls)
     # Total gain factor per (time, freq, baseline)
     gain = jnp.exp(log_amp[:, :, None].astype(DTYPE_R)) * jnp.exp(
-        1j * (phase[:, :, None] + phs_grad).astype(DTYPE_R)
+        1j * (phase[:, :, None] + phs_grad).astype(DTYPE_C)
     )  # (ntime, nfreq, nbls), complex64
     return vis * gain
 

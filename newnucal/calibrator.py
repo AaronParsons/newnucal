@@ -45,6 +45,126 @@ class _StopFitFlag:
                 pass
 
 
+class AndersonAccelerator:
+    """Anderson acceleration buffer for fixed-point iterations.
+
+    Accumulates iterates and residuals in a sliding window, then proposes a
+    mixed candidate via constrained least-squares.  Works on flat numpy arrays;
+    the caller is responsible for flattening inputs and reshaping outputs.
+
+    Parameters
+    ----------
+    history : int
+        Maximum number of past iterates to keep.  ``0`` disables AA.
+    start : int
+        Number of plain steps to take before the first AA proposal.
+        The step counter increments after each :meth:`push` call, so
+        ``start=2`` activates AA from the third push onward (consistent
+        with the original per-loop counter behaviour).
+    damping : float
+        Mixing weight: proposal = ``(1-damping)*g_plain + damping*g_aa``.
+    ridge : float
+        Tikhonov regularisation coefficient for the least-squares solve,
+        applied relative to the Gram-matrix trace.
+    max_weight : float
+        Reject proposals where any |beta_i| exceeds this value.
+    """
+
+    def __init__(
+        self,
+        history: int,
+        start: int = 2,
+        damping: float = 0.5,
+        ridge: float = 1e-8,
+        max_weight: float = 10.0,
+    ):
+        self.history    = history
+        self.start      = start
+        self.damping    = damping
+        self.ridge      = ridge
+        self.max_weight = max_weight
+        self._hist_g: list[np.ndarray] = []
+        self._hist_f: list[np.ndarray] = []
+        self._step = 0
+
+    def push(
+        self, x_flat: np.ndarray, g_flat: np.ndarray
+    ) -> np.ndarray | None:
+        """Record one plain step and return an AA-mixed candidate, or None.
+
+        Parameters
+        ----------
+        x_flat : np.ndarray, shape (n,)
+            Current iterate, flattened to 1-D float64.
+        g_flat : np.ndarray, shape (n,)
+            Plain fixed-point step result, flattened to 1-D float64.
+
+        Returns
+        -------
+        np.ndarray or None
+            Damped AA proposal ``(1-damping)*g_flat + damping*g_aa``, or
+            ``None`` when AA is disabled, not yet active, or the mixing
+            coefficients fail validity checks (non-finite or |beta| > max_weight).
+        """
+        if self.history == 0:
+            return None
+
+        f_flat = g_flat - x_flat
+        self._hist_g.append(g_flat.copy())
+        self._hist_f.append(f_flat.copy())
+        if len(self._hist_g) > self.history:
+            self._hist_g.pop(0)
+            self._hist_f.pop(0)
+
+        candidate = None
+        if self._step >= self.start and len(self._hist_f) >= 2:
+            F    = np.stack(self._hist_f, axis=0)
+            beta = self._solve_coeffs(F, self.ridge)
+            if (np.all(np.isfinite(beta))
+                    and float(np.max(np.abs(beta))) <= self.max_weight):
+                g_aa = np.tensordot(beta, np.stack(self._hist_g, axis=0), axes=1)
+                candidate = (1.0 - self.damping) * g_flat + self.damping * g_aa
+
+        self._step += 1
+        return candidate
+
+    def clear(self):
+        """Reset history and step counter (e.g. after an L-BFGS step)."""
+        self._hist_g.clear()
+        self._hist_f.clear()
+        self._step = 0
+
+    @staticmethod
+    def _solve_coeffs(F: np.ndarray, ridge: float = 1e-8) -> np.ndarray:
+        """Constrained least-squares mixing coefficients.
+
+        Solves ``min ||F^T beta||`` subject to ``sum(beta) = 1`` with
+        Tikhonov regularisation ``ridge * trace(G) * I`` added to the
+        Gram matrix ``G = F F^T``.
+
+        Parameters
+        ----------
+        F : np.ndarray, shape (m, n)
+            Residual matrix whose rows are past residuals ``f_i = g_i - x_i``.
+
+        Returns
+        -------
+        beta : np.ndarray, shape (m,)
+        """
+        n = F.shape[0]
+        gram = F @ F.T
+        scale = float(np.trace(gram) / max(n, 1)) if n > 0 else 1.0
+        gram = gram + ridge * max(scale, 1.0) * np.eye(n, dtype=gram.dtype)
+        kkt = np.block([
+            [gram, np.ones((n, 1), dtype=gram.dtype)],
+            [np.ones((1, n), dtype=gram.dtype), np.zeros((1, 1), dtype=gram.dtype)],
+        ])
+        rhs = np.zeros(n + 1, dtype=gram.dtype)
+        rhs[-1] = 1.0
+        sol = np.linalg.lstsq(kkt, rhs, rcond=None)[0]
+        return sol[:n]
+
+
 class Calibrator:
     def __init__(
         self,
@@ -186,10 +306,10 @@ class Calibrator:
         theta = np.linalg.solve(XTX, Xy[..., None])[..., 0]       # (ntime, nfreq, 3)
 
         gain_params = {
-            'log_amp': jnp.array(log_amp, dtype=jnp.float32),             # (ntime, nfreq)
-            'phase':   jnp.array(theta[:, :, 0], dtype=jnp.float32),      # (ntime, nfreq)
-            'phi':     jnp.array(                                           # (ntime, 2, nfreq)
-                theta[:, :, 1:].transpose(0, 2, 1), dtype=jnp.float32
+            'log_amp': jnp.array(log_amp, dtype=DTYPE_R),             # (ntime, nfreq)
+            'phase':   jnp.array(theta[:, :, 0], dtype=DTYPE_R),      # (ntime, nfreq)
+            'phi':     jnp.array(                                       # (ntime, 2, nfreq)
+                theta[:, :, 1:].transpose(0, 2, 1), dtype=DTYPE_R
             ),
         }
         loss = float(self._jit_loss({'sky_coeffs': sky_coeffs, **gain_params}))
@@ -348,61 +468,27 @@ class Calibrator:
                 print(f'    dirty iter {i:03d}: loss={loss:.4e}')
         return best_sky, best_loss
 
-    @staticmethod
-    def _flatten_sky_coeffs(sky_coeffs):
-        return np.asarray(sky_coeffs, dtype=np.float64).ravel()
-
-    @staticmethod
-    def _unflatten_sky_coeffs(vec, shape):
-        return jnp.array(np.asarray(vec, dtype=np.float32).reshape(shape), dtype=DTYPE_R)
-
-    @staticmethod
-    def _flatten_beam_coeffs(beam_coeffs):
-        return np.asarray(beam_coeffs, dtype=np.float64).ravel()
-
-    @staticmethod
-    def _unflatten_beam_coeffs(vec, shape):
-        return jnp.array(np.asarray(vec, dtype=np.float32).reshape(shape), dtype=DTYPE_R)
-
-    @staticmethod
-    def _anderson_coeffs(residual_rows, ridge: float = 1e-8):
-        """Solve min ||sum_i beta_i f_i|| subject to sum_i beta_i = 1."""
-        n = residual_rows.shape[0]
-        gram = residual_rows @ residual_rows.T
-        scale = float(np.trace(gram) / max(n, 1)) if n > 0 else 1.0
-        gram = gram + ridge * max(scale, 1.0) * np.eye(n, dtype=gram.dtype)
-        kkt = np.block([
-            [gram, np.ones((n, 1), dtype=gram.dtype)],
-            [np.ones((1, n), dtype=gram.dtype), np.zeros((1, 1), dtype=gram.dtype)],
-        ])
-        rhs = np.zeros(n + 1, dtype=gram.dtype)
-        rhs[-1] = 1.0
-        sol = np.linalg.lstsq(kkt, rhs, rcond=None)[0]
-        return sol[:n]
-
     def fit_alternating_dirty(
         self,
         params,
         n_iter: int = 30,
-        step_size: float = 0.5,
-        beam_reg: float = 1e-3,
-        momentum: float = 0.0,
-        anderson_history: int = 0,
-        aa_start: int = 2,
-        aa_damping: float = 0.5,
-        aa_ridge: float = 1e-8,
-        aa_max_weight: float = 10.0,
+        sky_step_size: float = 0.5,
+        sky_beam_reg: float = 1e-3,
+        sky_anderson_history: int = 0,
+        sky_aa_start: int = 2,
+        sky_aa_damping: float = 0.5,
+        sky_aa_ridge: float = 1e-8,
+        sky_aa_max_weight: float = 10.0,
+        sky_lbfgs_maxiter: int = 5,
+        beam_step_size: float = 0.5,
+        beam_sky_reg: float = 1e-3,
         beam_anderson_history: int | None = None,
         beam_aa_start: int = 1,
         beam_aa_damping: float = 0.5,
         beam_aa_ridge: float = 1e-8,
         beam_aa_max_weight: float = 10.0,
-        polish_maxiter: int = 5,
-        beam_polish_maxiter: int = 5,
-        beam_polish_rel_tol: float | None = None,
+        beam_lbfgs_maxiter: int = 5,
         solve_every: dict | None = None,
-        beam_step_size: float = 0.5,
-        beam_sky_reg: float = 1e-3,
         eff_alpha: float = 0.4,
         verbose: bool = False,
         _stop_flag=None,
@@ -412,10 +498,9 @@ class Calibrator:
         At each step the algorithm chooses between a sky dirty update and a beam
         dirty update by comparing their recent efficiency (Δloss / second),
         tracked via an exponential moving average.  After each beam step it
-        considers triggering an L-BFGS beam polish: once polish history is
-        available the trigger is cost-aware (fire when estimated polish
-        efficiency exceeds dirty efficiency); before the first polish the
-        ``beam_polish_rel_tol`` fallback and fixed-cadence triggers apply.
+        considers triggering an L-BFGS beam solve: once L-BFGS history is
+        available the trigger is cost-aware (fire when estimated L-BFGS
+        efficiency exceeds dirty efficiency).
 
         Parameters
         ----------
@@ -427,11 +512,6 @@ class Calibrator:
         eff_alpha : float
             EMA weight for efficiency estimates.  Higher → faster adaptation to
             recent performance.
-        beam_polish_rel_tol : float or None
-            Fallback beam-polish trigger used *before* the first polish (when no
-            cost-aware estimate exists yet).  If the beam step's relative
-            improvement is below this, polish fires.  ``None`` disables the
-            fallback.
         solve_every : dict or None
             ``'gains'`` (int, default 1): gains is a step type in the adaptive
                 selection; this value is the *maximum* steps between gains
@@ -442,14 +522,18 @@ class Calibrator:
                 least once every *N* non-sky steps.  ``0`` disables the cap.
             ``'beam_max'`` (int, default 0): hard cap — force a beam step at
                 least once every *N* non-beam steps.  ``0`` disables the cap.
-            ``'beam_polish_max'`` (int, default 25): hard cap — force beam
-                polish after at most *N* beam dirty steps since the last
-                polish.  ``0`` disables the cap.
-            ``'polish_sky'`` (int, default 0): L-BFGS sky polish every *N*
+            ``'beam_lbfgs_max'`` (int, default 25): hard cap — force beam
+                L-BFGS after at most *N* total steps since the last
+                L-BFGS.  ``0`` disables the cap.
+            ``'sky_lbfgs'`` (int, default 0): L-BFGS sky solve every *N*
                 steps (cadence-only, not adaptive).
-            ``'polish_beam'`` (int, default 0): additional fixed-cadence beam
-                polish every *N* beam steps counted from zero (OR'd with the
-                adaptive and cap triggers).
+            ``'beam_lbfgs'`` (int, default 0): additional fixed-cadence beam
+                L-BFGS every *N* beam dirty steps (OR'd with the adaptive
+                and cap triggers).
+        sky_aa_start : int
+            Sky steps before Anderson acceleration is enabled for sky
+            iterations.  Default of 2 skips AA on the first two sky steps
+            (warm-up) and enables it from the third onward.
         beam_aa_start : int
             Beam steps before Anderson acceleration is enabled for beam
             iterations.  Default of 1 skips AA on the very first beam step
@@ -460,14 +544,14 @@ class Calibrator:
         gains_max_every      = solve_every.get('gains',          1)
         sky_max_every        = solve_every.get('sky_max',        0)
         beam_max_every       = solve_every.get('beam_max',       0)
-        beam_polish_max_every = solve_every.get('beam_polish_max', 25)
+        beam_lbfgs_max_every = solve_every.get('beam_lbfgs_max', 25)
         _gains_enabled       = (gains_max_every != 0)
         _beam_enabled        = (solve_every.get('beam',          1) != 0)
-        polish_sky_every     = solve_every.get('polish_sky',     0)
-        polish_beam_every    = solve_every.get('polish_beam',    0)
+        sky_lbfgs_every     = solve_every.get('sky_lbfgs',     0)
+        beam_lbfgs_every    = solve_every.get('beam_lbfgs',    0)
 
         if beam_anderson_history is None:
-            beam_anderson_history = anderson_history
+            beam_anderson_history = sky_anderson_history
 
         sky_coeffs  = params['sky_coeffs']
         gain_params = {k: params[k] for k in ('log_amp', 'phase', 'phi')}
@@ -481,28 +565,31 @@ class Calibrator:
         else:
             stop = _stop_flag
             old_handler = None
-        sky_hist_g,  sky_hist_f  = [], []
-        beam_hist_g, beam_hist_f = [], []
-        sky_aa_step  = 0
-        beam_aa_step = 0
+
+        sky_acc  = AndersonAccelerator(
+            sky_anderson_history, sky_aa_start, sky_aa_damping,
+            sky_aa_ridge, sky_aa_max_weight)
+        beam_acc = AndersonAccelerator(
+            beam_anderson_history, beam_aa_start, beam_aa_damping,
+            beam_aa_ridge, beam_aa_max_weight)
 
         # Efficiency tracking: EMA of Δloss / second per step type.
         _eff_sky          = None   # sky dirty efficiency
         _eff_beam         = None   # beam dirty efficiency
         _eff_gains        = None   # gains efficiency
-        _eff_beam_polish  = None   # beam polish efficiency (set after first polish)
+        _eff_beam_lbfgs  = None   # beam L-BFGS efficiency (set after first L-BFGS step)
 
         _n_sky          = 0   # sky steps taken
         _n_beam         = 0   # beam steps taken
         _n_gains        = 0   # gains steps taken
-        _n_beam_polish  = 0   # beam polish steps taken
+        _n_beam_lbfgs  = 0   # beam L-BFGS steps taken
 
         # Steps-since-last for each type; used to enforce hard caps.
         _n_since_sky              = 0
         _n_since_beam             = 0
         _n_since_gains            = 0
-        _n_since_beam_polish      = 0  # total steps (any type) since last beam polish
-        _n_beam_since_beam_polish = 0  # beam dirty steps since last polish (cadence)
+        _n_since_beam_lbfgs      = 0  # total steps (any type) since last beam L-BFGS
+        _n_beam_since_beam_lbfgs = 0  # beam dirty steps since last L-BFGS (cadence)
 
         # True when beam_coeffs has been dirty-updated but cache not yet synced.
         # The cached-beam JIT (_jit_loss, _jit_val_grad) must not be called
@@ -516,7 +603,7 @@ class Calibrator:
             """One sky dirty step; avoids recomputing current loss."""
             resid = self.calibrated_residual({'sky_coeffs': sky, **gains})
             delta = self.fwd.accumulate_equatorial_sky_update(
-                resid, step_size=step_size, beam_reg=beam_reg)
+                resid, step_size=sky_step_size, beam_reg=sky_beam_reg)
             sky_trial = (sky + delta).astype(DTYPE_R)
             loss_trial = float(self._jit_loss({'sky_coeffs': sky_trial, **gains}))
             if loss_trial < current_loss:
@@ -550,12 +637,12 @@ class Calibrator:
                 if stop.stop:
                     break
 
-                _n_since_beam_polish += 1
+                _n_since_beam_lbfgs += 1
 
-                # --- Choose step type (adaptive 4-way: sky/beam/gains/beam_polish) ---
+                # --- Choose step type (adaptive 4-way: sky/beam/gains/beam_lbfgs) ---
                 # Hard caps: any type that is overdue gets forced.  When more
                 # than one is overdue, pick the most-starved (highest overage
-                # ratio); ties broken sky > beam > gains > beam_polish.
+                # ratio); ties broken sky > beam > gains > beam_lbfgs.
                 _overdue = {}
                 if sky_max_every > 0 and _n_since_sky >= sky_max_every:
                     _overdue['sky']   = _n_since_sky   / sky_max_every
@@ -563,18 +650,18 @@ class Calibrator:
                     _overdue['beam']  = _n_since_beam  / beam_max_every
                 if _gains_enabled and gains_max_every > 0 and _n_since_gains >= gains_max_every:
                     _overdue['gains'] = _n_since_gains / gains_max_every
-                if _beam_enabled and beam_polish_max_every > 0 and _n_since_beam_polish >= beam_polish_max_every:
-                    _overdue['beam_polish'] = _n_since_beam_polish / beam_polish_max_every
-                if (_beam_enabled and polish_beam_every > 0
-                        and _n_beam_since_beam_polish > 0
-                        and _n_beam_since_beam_polish % polish_beam_every == 0):
-                    _overdue['beam_polish'] = max(_overdue.get('beam_polish', 0.0), 1.0)
+                if _beam_enabled and beam_lbfgs_max_every > 0 and _n_since_beam_lbfgs >= beam_lbfgs_max_every:
+                    _overdue['beam_lbfgs'] = _n_since_beam_lbfgs / beam_lbfgs_max_every
+                if (_beam_enabled and beam_lbfgs_every > 0
+                        and _n_beam_since_beam_lbfgs > 0
+                        and _n_beam_since_beam_lbfgs % beam_lbfgs_every == 0):
+                    _overdue['beam_lbfgs'] = max(_overdue.get('beam_lbfgs', 0.0), 1.0)
 
                 if _overdue:
                     _step_type = max(_overdue, key=_overdue.get)
                 # Warm-up: collect one measurement per type before going adaptive.
                 # Gains first: sky and beam benefit from calibrated gains.
-                # beam_polish excluded from warm-up — first fires via hard cap only.
+                # beam_lbfgs excluded from warm-up — first fires via hard cap only.
                 elif _eff_gains is None and _gains_enabled:
                     _step_type = 'gains'
                 elif _eff_sky is None:
@@ -588,14 +675,14 @@ class Calibrator:
                         _cands['beam']  = _eff_beam or 0.0
                     if _gains_enabled:
                         _cands['gains'] = _eff_gains or 0.0
-                    # beam_polish enters adaptive pool only after first measurement
-                    if _beam_enabled and _eff_beam_polish is not None:
-                        _cands['beam_polish'] = _eff_beam_polish or 0.0
+                    # beam_lbfgs enters adaptive pool only after first measurement
+                    if _beam_enabled and _eff_beam_lbfgs is not None:
+                        _cands['beam_lbfgs'] = _eff_beam_lbfgs or 0.0
                     _step_type = max(_cands, key=_cands.get)
 
                 _do_sky         = (_step_type == 'sky')
                 _do_gains       = (_step_type == 'gains')
-                _do_beam_polish = (_step_type == 'beam_polish')
+                _do_beam_lbfgs = (_step_type == 'beam_lbfgs')
 
                 # ============================================================
                 # GAINS STEP
@@ -642,36 +729,25 @@ class Calibrator:
                     used_aa   = False
 
                     # Anderson acceleration
-                    if anderson_history > 0:
-                        x_vec = self._flatten_sky_coeffs(sky_coeffs)
-                        g_vec = self._flatten_sky_coeffs(sky_plain)
-                        f_vec = g_vec - x_vec
-                        sky_hist_g.append(g_vec.copy())
-                        sky_hist_f.append(f_vec.copy())
-                        if len(sky_hist_g) > anderson_history:
-                            sky_hist_g.pop(0); sky_hist_f.pop(0)
-                        if sky_aa_step >= aa_start and len(sky_hist_f) >= 2:
-                            F    = np.stack(sky_hist_f, axis=0)
-                            beta = self._anderson_coeffs(F, ridge=aa_ridge)
-                            if (np.all(np.isfinite(beta))
-                                    and float(np.max(np.abs(beta))) <= aa_max_weight):
-                                g_mix    = np.tensordot(beta, np.stack(sky_hist_g, axis=0), axes=1)
-                                sky_aa   = self._unflatten_sky_coeffs(g_mix, sky_coeffs.shape)
-                                sky_cand = ((1.0 - aa_damping) * sky_plain
-                                            + aa_damping * sky_aa).astype(DTYPE_R)
-                                gain_cand, _ = self.fit_gains_linear(sky_cand)
-                                loss_cand = float(self._jit_loss(
-                                    _full_params(sky_cand, beam_coeffs, gain_cand)))
-                                if loss_cand < loss_plain:
-                                    sky_next  = sky_cand
-                                    gain_next = gain_cand
-                                    loss_next = loss_cand
-                                    used_aa   = True
+                    cand_flat = sky_acc.push(
+                        np.asarray(sky_coeffs, dtype=np.float64).ravel(),
+                        np.asarray(sky_plain,  dtype=np.float64).ravel(),
+                    )
+                    if cand_flat is not None:
+                        sky_cand  = jnp.array(
+                            cand_flat.reshape(sky_coeffs.shape), dtype=DTYPE_R)
+                        gain_cand, _ = self.fit_gains_linear(sky_cand)
+                        loss_cand = float(self._jit_loss(
+                            _full_params(sky_cand, beam_coeffs, gain_cand)))
+                        if loss_cand < loss_plain:
+                            sky_next  = sky_cand
+                            gain_next = gain_cand
+                            loss_next = loss_cand
+                            used_aa   = True
 
-                    sky_coeffs     = sky_next
-                    gain_params    = gain_next
-                    loss           = loss_next
-                    sky_aa_step   += 1
+                    sky_coeffs  = sky_next
+                    gain_params = gain_next
+                    loss        = loss_next
                     _n_sky        += 1
                     _n_since_sky   = 0
                     _n_since_beam += 1
@@ -702,40 +778,27 @@ class Calibrator:
                     used_aa   = False
 
                     # Anderson acceleration
-                    if beam_anderson_history and beam_anderson_history > 0:
-                        x_vec = self._flatten_beam_coeffs(beam_coeffs)
-                        g_vec = self._flatten_beam_coeffs(beam_plain)
-                        f_vec = g_vec - x_vec
-                        beam_hist_g.append(g_vec.copy())
-                        beam_hist_f.append(f_vec.copy())
-                        if len(beam_hist_g) > beam_anderson_history:
-                            beam_hist_g.pop(0); beam_hist_f.pop(0)
-                        if beam_aa_step >= beam_aa_start and len(beam_hist_f) >= 2:
-                            F    = np.stack(beam_hist_f, axis=0)
-                            beta = self._anderson_coeffs(F, ridge=beam_aa_ridge)
-                            if (np.all(np.isfinite(beta))
-                                    and float(np.max(np.abs(beta))) <= beam_aa_max_weight):
-                                g_mix     = np.tensordot(
-                                    beta, np.stack(beam_hist_g, axis=0), axes=1)
-                                beam_aa   = self._unflatten_beam_coeffs(
-                                    g_mix, beam_coeffs.shape)
-                                beam_cand = ((1.0 - beam_aa_damping) * beam_plain
-                                             + beam_aa_damping * beam_aa).astype(DTYPE_R)
-                                loss_cand = float(self._jit_loss_variable_beam(
-                                    _full_params(sky_coeffs, beam_cand, gain_params)))
-                                if loss_cand < loss_plain:
-                                    beam_next = beam_cand
-                                    loss_next = loss_cand
-                                    used_aa   = True
+                    cand_flat = beam_acc.push(
+                        np.asarray(beam_coeffs, dtype=np.float64).ravel(),
+                        np.asarray(beam_plain,  dtype=np.float64).ravel(),
+                    )
+                    if cand_flat is not None:
+                        beam_cand = jnp.array(
+                            cand_flat.reshape(beam_coeffs.shape), dtype=DTYPE_R)
+                        loss_cand = float(self._jit_loss_variable_beam(
+                            _full_params(sky_coeffs, beam_cand, gain_params)))
+                        if loss_cand < loss_plain:
+                            beam_next = beam_cand
+                            loss_next = loss_cand
+                            used_aa   = True
 
-                    beam_coeffs               = beam_next
-                    loss                      = loss_next
-                    beam_aa_step             += 1
+                    beam_coeffs = beam_next
+                    loss        = loss_next
                     _n_beam                  += 1
                     _n_since_sky             += 1
                     _n_since_beam             = 0
                     _n_since_gains           += 1
-                    _n_beam_since_beam_polish += 1
+                    _n_beam_since_beam_lbfgs += 1
                     _beam_dirty_pending       = True
 
                     dt    = max(_time.perf_counter() - t_step, 1e-3)
@@ -752,19 +815,16 @@ class Calibrator:
                 # ============================================================
                 # BEAM POLISH STEP
                 # ============================================================
-                elif _do_beam_polish:
+                elif _do_beam_lbfgs:
                     if _beam_dirty_pending:
                         _sync_beam_cache()
                     t_step   = _time.perf_counter()
                     loss_pre = loss
-                    if verbose:
-                        print(f'    [beam_polish {_n_beam_polish:03d}]: '
-                              f'starting L-BFGS beam polish ...')
                     bp, loss = self.fit_beam_only(
                         {'sky_coeffs': sky_coeffs,
                          'beam_coeffs': beam_coeffs,
                          **gain_params},
-                        maxiter=beam_polish_maxiter, tol=1e-7,
+                        maxiter=beam_lbfgs_maxiter, tol=1e-7,
                     )
                     beam_coeffs = bp['beam_coeffs']
                     # fit_beam_only updates the cache and recompiles internally.
@@ -772,47 +832,47 @@ class Calibrator:
                     dloss = max(0.0, loss_pre - loss)
                     eff   = dloss / dt
                     # Fast-decay, slow-rise EMA: immediately believe a lower
-                    # measurement to avoid consecutive polish cascade.
-                    if _eff_beam_polish is None:
-                        _eff_beam_polish = eff
+                    # measurement to avoid consecutive L-BFGS cascade.
+                    if _eff_beam_lbfgs is None:
+                        _eff_beam_lbfgs = eff
                     else:
-                        _ema = eff_alpha * eff + (1.0 - eff_alpha) * _eff_beam_polish
-                        _eff_beam_polish = min(_ema, eff)
+                        _ema = eff_alpha * eff + (1.0 - eff_alpha) * _eff_beam_lbfgs
+                        _eff_beam_lbfgs = min(_ema, eff)
                     # Reset beam AA and re-measure beam efficiency from scratch.
-                    beam_hist_g.clear(); beam_hist_f.clear(); beam_aa_step = 0
+                    beam_acc.clear()
                     _eff_beam = None
-                    _n_beam_polish            += 1
-                    _n_since_beam_polish       = 0
-                    _n_beam_since_beam_polish  = 0
+                    _n_beam_lbfgs            += 1
+                    _n_since_beam_lbfgs       = 0
+                    _n_beam_since_beam_lbfgs  = 0
                     _n_since_sky              += 1
                     _n_since_beam             += 1
                     _n_since_gains            += 1
                     if verbose:
-                        print(f'    [beam_polish {_n_beam_polish - 1:03d}]: '
+                        print(f'    [beam_lbfgs {_n_beam_lbfgs - 1:03d}]: '
                               f'loss={loss:.4e}  eff={eff:.2e} Δloss/s')
 
-                # --- Optional sky polish (cadence only) ---
-                if polish_sky_every > 0 and (step + 1) % polish_sky_every == 0:
+                # --- Optional sky L-BFGS (cadence only) ---
+                if sky_lbfgs_every > 0 and (step + 1) % sky_lbfgs_every == 0:
                     if _beam_dirty_pending:
                         _sync_beam_cache()
                     if verbose:
-                        print(f'    [polish_sky]: starting L-BFGS sky polish ...')
+                        print(f'    [sky_lbfgs]: starting L-BFGS sky solve ...')
                     sky_coeffs, loss = self.fit_sky_only(
-                        sky_coeffs, gain_params, maxiter=polish_maxiter, tol=1e-7)
+                        sky_coeffs, gain_params, maxiter=sky_lbfgs_maxiter, tol=1e-7)
                     gain_params, _ = self.fit_gains_linear(sky_coeffs)
-                    sky_hist_g.clear(); sky_hist_f.clear(); sky_aa_step = 0
+                    sky_acc.clear()
                     _eff_sky = None  # sky landscape shifted; re-measure
                     if verbose:
-                        print(f'    [polish_sky]: loss={loss:.4e}')
+                        print(f'    [sky_lbfgs]: loss={loss:.4e}')
 
                 if verbose:
                     elapsed = _time.perf_counter() - _t0
                     eff_s  = f'{_eff_sky:.2e}'          if _eff_sky          is not None else ' N/A  '
                     eff_b  = f'{_eff_beam:.2e}'         if _eff_beam         is not None else ' N/A  '
                     eff_g  = f'{_eff_gains:.2e}'        if _eff_gains        is not None else ' N/A  '
-                    eff_bp = f'{_eff_beam_polish:.2e}'  if _eff_beam_polish  is not None else ' N/A  '
+                    eff_bp = f'{_eff_beam_lbfgs:.2e}'  if _eff_beam_lbfgs  is not None else ' N/A  '
                     print(f'  step {step:04d} [{_step_type:<11}]: loss={loss:.4e}'
-                          f'  eff[sky={eff_s} beam={eff_b} gains={eff_g} polish={eff_bp}]'
+                          f'  eff[sky={eff_s} beam={eff_b} gains={eff_g} lbfgs={eff_bp}]'
                           f'  t={elapsed:.1f}s')
 
                 if stop.stop:

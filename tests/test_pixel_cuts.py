@@ -252,35 +252,104 @@ class TestCalibratorPixelCuts:
 
 
 # =============================================================================
-# 3.  Anderson acceleration (unit tests for _anderson_coeffs)
+# 3.  Anderson acceleration (unit tests for AndersonAccelerator)
 # =============================================================================
 
-class TestAndersonCoeffs:
-    from newnucal.calibrator import Calibrator as _Cal
+class TestAndersonAccelerator:
 
-    def test_shape(self):
-        from newnucal.calibrator import Calibrator
+    def test_solve_coeffs_shape(self):
+        from newnucal.calibrator import AndersonAccelerator
         n, d = 4, 10
         F = np.random.default_rng(0).standard_normal((n, d))
-        beta = Calibrator._anderson_coeffs(F)
+        beta = AndersonAccelerator._solve_coeffs(F)
         assert beta.shape == (n,)
 
-    def test_sums_to_one(self):
+    def test_solve_coeffs_sums_to_one(self):
         """The constraint sum_i beta_i = 1 must be satisfied."""
-        from newnucal.calibrator import Calibrator
+        from newnucal.calibrator import AndersonAccelerator
         F = np.random.default_rng(1).standard_normal((5, 20))
-        beta = Calibrator._anderson_coeffs(F)
+        beta = AndersonAccelerator._solve_coeffs(F)
         assert abs(beta.sum() - 1.0) < 1e-6, f"beta sums to {beta.sum():.6f}, not 1"
 
-    def test_trivial_case(self):
+    def test_solve_coeffs_trivial_case(self):
         """With n=1 the only solution is beta=[1]."""
-        from newnucal.calibrator import Calibrator
+        from newnucal.calibrator import AndersonAccelerator
         F = np.array([[1.0, 2.0, 3.0]])
-        beta = Calibrator._anderson_coeffs(F)
+        beta = AndersonAccelerator._solve_coeffs(F)
         assert abs(beta[0] - 1.0) < 1e-6
 
-    def test_finite_values(self):
-        from newnucal.calibrator import Calibrator
+    def test_solve_coeffs_finite_values(self):
+        from newnucal.calibrator import AndersonAccelerator
         F = np.random.default_rng(42).standard_normal((6, 50))
-        beta = Calibrator._anderson_coeffs(F)
+        beta = AndersonAccelerator._solve_coeffs(F)
         assert np.isfinite(beta).all()
+
+    def test_push_returns_none_when_disabled(self):
+        from newnucal.calibrator import AndersonAccelerator
+        acc = AndersonAccelerator(history=0)
+        x = np.zeros(10)
+        g = np.ones(10)
+        assert acc.push(x, g) is None
+
+    def test_push_returns_none_before_start(self):
+        from newnucal.calibrator import AndersonAccelerator
+        acc = AndersonAccelerator(history=5, start=2)
+        x = np.zeros(10)
+        for i in range(2):
+            result = acc.push(x, x + 0.1 * i)
+            assert result is None, f"Expected None on push {i} (before start=2)"
+
+    def test_push_returns_array_after_start(self):
+        from newnucal.calibrator import AndersonAccelerator
+        rng = np.random.default_rng(7)
+        acc = AndersonAccelerator(history=5, start=2, damping=0.5)
+        x = rng.standard_normal(20)
+        g = rng.standard_normal(20)
+        acc.push(x, g)            # step 0 — before start
+        acc.push(x + 0.1, g - 0.1)  # step 1 — before start
+        result = acc.push(x + 0.2, g + 0.2)  # step 2 — should return candidate
+        assert result is not None
+        assert result.shape == (20,)
+        assert np.isfinite(result).all()
+
+    def test_push_candidate_is_damped_mix(self):
+        """With damping=1 the output is exactly g_aa; with damping=0 it is g_plain."""
+        from newnucal.calibrator import AndersonAccelerator
+        rng = np.random.default_rng(99)
+        n = 30
+
+        acc0 = AndersonAccelerator(history=5, start=0, damping=0.0)
+        acc1 = AndersonAccelerator(history=5, start=0, damping=1.0)
+
+        x = rng.standard_normal(n)
+        g1 = rng.standard_normal(n)
+        g2 = rng.standard_normal(n)
+
+        r0 = acc0.push(x, g1); r1 = acc1.push(x, g1)  # step 0: only 1 in history
+        r0 = acc0.push(x + 0.1, g2)
+        r1 = acc1.push(x + 0.1, g2)
+
+        # damping=0: candidate == g_plain
+        assert r0 is not None and np.allclose(r0, g2, atol=1e-12)
+        # damping=1: candidate == g_aa (not necessarily g_plain)
+        assert r1 is not None
+
+    def test_clear_resets_state(self):
+        from newnucal.calibrator import AndersonAccelerator
+        rng = np.random.default_rng(3)
+        acc = AndersonAccelerator(history=5, start=0)
+        for _ in range(4):
+            acc.push(rng.standard_normal(10), rng.standard_normal(10))
+        acc.clear()
+        assert acc._step == 0
+        assert len(acc._hist_g) == 0
+        assert len(acc._hist_f) == 0
+
+    def test_history_trimmed_to_max(self):
+        from newnucal.calibrator import AndersonAccelerator
+        rng = np.random.default_rng(5)
+        acc = AndersonAccelerator(history=3, start=0)
+        for _ in range(10):
+            acc.push(rng.standard_normal(8), rng.standard_normal(8))
+        assert len(acc._hist_g) <= 3
+        assert len(acc._hist_f) <= 3
