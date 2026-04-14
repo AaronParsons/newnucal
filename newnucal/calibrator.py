@@ -240,6 +240,7 @@ class Calibrator:
         self._jit_loss = jax.jit(self._loss)
         self._jit_val_grad = jax.jit(jax.value_and_grad(self._loss))
         self._jit_loss_variable_beam = jax.jit(self._loss_variable_beam)
+        self._jit_simulate = jax.jit(self.fwd.simulate)
         self.set_channel_weights(channel_weights)
         self.set_inv_noise_var(inv_noise_var)
         if noise_sigma is not None:
@@ -249,6 +250,7 @@ class Calibrator:
         return (self.channel_weights * self.inv_noise_var).astype(DTYPE_R)
 
     def _weighted_chi2(self, resid):
+        """Weighted chi2 using the current channel_weights * inv_noise_var."""
         w = self._effective_weights()
         return jnp.sum(w[:, :, None] * (jnp.abs(resid) ** 2))
 
@@ -257,22 +259,37 @@ class Calibrator:
         den = jnp.maximum(jnp.sum(w) * resid.shape[2], 1e-12)
         return self._weighted_chi2(resid) / den
 
-    def _loss(self, params):
+    def _loss(self, params, weights):
+        """Loss function with weights passed explicitly to avoid JIT constant baking."""
         vis_model = self.fwd.simulate(params['sky_coeffs'], self.rot_matrices)
         vis_cal = apply_gains(vis_model, params['log_amp'], params['phase'], params['phi'], self.bls)
-        return self._weighted_chi2(self.data - vis_cal)
+        return jnp.sum(weights[:, :, None] * (jnp.abs(self.data - vis_cal) ** 2))
 
-    def _loss_variable_beam(self, params):
+    def _loss_variable_beam(self, params, weights):
+        """Loss function (variable beam) with weights passed explicitly."""
         vis_model = self.fwd.simulate_variable_beam(
             params['sky_coeffs'], params['beam_coeffs'], self.rot_matrices
         )
         vis_cal = apply_gains(vis_model, params['log_amp'], params['phase'], params['phi'], self.bls)
-        return self._weighted_chi2(self.data - vis_cal)
+        return jnp.sum(weights[:, :, None] * (jnp.abs(self.data - vis_cal) ** 2))
 
     def calc_loss(self, params, explicit_beam: bool = False):
+        # Fast path: return the loss already computed by fit_gains_linear when
+        # called immediately after with the same (sky_coeffs, gain_params) arrays.
+        # Object-identity checks are safe because JAX arrays are immutable.
+        if not explicit_beam:
+            cache = getattr(self, '_fit_gains_linear_cache', None)
+            if cache is not None:
+                sc, gp, cached_loss = cache
+                if (params.get('sky_coeffs') is sc
+                        and params.get('log_amp') is gp.get('log_amp')
+                        and params.get('phase') is gp.get('phase')
+                        and params.get('phi') is gp.get('phi')):
+                    return cached_loss
+        w = self._effective_weights()
         if explicit_beam:
-            return float(self._jit_loss_variable_beam(params))
-        return float(self._jit_loss(params))
+            return float(self._jit_loss_variable_beam(params, w))
+        return float(self._jit_loss(params, w))
 
     def calc_chi2(self, params, explicit_beam: bool = False):
         return self.calc_loss(params, explicit_beam=explicit_beam)
@@ -351,8 +368,16 @@ class Calibrator:
         arr = jnp.clip(arr, 1e-20, jnp.inf)
         self.inv_noise_var = (1.0 / (arr ** 2)).astype(DTYPE_R)
 
-    def calc_reduced_chi2(self, params, explicit_beam: bool = False, subtract_params='auto'):
-        """Approximate reduced chi-squared under the current weights/noise model."""
+    def calc_reduced_chi2(self, params, explicit_beam: bool = False, subtract_params=0):
+        """Approximate reduced chi-squared under the current weights/noise model.
+
+        The denominator is the effective number of data points (sum of channel
+        weights times number of baselines), optionally minus the number of free
+        parameters.  The default ``subtract_params=0`` gives chi2 per data
+        point, which equals 1 when the noise model is correct.  Pass
+        ``subtract_params='auto'`` to subtract the full parameter count, or an
+        integer to subtract a specific number.
+        """
         chi2 = self.calc_chi2(params, explicit_beam=explicit_beam)
         if subtract_params == 'auto':
             npar = self.estimate_num_params(params)
@@ -373,6 +398,30 @@ class Calibrator:
 
     def init_sky_from_flux(self, flux):
         return jnp.array(dpss_project(np.asarray(flux), self.A_sky), dtype=DTYPE_R)
+
+    def simulate(self, params):
+        """Return gain-calibrated model visibilities for the given parameters.
+
+        Parameters
+        ----------
+        params : dict
+            Must include ``sky_coeffs``, ``log_amp``, ``phase``, ``phi``.
+            If ``beam_coeffs`` is present, ``simulate_variable_beam`` is used;
+            otherwise the precomputed beam cache is used.
+
+        Returns
+        -------
+        vis : jnp.ndarray, shape (ntime, nfreq, nbls), complex64
+        """
+        if 'beam_coeffs' in params:
+            vis_model = self.fwd.simulate_variable_beam(
+                params['sky_coeffs'], params['beam_coeffs'], self.rot_matrices
+            )
+        else:
+            vis_model = self.fwd.simulate(params['sky_coeffs'], self.rot_matrices)
+        return apply_gains(
+            vis_model, params['log_amp'], params['phase'], params['phi'], self.bls
+        )
 
     @staticmethod
     def _invert_gains(gain_params):
@@ -414,7 +463,7 @@ class Calibrator:
         return n_keep
 
     def fit_gains_linear(self, sky_coeffs):
-        vis_model = jax.jit(self.fwd.simulate)(sky_coeffs, self.rot_matrices)
+        vis_model = self._jit_simulate(sky_coeffs, self.rot_matrices)
         # Per-time optimal complex gain: data · conj(model) / |model|²
         # Shape: (ntime, nfreq, nbls)
         den = np.array(jnp.abs(vis_model) ** 2)          # (ntime, nfreq, nbls), weights
@@ -448,7 +497,13 @@ class Calibrator:
                 theta[:, :, 1:].transpose(0, 2, 1), dtype=DTYPE_R
             ),
         }
-        loss = float(self._jit_loss({'sky_coeffs': sky_coeffs, **gain_params}))
+        loss = float(self._jit_loss({'sky_coeffs': sky_coeffs, **gain_params}, self._effective_weights()))
+        # Cache by object identity so that an immediate calc_loss(params) call
+        # returns the same float without a second NUFFT evaluation.
+        # jax_finufft.nufft is non-deterministic: two calls with identical inputs
+        # can give slightly different values, causing large relative differences
+        # when the loss is near zero.  Returning the cached value avoids this.
+        self._fit_gains_linear_cache = (sky_coeffs, gain_params, loss)
         return gain_params, loss
 
     def _recompile_jit(self):
@@ -456,6 +511,7 @@ class Calibrator:
         self._jit_loss = jax.jit(self._loss)
         self._jit_val_grad = jax.jit(jax.value_and_grad(self._loss))
         self._jit_loss_variable_beam = jax.jit(self._loss_variable_beam)
+        self._jit_simulate = jax.jit(self.fwd.simulate)
 
     def fit_beam_only(self, params, maxiter: int = 10, tol: float = 1e-7):
         """L-BFGS on beam_coeffs with sky and gains held fixed.
@@ -526,8 +582,9 @@ class Calibrator:
         beam_coeffs = params['beam_coeffs']
 
         best_bc = beam_coeffs
+        _w = self._effective_weights()
         best_loss = float(self._jit_loss_variable_beam(
-            {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params}
+            {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params}, _w
         ))
         current_bc = beam_coeffs
 
@@ -540,7 +597,7 @@ class Calibrator:
             )
             trial_bc = current_bc + delta_bc
             loss = float(self._jit_loss_variable_beam(
-                {'sky_coeffs': sky_coeffs, 'beam_coeffs': trial_bc, **gain_params}
+                {'sky_coeffs': sky_coeffs, 'beam_coeffs': trial_bc, **gain_params}, _w
             ))
             if loss < best_loss:
                 best_loss = loss
@@ -573,7 +630,7 @@ class Calibrator:
         solver = LBFGS(fun=sky_loss, tol=tol, maxiter=maxiter, verbose=False, linesearch='backtracking', increase_factor=5, history_size=10, jit=True)
         result = solver.run(sky_coeffs)
         sky_new = result.params
-        loss = float(self._jit_loss({'sky_coeffs': sky_new, **gain_params}))
+        loss = float(self._jit_loss({'sky_coeffs': sky_new, **gain_params}, self._effective_weights()))
         return sky_new, loss
 
     def fit_sky_dirty(
@@ -588,13 +645,14 @@ class Calibrator:
     ):
         velocity = jnp.zeros_like(sky_coeffs)
         best_sky = sky_coeffs
-        best_loss = float(self._jit_loss({'sky_coeffs': sky_coeffs, **gain_params}))
+        _w = self._effective_weights()
+        best_loss = float(self._jit_loss({'sky_coeffs': sky_coeffs, **gain_params}, _w))
         for i in range(n_iter):
             resid = self.calibrated_residual({'sky_coeffs': sky_coeffs, **gain_params})
             delta = self.fwd.accumulate_equatorial_sky_update(resid, step_size=step_size, beam_reg=beam_reg)
             velocity = momentum * velocity + delta
             sky_coeffs = sky_coeffs + velocity
-            loss = float(self._jit_loss({'sky_coeffs': sky_coeffs, **gain_params}))
+            loss = float(self._jit_loss({'sky_coeffs': sky_coeffs, **gain_params}, _w))
             if loss < best_loss:
                 best_loss = loss
                 best_sky = sky_coeffs
@@ -734,12 +792,19 @@ class Calibrator:
             ),
         )
 
-        self.fwd.update_beam_cache(state.params['beam_coeffs'])
-        self._recompile_jit()
-        state.loss = float(self._jit_loss(state.params))
+        # Only update beam cache and recompile JIT when the beam actually changed.
+        # update_beam_cache always creates a new fwd._jit_one, and _recompile_jit
+        # creates several new JIT wrappers — unnecessary churn when beam is
+        # unchanged fills JAX's LRU compilation cache, evicting previous compiled
+        # functions and causing non-deterministic recompilation.
+        new_bc = state.params['beam_coeffs']
+        if not np.array_equal(np.asarray(new_bc), np.asarray(self.fwd.beam_coeffs)):
+            self.fwd.update_beam_cache(new_bc)
+            self._recompile_jit()
+        state.loss = float(self._jit_loss(state.params, self._effective_weights()))
         if target_reduced_chi2 is not None:
             state.reduced_chi2 = self.calc_reduced_chi2(
-                state.params, explicit_beam=True, subtract_params='auto'
+                state.params, explicit_beam=True, subtract_params=0
             )
         return state
 
@@ -778,7 +843,7 @@ class Calibrator:
                 resid, step_size=s['sky_step_size'], beam_reg=s['sky_beam_reg']
             )
             sky_trial = (sky + delta).astype(DTYPE_R)
-            loss_trial = float(self._jit_loss({'sky_coeffs': sky_trial, **gains}))
+            loss_trial = float(self._jit_loss({'sky_coeffs': sky_trial, **gains}, self._effective_weights()))
             if loss_trial < current_loss:
                 return sky_trial, loss_trial
             return sky, current_loss
@@ -792,7 +857,8 @@ class Calibrator:
             )
             beam_trial = (beam + delta_bc).astype(DTYPE_R)
             loss_trial = float(self._jit_loss_variable_beam(
-                {'sky_coeffs': sky, 'beam_coeffs': beam_trial, **gains}
+                {'sky_coeffs': sky, 'beam_coeffs': beam_trial, **gains},
+                self._effective_weights(),
             ))
             if loss_trial < current_loss:
                 return beam_trial, loss_trial
@@ -872,7 +938,7 @@ class Calibrator:
             if cand_flat is not None:
                 sky_cand = jnp.array(cand_flat.reshape(sky_coeffs.shape), dtype=DTYPE_R)
                 gain_cand, _ = self.fit_gains_linear(sky_cand)
-                loss_cand = float(self._jit_loss(_full_params(sky_cand, beam_coeffs, gain_cand)))
+                loss_cand = float(self._jit_loss(_full_params(sky_cand, beam_coeffs, gain_cand), self._effective_weights()))
                 if loss_cand < loss_plain:
                     sky_next = sky_cand
                     gain_next = gain_cand
@@ -903,7 +969,7 @@ class Calibrator:
             )
             if cand_flat is not None:
                 beam_cand = jnp.array(cand_flat.reshape(beam_coeffs.shape), dtype=DTYPE_R)
-                loss_cand = float(self._jit_loss_variable_beam(_full_params(sky_coeffs, beam_cand, gain_params)))
+                loss_cand = float(self._jit_loss_variable_beam(_full_params(sky_coeffs, beam_cand, gain_params), self._effective_weights()))
                 if loss_cand < loss_plain:
                     beam_next = beam_cand
                     loss_next = loss_cand
@@ -972,7 +1038,7 @@ class Calibrator:
         target = s['target_reduced_chi2']
         if target is not None and (state.step % check_every == 0):
             state.reduced_chi2 = self.calc_reduced_chi2(
-                state.params, explicit_beam=True, subtract_params='auto'
+                state.params, explicit_beam=True, subtract_params=0
             )
             if state.reduced_chi2 <= target:
                 state.stop_reason = 'target_reduced_chi2'
@@ -1146,7 +1212,7 @@ class Calibrator:
             stop = _stop_flag
             old_handler = None
         try:
-            loss = float(self._jit_loss(params))
+            loss = float(self._jit_loss(params, self._effective_weights()))
             _t0 = _time.perf_counter()
             for i in range(n_iter):
                 # --- Sky L-BFGS update (every step) ---
@@ -1165,7 +1231,8 @@ class Calibrator:
                         print(f'    [gains]: loss={loss:.4e}')
                 else:
                     loss = float(self._jit_loss(
-                        {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params}
+                        {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params},
+                        self._effective_weights(),
                     ))
 
                 # --- Beam solve (if scheduled) ---
@@ -1209,7 +1276,8 @@ class Calibrator:
         return {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params}, loss
 
     def fit_lbfgs(self, params, maxiter: int = 30, tol: float = 1e-7):
-        solver = LBFGS(fun=self._loss, tol=tol, maxiter=maxiter, verbose=False, linesearch='backtracking', increase_factor=5, history_size=10, jit=True)
+        w = self._effective_weights()
+        solver = LBFGS(fun=lambda p: self._loss(p, w), tol=tol, maxiter=maxiter, verbose=False, linesearch='backtracking', increase_factor=5, history_size=10, jit=True)
         result = solver.run(params)
         return result.params, float(result.state.value)
 
@@ -1221,7 +1289,7 @@ class Calibrator:
         best_params = params
         best_loss = jnp.inf
         for i in range(maxiter):
-            loss, grads = self._jit_val_grad(params)
+            loss, grads = self._jit_val_grad(params, self._effective_weights())
             if loss < best_loss:
                 best_loss = loss
                 best_params = params

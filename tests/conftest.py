@@ -6,6 +6,14 @@ All fixtures use small sizes so tests run quickly:
   nfreq=16, nside=8 (768 pixels), ntimes=2
 """
 
+import os
+# Force FINUFFT to use a single OpenMP thread so that nufft3 calls are
+# perfectly reproducible across separate invocations.  Without this,
+# parallel float reductions produce different rounding depending on thread
+# scheduling, causing test_resuming_preserves_anderson_state to fail
+# non-deterministically.  Must be set before the first FINUFFT call.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
 import numpy as np
 import pytest
 from astropy.time import Time
