@@ -68,7 +68,7 @@ def test_output_shape(forward_model, A_sky, rot_matrices):
 
 def test_nonzero_sky_gives_nonzero_vis(forward_model, A_sky):
     """A sky with positive flux should produce non-zero visibilities."""
-    sky_coeffs = _zenith_sky_coeffs(forward_model.sky_nside, A_sky, flux_per_pixel=1.0)
+    sky_coeffs = _zenith_sky_coeffs(forward_model.sky_model.nside, A_sky, flux_per_pixel=1.0)
     rot_m = _identity_rot()[None, :, :]
 
     vis = forward_model.simulate(sky_coeffs, rot_m)[0]  # (nfreq, nbls)
@@ -77,7 +77,7 @@ def test_nonzero_sky_gives_nonzero_vis(forward_model, A_sky):
 
 def test_gradient_computable(forward_model, A_sky):
     """JAX should be able to differentiate through the forward model."""
-    sky_coeffs = _zenith_sky_coeffs(forward_model.sky_nside, A_sky)
+    sky_coeffs = _zenith_sky_coeffs(forward_model.sky_model.nside, A_sky)
     rot_m = _identity_rot()[None, :, :]
 
     def loss(sc):
@@ -91,7 +91,7 @@ def test_gradient_computable(forward_model, A_sky):
 def test_vis_is_complex(forward_model, A_sky):
     npix = forward_model.npix_sky
     nmodes = A_sky.shape[1]
-    sky_coeffs = _zenith_sky_coeffs(forward_model.sky_nside, A_sky)
+    sky_coeffs = _zenith_sky_coeffs(forward_model.sky_model.nside, A_sky)
     rot_m = _identity_rot()[None, :, :]
 
     vis = forward_model.simulate(sky_coeffs, rot_m)
@@ -100,7 +100,7 @@ def test_vis_is_complex(forward_model, A_sky):
 
 def test_sky_rotation_changes_vis(forward_model, A_sky, rot_matrices):
     """Different rotation matrices should produce different visibilities."""
-    sky_coeffs = _zenith_sky_coeffs(forward_model.sky_nside, A_sky)
+    sky_coeffs = _zenith_sky_coeffs(forward_model.sky_model.nside, A_sky)
     vis = forward_model.simulate(sky_coeffs, rot_matrices)  # (ntime, nfreq, nbls)
 
     if rot_matrices.shape[0] > 1:

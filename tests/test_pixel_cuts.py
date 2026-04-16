@@ -33,10 +33,12 @@ ETA_BEAM    = 20e-9
 @pytest.fixture
 def fwd(array, beam_model, freqs):
     """Fresh ForwardModel (function-scoped; safe to mutate)."""
-    A = dpss_matrix(freqs, ETA_SKY)
-    fwd = ForwardModel(array, NSIDE_SKY, beam_model, freqs)
-    fwd.set_sky_dpss(A)
-    return fwd, A
+    from newnucal.sky import SkyModel
+    from newnucal.basis import SkyBasis
+    sky_model = SkyModel(nside=NSIDE_SKY, freqs=freqs,
+                         basis=SkyBasis.from_dpss(freqs, ETA_SKY))
+    fwd = ForwardModel(array, sky_model, beam_model, freqs)
+    return fwd, np.asarray(sky_model.A)
 
 
 @pytest.fixture
@@ -244,7 +246,7 @@ class TestCalibratorPixelCuts:
         calibrator.apply_horizon_cut()
         # Rebuild sky_coeffs for new npix
         params['sky_coeffs'] = jnp.zeros(
-            (calibrator.fwd.npix_sky, calibrator.A_sky.shape[1])
+            (calibrator.fwd.npix_sky, calibrator.fwd.A_sky.shape[1])
         )
         loss = calibrator.calc_loss(params)
         assert np.isfinite(loss)

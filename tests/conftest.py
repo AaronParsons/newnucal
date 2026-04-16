@@ -95,8 +95,6 @@ def rot_matrices():
 
 
 @pytest.fixture(scope="session")
-def forward_model(array, beam_model, freqs, A_sky):
+def forward_model(array, sky_model, beam_model, freqs):
     from newnucal.simulate import ForwardModel
-    fwd = ForwardModel(array, NSIDE_SKY, beam_model, freqs)
-    fwd.set_sky_basis(A_sky)
-    return fwd
+    return ForwardModel(array, sky_model, beam_model, freqs)

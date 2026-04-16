@@ -34,12 +34,12 @@ def test_beam_model_shapes(beam_model, freqs):
     npix = healpy.nside2npix(beam_model.nside)
     assert beam_model.coeffs.shape[0] == npix
     assert beam_model.coeffs.shape[1] == beam_model.nmodes
-    assert beam_model.A_beam.shape == (len(freqs), beam_model.nmodes)
+    assert beam_model.A.shape == (len(freqs), beam_model.nmodes)
 
 
 def test_beam_reconstruction_positive(beam_model):
     """Reconstructed beam power should be non-negative everywhere."""
-    rec = dpss_reconstruct(beam_model.coeffs, beam_model.A_beam)
+    rec = dpss_reconstruct(beam_model.coeffs, beam_model.A)
     # Reconstruction can have small ringing below horizon; above horizon
     # (first pixel = north pole / zenith for nside=8) must be positive.
     assert rec[0, :].min() > 0, "Zenith beam power should be positive"
@@ -48,7 +48,7 @@ def test_beam_reconstruction_positive(beam_model):
 def test_beam_zenith_brightest(beam_model):
     """Airy beam should be brightest at zenith (pixel 0 in RING, th=0)."""
     import healpy
-    rec = dpss_reconstruct(beam_model.coeffs, beam_model.A_beam)
+    rec = dpss_reconstruct(beam_model.coeffs, beam_model.A)
     # Average power across frequencies
     mean_power = rec.mean(axis=1)
     # Zenith pixel (theta closest to 0)
@@ -73,13 +73,13 @@ class TestBeamModelWithBeamBasis:
         bb = _make_beam_basis(freqs)
         bm = BeamModel(nside=NSIDE_BEAM, freqs=freqs, basis=bb)
         npix = healpy.nside2npix(NSIDE_BEAM)
-        assert bm.A_beam.shape == (len(freqs), N_BEAM_MODES + 1)
+        assert bm.A.shape == (len(freqs), N_BEAM_MODES + 1)
         assert bm.coeffs.shape == (npix, N_BEAM_MODES + 1)
 
-    def test_A_beam_orthonormal_columns(self, freqs):
+    def test_A_orthonormal_columns(self, freqs):
         bb = _make_beam_basis(freqs)
         bm = BeamModel(nside=NSIDE_BEAM, freqs=freqs, basis=bb)
-        A  = bm.A_beam.astype(np.float64)
+        A  = bm.A.astype(np.float64)
         gram = A.T @ A
         residual = gram - np.eye(gram.shape[0])
         assert np.max(np.abs(residual)) < 1e-5
@@ -92,7 +92,7 @@ class TestBeamModelWithBeamBasis:
     def test_reconstruction_shape(self, freqs):
         bb  = _make_beam_basis(freqs)
         bm  = BeamModel(nside=NSIDE_BEAM, freqs=freqs, basis=bb)
-        rec = bm.coeffs @ bm.A_beam.T
+        rec = bm.coeffs @ bm.A.T
         import healpy
         assert rec.shape == (healpy.nside2npix(NSIDE_BEAM), len(freqs))
 
@@ -110,14 +110,14 @@ class TestBeamModelArrayBasis:
         Q, _   = np.linalg.qr(rng.standard_normal((nfreq, nmodes)))
         A      = Q.astype(np.float32)   # (nfreq, nmodes)
         bm     = BeamModel(nside=NSIDE_BEAM, freqs=freqs, basis=A)
-        assert bm.A_beam.shape == (nfreq, nmodes)
+        assert bm.A.shape == (nfreq, nmodes)
 
     def test_array_basis_stored_as_float32(self, freqs):
         rng    = np.random.default_rng(23)
         nfreq  = len(freqs)
         A      = rng.standard_normal((nfreq, 4)).astype(np.float64)
         bm     = BeamModel(nside=NSIDE_BEAM, freqs=freqs, basis=A)
-        assert bm.A_beam.dtype == np.float32
+        assert bm.A.dtype == np.float32
 
 
 # ------------------------------------------------------------------

@@ -1337,27 +1337,18 @@ class Calibrator:
         }
 
         # Accumulate product on equatorial HEALPix
-        sky_nside = self.fwd.sky_nside
+        sky_nside = self.fwd.sky_model.nside
         product_map, _weights = grid_fitter.accumulate_product_healpix(
             coeff_maps_all,
             np.asarray(self.rot_matrices),
             sky_nside=sky_nside,
         )
 
-        # Resolve beam model for beam division
         if beam_model is None:
-            from .beam import BeamModel as _BeamModel
-            # Build a minimal BeamModel proxy carrying the same coeffs/A_beam
-            bm_proxy = object.__new__(_BeamModel)
-            bm_proxy.nside   = self.fwd.beam_nside
-            bm_proxy.freqs   = np.asarray(self.freqs)
-            bm_proxy.coeffs  = np.asarray(self.fwd.beam_coeffs)
-            bm_proxy.A_beam  = np.asarray(self.fwd.A_beam)
-            beam_model = bm_proxy
+            beam_model = self.fwd.beam_model
 
         sky_coeffs = grid_fitter.init_sky_coeffs_from_product(
             product_map,
-            A_sky=np.asarray(self.A_sky),
             beam_model=beam_model,
             beam_reg=beam_reg,
         )

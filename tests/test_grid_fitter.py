@@ -372,18 +372,18 @@ class TestInitSkyCoeffsFromProduct:
         )
         return pm
 
-    def test_shape(self, grid_fitter, product_map, A_sky):
+    def test_shape(self, grid_fitter, product_map):
         import healpy as hp
-        npix_sky  = hp.nside2npix(NSIDE_SKY)
-        nmodes_sky = A_sky.shape[1]
-        sky_coeffs = grid_fitter.init_sky_coeffs_from_product(product_map, A_sky)
+        npix_sky   = hp.nside2npix(NSIDE_SKY)
+        nmodes_sky = grid_fitter.sky_basis.nmodes
+        sky_coeffs = grid_fitter.init_sky_coeffs_from_product(product_map)
         assert sky_coeffs.shape == (npix_sky, nmodes_sky)
 
-    def test_with_beam_model(self, grid_fitter, product_map, A_sky, beam_model):
+    def test_with_beam_model(self, grid_fitter, product_map, beam_model):
         """Dividing by beam should not crash and should change the result."""
-        sky_coeffs_nobm = grid_fitter.init_sky_coeffs_from_product(product_map, A_sky)
+        sky_coeffs_nobm = grid_fitter.init_sky_coeffs_from_product(product_map)
         sky_coeffs_bm   = grid_fitter.init_sky_coeffs_from_product(
-            product_map, A_sky, beam_model=beam_model
+            product_map, beam_model=beam_model
         )
         assert sky_coeffs_nobm.shape == sky_coeffs_bm.shape
         # Beam division should change values
@@ -391,6 +391,6 @@ class TestInitSkyCoeffsFromProduct:
         diff = jnp.max(jnp.abs(sky_coeffs_nobm - sky_coeffs_bm))
         assert float(diff) > 1e-6, "Beam division produced no change"
 
-    def test_finite_values(self, grid_fitter, product_map, A_sky):
-        sky_coeffs = grid_fitter.init_sky_coeffs_from_product(product_map, A_sky)
+    def test_finite_values(self, grid_fitter, product_map):
+        sky_coeffs = grid_fitter.init_sky_coeffs_from_product(product_map)
         assert np.all(np.isfinite(np.asarray(sky_coeffs))), "Sky coeffs contain non-finite values"

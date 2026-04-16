@@ -55,8 +55,8 @@ class ForwardModel:
         eta_padding: float = 0.0,
     ):
         self.array = array
-        self.sky_nside = sky_model.nside
-        self.beam_nside = beam_model.nside
+        self.sky_model = sky_model
+        self.beam_model = beam_model
         self.eps = eps
         self.eta_max = eta_max
         self.eta_padding = float(eta_padding)
@@ -190,7 +190,7 @@ class ForwardModel:
             topo_th, topo_ph = healjax.vec2ang(
                 jnp.array(topo[0]), jnp.array(topo[1]), jnp.array(topo[2])
             )
-            px, wgts = get_interp_weights(topo_th, topo_ph, self.beam_nside)
+            px, wgts = get_interp_weights(topo_th, topo_ph, self.beam_model.nside)
             px = np.array(px, dtype=np.int32)
             wgts = np.array(wgts, dtype=DTYPE_R_NPY)
 
@@ -458,6 +458,7 @@ class ForwardModel:
             np.stack(beam_spec_horizon_all), dtype=DTYPE_R
         )
         self.beam_coeffs = jnp.array(bc_np, dtype=DTYPE_R)
+        self.beam_model.coeffs = bc_np
         # Invalidate compiled simulation so the new precomputed beam is used.
         self._jit_one = jax.jit(self._simulate_one_precomputed)
 

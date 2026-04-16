@@ -25,6 +25,8 @@ import numpy as np
 import healpy
 from pyuvdata.analytic_beam import AiryBeam
 
+from .basis import BeamBasis
+
 DTYPE_R = np.float32
 
 
@@ -41,9 +43,9 @@ class BeamModel:
     basis : BeamBasis or array_like (nfreq, nmodes)
         Spectral basis for the beam.  Accepted forms:
 
-        - :class:`~newnucal.basis.BeamBasis` — ``basis.A`` is used as
-          ``A``.
-        - ``ndarray`` of shape ``(nfreq, nmodes)`` — used directly.
+        - :class:`~newnucal.basis.BeamBasis` — stored directly.
+        - ``ndarray`` of shape ``(nfreq, nmodes)`` — wrapped in a
+          :class:`~newnucal.basis.BeamBasis`.
     beam : pyuvdata AnalyticBeam, optional
         Analytic beam used to initialise the pixel coefficients.
         Defaults to an AiryBeam with diameter=14.6 m (HERA element).
@@ -67,11 +69,11 @@ class BeamModel:
             beam = AiryBeam(diameter=14.6, include_cross_pols=False)
         self.beam = beam
 
-        # Resolve spectral basis: BeamBasis has an .A attribute; ndarray does not.
-        if hasattr(basis, 'A'):
-            self.A = np.asarray(basis.A, dtype=DTYPE_R)   # (nfreq, nmodes)
+        # Normalise to a BeamBasis so the canonical array lives in one place.
+        if isinstance(basis, BeamBasis):
+            self.basis = basis
         else:
-            self.A = np.asarray(basis, dtype=DTYPE_R)     # (nfreq, nmodes)
+            self.basis = BeamBasis(A=np.asarray(basis, dtype=DTYPE_R))
 
         # Pixel centres in topocentric coordinates
         npix = healpy.nside2npix(nside)
@@ -88,13 +90,18 @@ class BeamModel:
 
     # ------------------------------------------------------------------
 
+    @property
+    def A(self):
+        """Spectral basis matrix (nfreq, nmodes)."""
+        return self.basis.A
+
     def project(self, data):
         """Project data (npix, nfreq) onto internal basis. Return coefficients."""
-        return data @ self.A
+        return self.basis.project(data)
 
     def deproject(self, coeffs):
-        """De-project coeffs (npix, coeffs) back to frequency basis."""
-        return coeffs @ self.A.T
+        """De-project coeffs (npix, nmodes) back to frequency basis."""
+        return self.basis.deproject(coeffs)
 
     def _eval_beam(self, beam, az, za, ch_chunk):
         """Evaluate beam power on the pixel grid across all frequencies."""

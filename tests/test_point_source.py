@@ -55,16 +55,17 @@ class TestPointSourcePhaseGradient:
     @pytest.fixture
     def forward_model_small(self, small_array, beam_model_small, freqs):
         """ForwardModel with small array and nside=8 sky."""
-        fwd = ForwardModel(
+        from newnucal.sky import SkyModel
+        from newnucal.basis import SkyBasis
+        sky_model = SkyModel(nside=8, freqs=freqs,
+                             basis=SkyBasis.from_dpss(freqs, eta_max=40e-9))
+        return ForwardModel(
             array=small_array,
-            sky_nside=8,
+            sky_model=sky_model,
             beam_model=beam_model_small,
             freqs=freqs,
             eps=1e-6,
         )
-        A_sky = dpss_matrix(freqs, eta_max=40e-9)
-        fwd.set_sky_dpss(A_sky)
-        return fwd
 
     def test_zenith_source_constant_phase(self, forward_model_small, freqs):
         """
@@ -133,7 +134,7 @@ class TestPointSourcePhaseGradient:
 
         # Pick pixel 0 (near zenith) — guaranteed above horizon
         px = 0
-        px_th, px_ph = healpy.pix2ang(forward_model_small.sky_nside, px)
+        px_th, px_ph = healpy.pix2ang(forward_model_small.sky_model.nside, px)
         topo_vec = np.array(healpy.ang2vec(px_th, px_ph))   # (3,)
 
         flat_flux = np.zeros((npix, freqs_arr.shape[0]), dtype=np.float32)
@@ -146,12 +147,9 @@ class TestPointSourcePhaseGradient:
         # Reconstruct W[px, f] = sky_spec * beam_spec at this pixel
         sky_spec = np.array((sky_coeffs[px:px+1] @ jnp.array(A_sky).T)[0])
 
-        beam_model = forward_model_small._beam_model_ref if hasattr(
-            forward_model_small, '_beam_model_ref') else None
-        # Use beam_interp directly from the stored coeffs
         th0  = jnp.array([float(px_th)])
         ph0  = jnp.array([float(px_ph)])
-        px_b, wgts = _giw(th0, ph0, forward_model_small.beam_nside)
+        px_b, wgts = _giw(th0, ph0, forward_model_small.beam_model.nside)
         beam_interp = np.array(
             jnp.sum(wgts[:, :, None] * forward_model_small.beam_coeffs[px_b], axis=0)[0]
         )
@@ -191,7 +189,7 @@ class TestPointSourcePhaseGradient:
         freqs_arr = freqs
 
         # Off-zenith source
-        all_th, all_ph = healpy.pix2ang(forward_model_small.sky_nside, np.arange(npix))
+        all_th, all_ph = healpy.pix2ang(forward_model_small.sky_model.nside, np.arange(npix))
         east_px = np.where((all_th < 0.4) & (np.abs(all_ph - np.pi/2) < 0.3))[0]
         if len(east_px) == 0:
             east_px = [np.argmin(all_th)]
@@ -230,16 +228,17 @@ class TestFringeRate:
     @pytest.fixture
     def forward_model_with_times(self, array, beam_model, freqs):
         """ForwardModel for fringe rate tests."""
-        fwd = ForwardModel(
+        from newnucal.sky import SkyModel
+        from newnucal.basis import SkyBasis
+        sky_model = SkyModel(nside=8, freqs=freqs,
+                             basis=SkyBasis.from_dpss(freqs, eta_max=40e-9))
+        return ForwardModel(
             array=array,
-            sky_nside=8,
+            sky_model=sky_model,
             beam_model=beam_model,
             freqs=freqs,
             eps=1e-6,
         )
-        A_sky = dpss_matrix(freqs, eta_max=40e-9)
-        fwd.set_sky_dpss(A_sky)
-        return fwd
 
     def test_fringe_rate_declination_dependence(self, forward_model_with_times, freqs):
         """

@@ -24,27 +24,31 @@ class SkyModel:
     freqs : array_like, (nfreq,) Hz
     basis : SkyBasis or array_like (nfreq, nmodes)
         Spectral basis.  Accepted forms:
-        - :class:`~newnucal.basis.SkyBasis` — ``basis.A`` is used as
-          ``A``.
-        - ``ndarray`` of shape ``(nfreq, nmodes)`` — used directly.
+        - :class:`~newnucal.basis.SkyBasis` — stored directly.
+        - ``ndarray`` of shape ``(nfreq, nmodes)`` — wrapped in a
+          :class:`~newnucal.basis.SkyBasis`.
     """
 
     def __init__(self, nside: int, freqs, basis):
-        self.nside  = int(nside)
-        self.freqs  = np.asarray(freqs, dtype=DTYPE_R)
-        # Resolve spectral basis: BeamBasis has an .A attribute; ndarray does not.
-        if hasattr(basis, 'A'):
-            self.A = np.asarray(basis.A, dtype=DTYPE_R)   # (nfreq, nmodes)
+        self.nside = int(nside)
+        self.freqs = np.asarray(freqs, dtype=DTYPE_R)
+        if isinstance(basis, SkyBasis):
+            self.basis = basis
         else:
-            self.A = np.asarray(basis, dtype=DTYPE_R)     # (nfreq, nmodes)
+            self.basis = SkyBasis(A=np.asarray(basis, dtype=DTYPE_R))
+
+    @property
+    def A(self):
+        """Spectral basis matrix (nfreq, nmodes)."""
+        return self.basis.A
 
     def project(self, data):
         """Project data (npix, nfreq) onto internal basis. Return coefficients."""
-        return data @ self.A
+        return self.basis.project(data)
 
     def deproject(self, coeffs):
-        """De-project coeffs (npix, coeffs) back to frequency basis."""
-        return coeffs @ self.A.T
+        """De-project coeffs (npix, nmodes) back to frequency basis."""
+        return self.basis.deproject(coeffs)
 
     # ------------------------------------------------------------------
     # Properties
@@ -52,7 +56,7 @@ class SkyModel:
 
     @property
     def nmodes(self) -> int:
-        return self.A.shape[1]
+        return self.basis.nmodes
 
     @property
     def npix(self) -> int:
