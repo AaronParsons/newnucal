@@ -910,7 +910,7 @@ class Calibrator:
             gain_params, loss = self.fit_gains_linear(sky_coeffs)
             dt = max(_time.perf_counter() - t_step, 1e-3)
             dloss = max(0.0, loss_pre - loss)
-            eff = dloss / dt
+            eff = dloss / (max(loss_pre, 1e-30) * dt)
             if state.eff_gains is None:
                 state.eff_gains = eff
             else:
@@ -921,7 +921,7 @@ class Calibrator:
             state.n_since_sky += 1
             state.n_since_beam += 1
             if verbose:
-                print(f"    [gains {state.n_gains - 1:03d}]: loss={loss:.4e}  eff={eff:.2e} Δloss/s")
+                print(f"    [gains {state.n_gains - 1:03d}]: loss={loss:.4e}  eff={eff:.2e} frac_Δloss/s")
         elif do_sky:
             if state.beam_dirty_pending:
                 self._sync_beam_cache_from_state(state)
@@ -949,7 +949,7 @@ class Calibrator:
             loss = loss_next
             dt = max(_time.perf_counter() - t_step, 1e-3)
             dloss = max(0.0, loss_pre - loss)
-            eff = dloss / dt
+            eff = dloss / (max(loss_pre, 1e-30) * dt)
             state.eff_sky = eff if state.eff_sky is None else s['eff_alpha'] * eff + (1.0 - s['eff_alpha']) * state.eff_sky
             state.n_sky += 1
             state.n_since_sky = 0
@@ -957,7 +957,7 @@ class Calibrator:
             state.n_since_gains += 1
             if verbose:
                 tag = 'AA' if used_aa else '  '
-                print(f"    [sky {tag} {state.n_sky - 1:03d}]: loss={loss:.4e}  eff={eff:.2e} Δloss/s")
+                print(f"    [sky {tag} {state.n_sky - 1:03d}]: loss={loss:.4e}  eff={eff:.2e} frac_Δloss/s")
         elif step_type == 'beam':
             beam_plain, loss_plain = _beam_plain_step(sky_coeffs, beam_coeffs, gain_params, loss)
             beam_next = beam_plain
@@ -979,7 +979,7 @@ class Calibrator:
             state.beam_dirty_pending = True
             dt = max(_time.perf_counter() - t_step, 1e-3)
             dloss = max(0.0, loss_pre - loss)
-            eff = dloss / dt
+            eff = dloss / (max(loss_pre, 1e-30) * dt)
             state.eff_beam = eff if state.eff_beam is None else s['eff_alpha'] * eff + (1.0 - s['eff_alpha']) * state.eff_beam
             state.n_beam += 1
             state.n_since_sky += 1
@@ -988,7 +988,7 @@ class Calibrator:
             state.n_beam_since_beam_lbfgs += 1
             if verbose:
                 tag = 'AA' if used_aa else '  '
-                print(f"    [beam {tag} {state.n_beam - 1:03d}]: loss={loss:.4e}  eff={eff:.2e} Δloss/s")
+                print(f"    [beam {tag} {state.n_beam - 1:03d}]: loss={loss:.4e}  eff={eff:.2e} frac_Δloss/s")
         elif do_beam_lbfgs:
             if state.beam_dirty_pending:
                 self._sync_beam_cache_from_state(state)
@@ -999,7 +999,7 @@ class Calibrator:
             beam_coeffs = bp['beam_coeffs']
             dt = max(_time.perf_counter() - t_step, 1e-3)
             dloss = max(0.0, loss_pre - loss)
-            eff = dloss / dt
+            eff = dloss / (max(loss_pre, 1e-30) * dt)
             if state.eff_beam_lbfgs is None:
                 state.eff_beam_lbfgs = eff
             else:
@@ -1014,7 +1014,7 @@ class Calibrator:
             state.n_since_beam += 1
             state.n_since_gains += 1
             if verbose:
-                print(f"    [beam_lbfgs {state.n_beam_lbfgs - 1:03d}]: loss={loss:.4e}  eff={eff:.2e} Δloss/s")
+                print(f"    [beam_lbfgs {state.n_beam_lbfgs - 1:03d}]: loss={loss:.4e}  eff={eff:.2e} frac_Δloss/s")
 
         if sky_lbfgs_every > 0 and (step + 1) % sky_lbfgs_every == 0:
             if state.beam_dirty_pending:
