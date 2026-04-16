@@ -65,12 +65,13 @@ def _derive_product_basis(sky_basis, beam_basis, n_product_modes: int = 20):
 
     Returns
     -------
-    product_basis : ndarray, (nbasis, nfreq) float32
+    product_basis : ndarray, (nbasis, nfreq)
         Rows form an orthonormal frequency basis.
     """
     if not (sky_basis.has_svd and beam_basis.has_svd):
-        # Fallback: use sky basis rows as the product basis
-        return sky_basis.A.T.copy().astype(DTYPE_R)  # (nmodes, nfreq)
+        # Fallback: use biggest basis rows as the product basis
+        A = sky_basis.A if sky_basis.nmodes > beam_basis.nmodes else beam_basis.A
+        return A.T.copy().astype(DTYPE_R)  # (nmodes, nfreq)
 
     nfreq = sky_basis.nfreq
     # Extended beam vectors: [mean, s1*v1, s2*v2, ...]
@@ -250,10 +251,10 @@ class GridFitter:
 
         Parameters
         ----------
-        log_amp : (nfreq,) float32
-        phase   : (nfreq,) float32
-        phi     : (2, nfreq) float32
-        bls     : (nbl, 2) float32
+        log_amp : (nfreq,)
+        phase   : (nfreq,)
+        phi     : (2, nfreq)
+        bls     : (nbl, 2)
 
         Returns (nfreq, nbl) complex64.
         """
@@ -276,7 +277,7 @@ class GridFitter:
 
         Returns
         -------
-        gain_params : dict with float32 arrays
+        gain_params : dict with arrays
             ``log_amp`` (nfreq,), ``phase`` (nfreq,), ``phi`` (2, nfreq)
         """
         den    = np.abs(vis_model_fn) ** 2              # (nfreq, nbl)
@@ -348,13 +349,13 @@ class GridFitter:
         and modes, accelerating convergence.
         """
         rng = np.random.default_rng(seed)
-        acc = np.zeros((self.nl, self.nm, self.nbasis), dtype=np.float32)
+        acc = np.zeros((self.nl, self.nm, self.nbasis), dtype=DTYPE_R)
         for _ in range(nprobe):
             z = (rng.standard_normal((self.nfreq, self.nbl))
                  + 1j * rng.standard_normal((self.nfreq, self.nbl))
                  ).astype(DTYPE_C)
             y = self._adj(z)
-            acc += np.abs(y).astype(np.float32) ** 2
+            acc += np.abs(y).astype(DTYPE_R) ** 2
         acc /= nprobe
         # Floor at the 5th percentile to avoid division by near-zero
         floor = float(np.percentile(acc[acc > 0], 5)) if np.any(acc > 0) else 1.0
@@ -606,9 +607,9 @@ class GridFitter:
 
         Returns
         -------
-        product_map : ndarray, (npix_sky, nfreq) float32
+        product_map : ndarray, (npix_sky, nfreq)
             Beam-weighted accumulated product.
-        weights     : ndarray, (npix_sky,) float32
+        weights     : ndarray, (npix_sky,)
             Accumulation counts per pixel.
         """
         import healpy as hp
@@ -648,18 +649,15 @@ class GridFitter:
     def init_sky_coeffs_from_product(
         self,
         product_map,
-        A_sky,
         beam_model: BeamModel | None = None,
         beam_reg: float = 1e-3,
     ):
-        """Project an accumulated product map onto the DPSS sky basis.
+        """Project an accumulated product map onto the sky basis.
 
         Parameters
         ----------
         product_map : ndarray, (npix_sky, nfreq)
             Output of :meth:`accumulate_product_healpix`.
-        A_sky : ndarray, (nfreq, nmodes_sky)
-            DPSS matrix from the Calibrator.
         beam_model : BeamModel or None
             If provided, the product is divided by the mean beam spectrum
             before projecting, yielding a rough sky-only estimate.
@@ -668,17 +666,15 @@ class GridFitter:
 
         Returns
         -------
-        sky_coeffs : jnp.ndarray, (npix_sky, nmodes_sky) float32
+        sky_coeffs : jnp.ndarray, (npix_sky, nmodes_sky)
         """
-        import jax.numpy as jnp
-
-        sky_map = np.asarray(product_map, dtype=np.float32)  # (npix_sky, nfreq)
+        sky_map = np.asarray(product_map, dtype=DTYPE_R)  # (npix_sky, nfreq)
 
         if beam_model is not None:
             # Mean beam spectrum evaluated at each HEALPix pixel.
             # Approximate: use the pixel-averaged beam coefficients.
             beam_spec = (np.asarray(beam_model.coeffs) @
-                         np.asarray(beam_model.A_beam).T)    # (npix_beam, nfreq)
+                         np.asarray(beam_model.A).T)    # (npix_beam, nfreq)
             # beam_nside may differ from sky_nside; use nearest-pixel lookup
             import healpy as hp
             sky_nside  = hp.npix2nside(sky_map.shape[0])
@@ -689,5 +685,5 @@ class GridFitter:
             beam_at_sky = beam_spec[beam_pix]                # (npix_sky, nfreq)
             sky_map = sky_map / (beam_at_sky + beam_reg)
 
-        sky_coeffs = (sky_map @ np.asarray(A_sky)).astype(np.float32)
+        sky_coeffs = self.sky_basis.project(sky_map).astype(DTYPE_R)
         return jnp.array(sky_coeffs)

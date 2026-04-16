@@ -7,11 +7,11 @@ the sky as the Earth rotates).
 
 At a given topocentric direction (th, ph) and frequency ν:
 
-    B(th, ph, ν) = interp(beam_coeffs, th, ph) @ A_beam[ν, :]
+    B(th, ph, ν) = interp(beam_coeffs, th, ph) @ A[ν, :]
 
 where interp uses bilinear HEALPix interpolation (4 neighbours).
 
-The spectral basis ``A_beam`` (shape ``(nfreq, nmodes)``) is supplied as a
+The spectral basis ``A`` (shape ``(nfreq, nmodes)``) is supplied as a
 :class:`~newnucal.basis.BeamBasis` or a plain ``(nfreq, nmodes)`` ndarray.
 
 Initialisation
@@ -24,8 +24,6 @@ frequency spectrum is projected onto the chosen basis.
 import numpy as np
 import healpy
 from pyuvdata.analytic_beam import AiryBeam
-
-from .dpss import dpss_project
 
 DTYPE_R = np.float32
 
@@ -44,7 +42,7 @@ class BeamModel:
         Spectral basis for the beam.  Accepted forms:
 
         - :class:`~newnucal.basis.BeamBasis` — ``basis.A`` is used as
-          ``A_beam``.
+          ``A``.
         - ``ndarray`` of shape ``(nfreq, nmodes)`` — used directly.
     beam : pyuvdata AnalyticBeam, optional
         Analytic beam used to initialise the pixel coefficients.
@@ -71,9 +69,9 @@ class BeamModel:
 
         # Resolve spectral basis: BeamBasis has an .A attribute; ndarray does not.
         if hasattr(basis, 'A'):
-            self.A_beam = np.asarray(basis.A, dtype=DTYPE_R)   # (nfreq, nmodes)
+            self.A = np.asarray(basis.A, dtype=DTYPE_R)   # (nfreq, nmodes)
         else:
-            self.A_beam = np.asarray(basis, dtype=DTYPE_R)     # (nfreq, nmodes)
+            self.A = np.asarray(basis, dtype=DTYPE_R)     # (nfreq, nmodes)
 
         # Pixel centres in topocentric coordinates
         npix = healpy.nside2npix(nside)
@@ -85,10 +83,18 @@ class BeamModel:
         beam_power = self._eval_beam(beam, az, za, ch_chunk)  # (npix, nfreq)
 
         # Project onto spectral basis
-        self.coeffs = dpss_project(beam_power, self.A_beam).astype(DTYPE_R)
+        self.coeffs = self.project(beam_power).astype(DTYPE_R)
         # (npix, nmodes)
 
     # ------------------------------------------------------------------
+
+    def project(self, data):
+        """Project data (npix, nfreq) onto internal basis. Return coefficients."""
+        return data @ self.A
+
+    def deproject(self, coeffs):
+        """De-project coeffs (npix, coeffs) back to frequency basis."""
+        return coeffs @ self.A.T
 
     def _eval_beam(self, beam, az, za, ch_chunk):
         """Evaluate beam power on the pixel grid across all frequencies."""
@@ -122,4 +128,4 @@ class BeamModel:
 
     @property
     def nmodes(self) -> int:
-        return self.A_beam.shape[1]
+        return self.A.shape[1]

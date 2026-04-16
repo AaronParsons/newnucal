@@ -63,6 +63,14 @@ class _SpectralBasis:
         self.svd_svals = np.asarray(svd_svals, dtype=DTYPE_R) if svd_svals is not None else None
         self.n_samples = int(n_samples) if n_samples is not None else None
 
+    def project(self, data):
+        """Project data (npix, nfreq) onto internal basis. Return coefficients."""
+        return data @ self.A
+
+    def deproject(self, coeffs):
+        """De-project coeffs (npix, coeffs) back to frequency basis."""
+        return coeffs @ self.A.T
+
     # ------------------------------------------------------------------
     # Construction
     # ------------------------------------------------------------------

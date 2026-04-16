@@ -20,6 +20,7 @@ from .gains import apply_gains, init_gain_params
 from .rfi import RFIConfig, prepare_initial_channel_weights, update_channel_weights_from_residuals
 
 DTYPE_R = jnp.float32
+DTYPE_R_NPY = np.float32
 DTYPE_C = jnp.complex64
 
 
@@ -227,19 +228,18 @@ class Calibrator:
         self.channel_weights = jnp.ones(self.data.shape[:2], dtype=DTYPE_R)
         self.inv_noise_var = jnp.ones(self.data.shape[:2], dtype=DTYPE_R)
 
-        self.A_sky = np.asarray(sky_model.A_sky, dtype=np.float32)  # (nfreq, nmodes)
+        self.A_sky = np.asarray(sky_model.A, dtype=DTYPE_R_NPY)  # (nfreq, nmodes)
         sky_nside  = sky_model.nside
 
         self.fwd = ForwardModel(
             array,
-            sky_nside,
+            sky_model,
             beam_model,
             freqs,
             eps=eps,
             eta_max=None,
             eta_padding=eta_padding,
         )
-        self.fwd.set_sky_basis(self.A_sky)
         self.fwd.precompute_time_geometry(self.rot_matrices)
 
         self._jit_loss = jax.jit(self._loss)
@@ -1331,9 +1331,9 @@ class Calibrator:
 
         # Per-time 4-DOF gains → Calibrator format (add time axis)
         gain_params = {
-            'log_amp': jnp.array(gain_params_all['log_amp'], dtype=jnp.float32),
-            'phase':   jnp.array(gain_params_all['phase'],   dtype=jnp.float32),
-            'phi':     jnp.array(gain_params_all['phi'],     dtype=jnp.float32),
+            'log_amp': jnp.array(gain_params_all['log_amp'], dtype=DTYPE_R),
+            'phase':   jnp.array(gain_params_all['phase'],   dtype=DTYPE_R),
+            'phi':     jnp.array(gain_params_all['phi'],     dtype=DTYPE_R),
         }
 
         # Accumulate product on equatorial HEALPix

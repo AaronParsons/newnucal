@@ -18,6 +18,7 @@ import healjax
 
 from .array import HERAArray
 from .beam import BeamModel
+from .sky import SkyModel
 
 DTYPE_R = jnp.float32
 DTYPE_C = jnp.complex64
@@ -46,7 +47,7 @@ class ForwardModel:
     def __init__(
         self,
         array: HERAArray,
-        sky_nside: int,
+        sky_model: SkyModel,
         beam_model: BeamModel,
         freqs,
         eps: float = 1e-6,
@@ -54,7 +55,7 @@ class ForwardModel:
         eta_padding: float = 0.0,
     ):
         self.array = array
-        self.sky_nside = sky_nside
+        self.sky_nside = sky_model.nside
         self.beam_nside = beam_model.nside
         self.eps = eps
         self.eta_max = eta_max
@@ -63,14 +64,12 @@ class ForwardModel:
         freqs_np = np.asarray(freqs, dtype=np.float64)
         self.freqs = jnp.array(freqs_np, dtype=DTYPE_R)
 
-        self.A_beam = jnp.array(beam_model.A_beam, dtype=DTYPE_R)
+        self.A_beam = jnp.array(beam_model.A, dtype=DTYPE_R)
         self.beam_coeffs = jnp.array(beam_model.coeffs, dtype=DTYPE_R)
 
-        npix_sky = healpy.nside2npix(sky_nside)
-        eq_xyz = np.array(
-            healpy.pix2vec(sky_nside, np.arange(npix_sky)), dtype=DTYPE_R_NPY
-        )
-        self.eq_coords = jnp.array(eq_xyz)
+        self.A_sky = jnp.array(sky_model.A, dtype=DTYPE_R)
+
+        self.eq_coords = jnp.array(sky_model.eq_vec)
 
         nfreq = len(freqs_np)
         dnu = float(freqs_np[1] - freqs_np[0])
@@ -81,7 +80,7 @@ class ForwardModel:
         eta_np = np.fft.fftfreq(nfreq, d=dnu)
         phase_np = np.exp(-2j * np.pi * eta_np * nu_0) / nfreq
 
-        self._eta_full = jnp.array(eta_np.astype(np.float32))
+        self._eta_full = jnp.array(eta_np.astype(DTYPE_R_NPY))
         self._phase_full = jnp.array(phase_np.astype(np.complex64))
 
         if eta_max is None:
@@ -107,8 +106,7 @@ class ForwardModel:
         self._tgt_y = jnp.array(tgt_y, dtype=DTYPE_R)
         self._tgt_z = jnp.array(tgt_z, dtype=DTYPE_R)
 
-        self.A_sky = None
-        self._jit_one = None
+        self._jit_one = jax.jit(self._simulate_one_precomputed)
 
         self._geom_ready = False
         self._topo_all = None
@@ -129,7 +127,7 @@ class ForwardModel:
 
         Call this before :meth:`apply_pixel_mask`.
         """
-        rot_ms = np.asarray(rot_matrices, dtype=np.float32)
+        rot_ms = np.asarray(rot_matrices, dtype=DTYPE_R_NPY)
         eq = np.asarray(self.eq_coords)   # (3, npix)
         ever_visible = np.zeros(eq.shape[1], dtype=bool)
         for i in range(rot_ms.shape[0]):
@@ -160,19 +158,6 @@ class ForwardModel:
             setattr(self, attr, None)
         return self
 
-    def set_sky_basis(self, A_sky):
-        """Set the sky spectral basis and (re-)JIT the simulation.
-
-        Parameters
-        ----------
-        A_sky : array_like, shape (nfreq, nmodes)
-            Any compact spectral basis whose columns span the sky frequency
-            structure — DPSS modes, eigenbasis rows, or custom vectors.
-            Reconstruction convention: ``sky_spec = sky_coeffs @ A_sky.T``.
-        """
-        self.A_sky = jnp.array(A_sky, dtype=DTYPE_R)
-        self._jit_one = jax.jit(self._simulate_one_precomputed)
-
     def precompute_time_geometry(self, rot_matrices):
         """Precompute time-only geometry and interpolation operators.
 
@@ -198,16 +183,16 @@ class ForwardModel:
         # Extract beam arrays once outside the loop for efficiency
         bc_np = np.asarray(self.beam_coeffs)   # (npix_beam, nmodes_beam)
         ab_np = np.asarray(self.A_beam)         # (nfreq, nmodes_beam)
-        eta_np = np.asarray(self._eta, dtype=np.float32)
+        eta_np = np.asarray(self._eta, dtype=DTYPE_R_NPY)
         for i in range(ntime):
-            topo = np.array(rot_ms[i] @ self.eq_coords, dtype=np.float32)
-            horizon = (topo[2] > 0).astype(np.float32)
+            topo = np.array(rot_ms[i] @ self.eq_coords, dtype=DTYPE_R_NPY)
+            horizon = (topo[2] > 0).astype(DTYPE_R_NPY)
             topo_th, topo_ph = healjax.vec2ang(
                 jnp.array(topo[0]), jnp.array(topo[1]), jnp.array(topo[2])
             )
             px, wgts = get_interp_weights(topo_th, topo_ph, self.beam_nside)
             px = np.array(px, dtype=np.int32)
-            wgts = np.array(wgts, dtype=np.float32)
+            wgts = np.array(wgts, dtype=DTYPE_R_NPY)
 
             # Store interpolation stencil for beam solving (update_beam_cache /
             # simulate_variable_beam).  px/wgts shape: (4, npix_sky).
@@ -221,9 +206,9 @@ class ForwardModel:
             bs_np = (bi_np @ ab_np.T) * horizon[:, None]             # (npix_sky, nfreq)
             beam_spec_horizon_all.append(bs_np)
 
-            src_x = np.repeat(topo[0], ndelay).astype(np.float32) * two_pi
-            src_y = np.repeat(topo[1], ndelay).astype(np.float32) * two_pi
-            src_z = np.tile(eta_np, npix).astype(np.float32) * two_pi
+            src_x = np.repeat(topo[0], ndelay).astype(DTYPE_R_NPY) * two_pi
+            src_y = np.repeat(topo[1], ndelay).astype(DTYPE_R_NPY) * two_pi
+            src_z = np.tile(eta_np, npix).astype(DTYPE_R_NPY) * two_pi
 
             topo_all.append(topo)
             horizon_all.append(horizon)
@@ -247,8 +232,7 @@ class ForwardModel:
         # Invalidate any cached JIT compilation: the precomputed arrays are
         # captured by value in the trace, so a fresh jit is needed after each
         # geometry recompute to avoid stale compiled code.
-        if self.A_sky is not None:
-            self._jit_one = jax.jit(self._simulate_one_precomputed)
+        self._jit_one = jax.jit(self._simulate_one_precomputed)
         return self
 
     def _forward_components_from_cache(self, sky_coeffs, tind):
@@ -278,8 +262,6 @@ class ForwardModel:
         return vis_flat.reshape(self.nfreq, self.nbls)
 
     def simulate(self, sky_coeffs, rot_matrices):
-        if self._jit_one is None:
-            raise RuntimeError('Call set_sky_basis() before simulate().')
         if (not self._geom_ready) or (self._topo_all.shape[0] != rot_matrices.shape[0]):
             self.precompute_time_geometry(rot_matrices)
         inds = jnp.arange(rot_matrices.shape[0], dtype=jnp.int32)
@@ -378,20 +360,20 @@ class ForwardModel:
         -------
         delta_bc : jnp.ndarray, shape (npix_beam, nmodes_beam)
         """
-        ab_np = np.asarray(self.A_beam, dtype=np.float32)   # (nfreq, nmodes_beam)
+        ab_np = np.asarray(self.A_beam, dtype=DTYPE_R_NPY)   # (nfreq, nmodes_beam)
 
         # Sky spectrum in pixel × frequency space (complex for matched filter)
         sky_spec = np.asarray(
             (jnp.array(sky_coeffs) @ self.A_sky.T).astype(DTYPE_C)
         )                                                    # (npix_sky, nfreq)
         sky_weight = (sky_spec.real ** 2 + sky_spec.imag ** 2).astype(
-            np.float32
+            DTYPE_R_NPY
         )                                                    # |sky_spec|² (npix_sky, nfreq)
         # Per-pixel sky power (summed over frequency) used to weight the scatter
         sky_pow = sky_weight.sum(axis=1)                     # (npix_sky,)
 
-        num = np.zeros((self.npix_beam, self.nmodes_beam), dtype=np.float32)
-        den = np.zeros(self.npix_beam, dtype=np.float32)
+        num = np.zeros((self.npix_beam, self.nmodes_beam), dtype=DTYPE_R_NPY)
+        den = np.zeros(self.npix_beam, dtype=DTYPE_R_NPY)
 
         ntime = int(residual_vis.shape[0])
         for tind in range(ntime):
@@ -435,7 +417,7 @@ class ForwardModel:
         """
         if not self._geom_ready:
             raise RuntimeError('Call precompute_time_geometry() first.')
-        bc_np = np.asarray(beam_coeffs, dtype=np.float32)
+        bc_np = np.asarray(beam_coeffs, dtype=DTYPE_R_NPY)
         ab_np = np.asarray(self.A_beam)
         beam_spec_horizon_all = []
         for i in range(len(self._interp_px_all)):
@@ -461,7 +443,7 @@ class ForwardModel:
         """
         if not self._geom_ready:
             raise RuntimeError('Call precompute_time_geometry() first.')
-        bc_np = np.asarray(beam_coeffs, dtype=np.float32)
+        bc_np = np.asarray(beam_coeffs, dtype=DTYPE_R_NPY)
         ab_np = np.asarray(self.A_beam)
         ntime = len(self._interp_px_all)
         beam_spec_horizon_all = []
@@ -477,8 +459,7 @@ class ForwardModel:
         )
         self.beam_coeffs = jnp.array(bc_np, dtype=DTYPE_R)
         # Invalidate compiled simulation so the new precomputed beam is used.
-        if self.A_sky is not None:
-            self._jit_one = jax.jit(self._simulate_one_precomputed)
+        self._jit_one = jax.jit(self._simulate_one_precomputed)
 
     def _simulate_one_variable_beam(self, sky_coeffs, beam_coeffs, tind):
         """Forward model for one time step with *beam_coeffs* as a traced input.
@@ -581,7 +562,7 @@ def compute_rotation_matrices(times, location):
     )
     crds.setup()
 
-    rot_ms = np.empty((len(times), 3, 3), dtype=np.float32)
+    rot_ms = np.empty((len(times), 3, 3), dtype=DTYPE_R_NPY)
     for i, t in enumerate(times):
         rot_ms[i] = _erfa_rot_matrix(crds, t)
     return rot_ms

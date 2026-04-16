@@ -12,6 +12,7 @@ import healpy
 
 from .basis import SkyBasis
 
+DTYPE_R = np.float32
 
 class SkyModel:
     """Sky model on an equatorial HEALPix grid with a spectral basis.
@@ -21,27 +22,37 @@ class SkyModel:
     nside : int
         HEALPix resolution (power of 2).
     freqs : array_like, (nfreq,) Hz
-    basis : SkyBasis
-        Spectral basis.  ``A_sky = basis.A`` has shape ``(nfreq, nmodes)``.
+    basis : SkyBasis or array_like (nfreq, nmodes)
+        Spectral basis.  Accepted forms:
+        - :class:`~newnucal.basis.SkyBasis` — ``basis.A`` is used as
+          ``A``.
+        - ``ndarray`` of shape ``(nfreq, nmodes)`` — used directly.
     """
 
-    def __init__(self, nside: int, freqs, basis: SkyBasis):
+    def __init__(self, nside: int, freqs, basis):
         self.nside  = int(nside)
-        self.freqs  = np.asarray(freqs, dtype=np.float64)
-        self.basis  = basis
+        self.freqs  = np.asarray(freqs, dtype=DTYPE_R)
+        # Resolve spectral basis: BeamBasis has an .A attribute; ndarray does not.
+        if hasattr(basis, 'A'):
+            self.A = np.asarray(basis.A, dtype=DTYPE_R)   # (nfreq, nmodes)
+        else:
+            self.A = np.asarray(basis, dtype=DTYPE_R)     # (nfreq, nmodes)
+
+    def project(self, data):
+        """Project data (npix, nfreq) onto internal basis. Return coefficients."""
+        return data @ self.A
+
+    def deproject(self, coeffs):
+        """De-project coeffs (npix, coeffs) back to frequency basis."""
+        return coeffs @ self.A.T
 
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
 
     @property
-    def A_sky(self) -> np.ndarray:
-        """Spectral basis matrix ``(nfreq, nmodes)`` float32."""
-        return self.basis.A
-
-    @property
     def nmodes(self) -> int:
-        return int(self.basis.nmodes)
+        return self.A.shape[1]
 
     @property
     def npix(self) -> int:
@@ -50,3 +61,8 @@ class SkyModel:
     @property
     def nfreq(self) -> int:
         return int(self.freqs.shape[0])
+
+    @property
+    def eq_vec(self) -> np.ndarray:
+        vec = healpy.pix2vec(self.nside, np.arange(self.npix))
+        return np.array(vec, dtype=DTYPE_R)
