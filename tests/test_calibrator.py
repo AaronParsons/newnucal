@@ -32,7 +32,7 @@ def sky_coeffs_true(forward_model, A_sky, freqs):
 
 @pytest.fixture
 def calibrator_gains_setup(array, beam_model, freqs, rot_matrices,
-                            forward_model, sky_coeffs_true):
+                            forward_model, sky_coeffs_true, sky_model):
     """Returns (Calibrator, true_gain_params) where data = simulate(sky_true) * gains."""
     from newnucal.calibrator import Calibrator
 
@@ -67,8 +67,7 @@ def calibrator_gains_setup(array, beam_model, freqs, rot_matrices,
     cal = Calibrator(
         array=array,
         beam_model=beam_model,
-        sky_nside=NSIDE_SKY,
-        sky_eta_max=ETA_SKY,
+        sky_model=sky_model,
         freqs=freqs,
         rot_matrices=rot_matrices,
         data=np.array(vis_data),
@@ -136,15 +135,15 @@ class TestFitGainsLinear:
 
 
 @pytest.fixture
-def calibrator_rfi_setup(array, beam_model, freqs, rot_matrices, forward_model, sky_coeffs_true):
+def calibrator_rfi_setup(array, beam_model, freqs, rot_matrices, forward_model,
+                          sky_coeffs_true, sky_model):
     """Return a Calibrator whose data matches the true sky and unity gains."""
     from newnucal.calibrator import Calibrator
     vis_true = forward_model.simulate(sky_coeffs_true, jnp.array(rot_matrices))
     cal = Calibrator(
         array=array,
         beam_model=beam_model,
-        sky_nside=NSIDE_SKY,
-        sky_eta_max=ETA_SKY,
+        sky_model=sky_model,
         freqs=freqs,
         rot_matrices=rot_matrices,
         data=np.array(vis_true),
@@ -175,7 +174,7 @@ class TestRFIWeightedCalibrator:
 
         assert loss_downweighted < 0.05 * loss_full
 
-    def test_calc_reduced_chi2_near_unity_for_known_noise(self, array, beam_model, freqs, rot_matrices, forward_model, sky_coeffs_true):
+    def test_calc_reduced_chi2_near_unity_for_known_noise(self, array, beam_model, freqs, rot_matrices, forward_model, sky_coeffs_true, sky_model):
         from newnucal.calibrator import Calibrator
         rng = np.random.default_rng(123)
         vis_true = np.array(forward_model.simulate(sky_coeffs_true, jnp.array(rot_matrices)))
@@ -186,8 +185,7 @@ class TestRFIWeightedCalibrator:
         cal = Calibrator(
             array=array,
             beam_model=beam_model,
-            sky_nside=NSIDE_SKY,
-            sky_eta_max=ETA_SKY,
+            sky_model=sky_model,
             freqs=freqs,
             rot_matrices=rot_matrices,
             data=data,
@@ -249,7 +247,8 @@ class TestRFIWeightedCalibrator:
 
 
 @pytest.fixture
-def calibrator_noisy_setup(array, beam_model, freqs, rot_matrices, forward_model, sky_coeffs_true):
+def calibrator_noisy_setup(array, beam_model, freqs, rot_matrices, forward_model,
+                            sky_coeffs_true, sky_model):
     """Return (Calibrator, true params, sigma) for noisy data with the true sky/beam."""
     from newnucal.calibrator import Calibrator
     rng = np.random.default_rng(2024)
@@ -260,8 +259,7 @@ def calibrator_noisy_setup(array, beam_model, freqs, rot_matrices, forward_model
     cal = Calibrator(
         array=array,
         beam_model=beam_model,
-        sky_nside=NSIDE_SKY,
-        sky_eta_max=ETA_SKY,
+        sky_model=sky_model,
         freqs=freqs,
         rot_matrices=rot_matrices,
         data=data,

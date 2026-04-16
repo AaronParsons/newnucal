@@ -59,13 +59,27 @@ def A_beam(freqs):
 
 
 @pytest.fixture(scope="session")
-def beam_model(freqs):
+def sky_basis(freqs):
+    from newnucal.basis import SkyBasis
+    return SkyBasis.from_dpss(freqs, ETA_MAX_SKY)
+
+
+@pytest.fixture(scope="session")
+def beam_basis(freqs):
+    from newnucal.basis import BeamBasis
+    return BeamBasis.from_dpss(freqs, ETA_MAX_BEAM)
+
+
+@pytest.fixture(scope="session")
+def sky_model(freqs, sky_basis):
+    from newnucal.sky import SkyModel
+    return SkyModel(nside=NSIDE_SKY, freqs=freqs, basis=sky_basis)
+
+
+@pytest.fixture(scope="session")
+def beam_model(freqs, beam_basis):
     from newnucal.beam import BeamModel
-    return BeamModel(
-        nside=NSIDE_BEAM,
-        freqs=freqs,
-        eta_max=ETA_MAX_BEAM,
-    )
+    return BeamModel(nside=NSIDE_BEAM, freqs=freqs, basis=beam_basis)
 
 
 @pytest.fixture(scope="session")
@@ -84,5 +98,5 @@ def rot_matrices():
 def forward_model(array, beam_model, freqs, A_sky):
     from newnucal.simulate import ForwardModel
     fwd = ForwardModel(array, NSIDE_SKY, beam_model, freqs)
-    fwd.set_sky_dpss(A_sky)
+    fwd.set_sky_basis(A_sky)
     return fwd

@@ -14,7 +14,7 @@ from jaxopt import LBFGS
 
 from .array import HERAArray
 from .beam import BeamModel
-from .dpss import dpss_matrix, dpss_project
+from .dpss import dpss_project
 from .simulate import ForwardModel
 from .gains import apply_gains, init_gain_params
 from .rfi import RFIConfig, prepare_initial_channel_weights, update_channel_weights_from_residuals
@@ -204,18 +204,22 @@ class Calibrator:
         self,
         array: HERAArray,
         beam_model: BeamModel,
-        sky_nside: int,
-        sky_eta_max: float,
+        sky_model,
         freqs,
         rot_matrices,
         data,
-        sky_eigenval_cutoff: float = 1e-9,
         eps: float = 1e-6,
         eta_padding: float = 0.0,
         channel_weights=None,
         inv_noise_var=None,
         noise_sigma=None,
     ):
+        """
+        Parameters
+        ----------
+        sky_model : SkyModel
+            Sky model providing ``nside`` and the spectral basis ``A_sky``.
+        """
         self.freqs = jnp.array(freqs, dtype=DTYPE_R)
         self.rot_matrices = jnp.array(rot_matrices, dtype=DTYPE_R)
         self.data = jnp.array(data, dtype=DTYPE_C)
@@ -223,18 +227,19 @@ class Calibrator:
         self.channel_weights = jnp.ones(self.data.shape[:2], dtype=DTYPE_R)
         self.inv_noise_var = jnp.ones(self.data.shape[:2], dtype=DTYPE_R)
 
-        self.A_sky = dpss_matrix(freqs, sky_eta_max, eigenval_cutoff=sky_eigenval_cutoff)
+        self.A_sky = np.asarray(sky_model.A_sky, dtype=np.float32)  # (nfreq, nmodes)
+        sky_nside  = sky_model.nside
+
         self.fwd = ForwardModel(
             array,
             sky_nside,
             beam_model,
             freqs,
             eps=eps,
-            #eta_max=sky_eta_max + getattr(beam_model, 'eta_max', 0.0),
             eta_max=None,
             eta_padding=eta_padding,
         )
-        self.fwd.set_sky_dpss(self.A_sky)
+        self.fwd.set_sky_basis(self.A_sky)
         self.fwd.precompute_time_geometry(self.rot_matrices)
 
         self._jit_loss = jax.jit(self._loss)
@@ -1274,6 +1279,143 @@ class Calibrator:
             if _stop_flag is None:
                 _StopFitFlag.restore(old_handler)
         return {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params}, loss
+
+    # ------------------------------------------------------------------
+    # Grid-based fast pre-optimizer
+    # ------------------------------------------------------------------
+
+    def init_params_from_grid_fit(
+        self,
+        grid_fitter,
+        n_iter: int = 40,
+        beam_model=None,
+        beam_reg: float = 1e-3,
+        verbose: bool = False,
+        **fit_kwargs,
+    ):
+        """Initialise sky and gain parameters from a fast per-time grid fit.
+
+        Runs :meth:`~newnucal.grid_fitter.GridFitter.fit_all_times` on
+        ``self.data``, converts the per-time gains to the Calibrator 4-DOF
+        format, accumulates the per-time product maps on an equatorial
+        HEALPix grid, divides by the beam, and projects onto the DPSS sky
+        basis.
+
+        Parameters
+        ----------
+        grid_fitter : GridFitter
+        n_iter : int
+            Iterations per time step in the grid fit.
+        beam_model : BeamModel or None
+            If provided, the accumulated product is divided by the beam
+            before projecting onto the sky DPSS basis.  ``None`` uses
+            ``self.fwd.beam_coeffs`` to construct a beam estimate.
+        beam_reg : float
+        verbose : bool
+        **fit_kwargs
+            Extra keyword arguments forwarded to :meth:`GridFitter.fit_all_times`.
+
+        Returns
+        -------
+        params : dict
+            ``sky_coeffs``, ``log_amp``, ``phase``, ``phi`` ready to pass
+            to any Calibrator optimiser.
+        """
+        import jax.numpy as jnp
+
+        data_np = np.asarray(self.data)   # (ntime, nfreq, nbl)
+
+        coeff_maps_all, gain_params_all, _ = grid_fitter.fit_all_times(
+            data_np, n_iter=n_iter, verbose=verbose, **fit_kwargs
+        )
+
+        # Per-time 4-DOF gains → Calibrator format (add time axis)
+        gain_params = {
+            'log_amp': jnp.array(gain_params_all['log_amp'], dtype=jnp.float32),
+            'phase':   jnp.array(gain_params_all['phase'],   dtype=jnp.float32),
+            'phi':     jnp.array(gain_params_all['phi'],     dtype=jnp.float32),
+        }
+
+        # Accumulate product on equatorial HEALPix
+        sky_nside = self.fwd.sky_nside
+        product_map, _weights = grid_fitter.accumulate_product_healpix(
+            coeff_maps_all,
+            np.asarray(self.rot_matrices),
+            sky_nside=sky_nside,
+        )
+
+        # Resolve beam model for beam division
+        if beam_model is None:
+            from .beam import BeamModel as _BeamModel
+            # Build a minimal BeamModel proxy carrying the same coeffs/A_beam
+            bm_proxy = object.__new__(_BeamModel)
+            bm_proxy.nside   = self.fwd.beam_nside
+            bm_proxy.freqs   = np.asarray(self.freqs)
+            bm_proxy.coeffs  = np.asarray(self.fwd.beam_coeffs)
+            bm_proxy.A_beam  = np.asarray(self.fwd.A_beam)
+            beam_model = bm_proxy
+
+        sky_coeffs = grid_fitter.init_sky_coeffs_from_product(
+            product_map,
+            A_sky=np.asarray(self.A_sky),
+            beam_model=beam_model,
+            beam_reg=beam_reg,
+        )
+
+        return {'sky_coeffs': sky_coeffs, **gain_params}
+
+    def fit_grid_fast(
+        self,
+        params,
+        grid_fitter,
+        n_iter: int = 40,
+        beam_model=None,
+        beam_reg: float = 1e-3,
+        verbose: bool = False,
+        **fit_kwargs,
+    ):
+        """Pre-optimise using the fast grid-based solver, then return params.
+
+        Equivalent to calling :meth:`init_params_from_grid_fit` with the
+        current params' gain values as the initialisation, but also accepts
+        and returns a ``params`` dict so it can be scheduled like other
+        optimisers (``fit_alternating``, ``fit_alternating_dirty``, …).
+
+        Parameters
+        ----------
+        params : dict
+            Current parameters (gain init is extracted from this dict).
+        grid_fitter : GridFitter
+        n_iter : int
+        beam_model : BeamModel or None
+        beam_reg : float
+        verbose : bool
+        **fit_kwargs
+            Forwarded to :meth:`GridFitter.fit_all_times`.
+
+        Returns
+        -------
+        params : dict
+        loss  : float
+        """
+        gain_init = {
+            'log_amp': np.asarray(params['log_amp']),   # (ntime, nfreq)
+            'phase':   np.asarray(params['phase']),
+            'phi':     np.asarray(params['phi']),
+        }
+        new_params = self.init_params_from_grid_fit(
+            grid_fitter,
+            n_iter=n_iter,
+            beam_model=beam_model,
+            beam_reg=beam_reg,
+            verbose=verbose,
+            gain_params_init=gain_init,
+            **fit_kwargs,
+        )
+        if 'beam_coeffs' in params:
+            new_params['beam_coeffs'] = params['beam_coeffs']
+        loss = float(self._jit_loss(new_params, self._effective_weights()))
+        return new_params, loss
 
     def fit_lbfgs(self, params, maxiter: int = 30, tol: float = 1e-7):
         w = self._effective_weights()

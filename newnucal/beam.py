@@ -1,9 +1,9 @@
 """
 Beam model on a topocentric HEALPix grid.
 
-The beam is represented by DPSS spectral coefficients stored at each
-HEALPix pixel.  Pixels are in *topocentric* coordinates (the beam is
-fixed on the sky as the Earth rotates).
+The beam is represented by spectral coefficients stored at each HEALPix
+pixel.  Pixels are in *topocentric* coordinates (the beam is fixed on
+the sky as the Earth rotates).
 
 At a given topocentric direction (th, ph) and frequency ν:
 
@@ -11,24 +11,28 @@ At a given topocentric direction (th, ph) and frequency ν:
 
 where interp uses bilinear HEALPix interpolation (4 neighbours).
 
+The spectral basis ``A_beam`` (shape ``(nfreq, nmodes)``) is supplied as a
+:class:`~newnucal.basis.BeamBasis` or a plain ``(nfreq, nmodes)`` ndarray.
+
 Initialisation
 --------------
 The default starting point is a circularly-symmetric analytic beam
 (e.g. AiryBeam) evaluated on the HEALPix grid.  For each pixel the
-frequency spectrum is projected onto DPSS modes.
+frequency spectrum is projected onto the chosen basis.
 """
 
 import numpy as np
 import healpy
 from pyuvdata.analytic_beam import AiryBeam
 
-from .dpss import dpss_matrix, dpss_project
+from .dpss import dpss_project
 
 DTYPE_R = np.float32
 
+
 class BeamModel:
     """
-    HEALPix DPSS beam model in topocentric coordinates.
+    HEALPix beam model in topocentric coordinates with a pluggable spectral basis.
 
     Parameters
     ----------
@@ -36,13 +40,15 @@ class BeamModel:
         HEALPix resolution (power of 2).
     freqs : array_like, shape (nfreq,)
         Frequency array in Hz.
-    eta_max : float
-        DPSS delay half-width in seconds.
+    basis : BeamBasis or array_like (nfreq, nmodes)
+        Spectral basis for the beam.  Accepted forms:
+
+        - :class:`~newnucal.basis.BeamBasis` — ``basis.A`` is used as
+          ``A_beam``.
+        - ``ndarray`` of shape ``(nfreq, nmodes)`` — used directly.
     beam : pyuvdata AnalyticBeam, optional
-        Analytic beam used to initialise the DPSS coefficients.
+        Analytic beam used to initialise the pixel coefficients.
         Defaults to an AiryBeam with diameter=14.6 m (HERA element).
-    eigenval_cutoff : float
-        Eigenvalue cutoff for DPSS mode selection.
     ch_chunk : int
         Number of frequency channels to evaluate at once when sampling
         the analytic beam (avoids large temporary arrays).
@@ -52,34 +58,33 @@ class BeamModel:
         self,
         nside: int,
         freqs,
-        eta_max: float,
+        basis,
         beam=None,
-        eigenval_cutoff: float = 1e-9,
         ch_chunk: int = 32,
     ):
         self.nside = nside
         self.freqs = np.asarray(freqs, dtype=np.float64)
-        self.eta_max = eta_max
 
         if beam is None:
             beam = AiryBeam(diameter=14.6, include_cross_pols=False)
         self.beam = beam
 
-        # DPSS basis
-        self.A_beam = dpss_matrix(self.freqs, eta_max, eigenval_cutoff)
-        # (nfreq, nmodes)
+        # Resolve spectral basis: BeamBasis has an .A attribute; ndarray does not.
+        if hasattr(basis, 'A'):
+            self.A_beam = np.asarray(basis.A, dtype=DTYPE_R)   # (nfreq, nmodes)
+        else:
+            self.A_beam = np.asarray(basis, dtype=DTYPE_R)     # (nfreq, nmodes)
 
         # Pixel centres in topocentric coordinates
         npix = healpy.nside2npix(nside)
         th, ph = healpy.pix2ang(nside, np.arange(npix))
-        # AiryBeam uses az = ph (azimuth) and za = th (zenith angle)
         az = ph.astype(np.float64)
         za = th.astype(np.float64)
 
         # Evaluate beam power at each pixel for all frequencies
         beam_power = self._eval_beam(beam, az, za, ch_chunk)  # (npix, nfreq)
 
-        # Project onto DPSS basis: coeffs[px, mode] = sum_ν beam_power[px, ν] * A[ν, mode]
+        # Project onto spectral basis
         self.coeffs = dpss_project(beam_power, self.A_beam).astype(DTYPE_R)
         # (npix, nmodes)
 
@@ -94,7 +99,6 @@ class BeamModel:
         for ch in range(0, nfreq, ch_chunk):
             ch_sl = slice(ch, ch + ch_chunk)
             freqs_chunk = self.freqs[ch_sl]
-            # power_eval returns an array of shape (1, Naxes_vec, nfreq_chunk, npix)
             resp = beam.power_eval(
                 az_array=az,
                 za_array=za,

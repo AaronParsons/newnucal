@@ -48,11 +48,9 @@ class TestPointSourcePhaseGradient:
     def beam_model_small(self, freqs):
         """Minimal beam model."""
         from newnucal.beam import BeamModel
-        return BeamModel(
-            nside=8,
-            freqs=freqs,
-            eta_max=20e-9,
-        )
+        from newnucal.basis import BeamBasis
+        basis = BeamBasis.from_dpss(freqs, eta_max=20e-9)
+        return BeamModel(nside=8, freqs=freqs, basis=basis)
 
     @pytest.fixture
     def forward_model_small(self, small_array, beam_model_small, freqs):

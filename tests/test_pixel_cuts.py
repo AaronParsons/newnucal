@@ -52,7 +52,7 @@ def rot2():
 
 
 @pytest.fixture
-def calibrator(array, beam_model, freqs):
+def calibrator(array, beam_model, freqs, sky_model):
     """Minimal Calibrator with synthetic zero data (function-scoped)."""
     from newnucal.calibrator import Calibrator
     ntime, nbls = 2, array.nbls
@@ -62,8 +62,7 @@ def calibrator(array, beam_model, freqs):
     return Calibrator(
         array=array,
         beam_model=beam_model,
-        sky_nside=NSIDE_SKY,
-        sky_eta_max=ETA_SKY,
+        sky_model=sky_model,
         freqs=freqs,
         rot_matrices=rot,
         data=data,

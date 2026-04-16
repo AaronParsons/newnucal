@@ -1,9 +1,11 @@
 """
 Forward visibility simulation.
 
-ForwardModel maps sky DPSS coefficients → model visibilities via a 3-D type-3
-NUFFT in (l, m, eta). This version also exposes adjoint/backprojection helpers
-for dirty-map sky updates.
+ForwardModel maps sky spectral coefficients → model visibilities via a 3-D
+type-3 NUFFT in (l, m, eta).  The sky spectral basis ``A_sky`` (shape
+``(nfreq, nmodes)``) can be any compact basis — DPSS, eigenbasis rows, or
+custom modes — set via :meth:`~ForwardModel.set_sky_basis`.  This version also
+exposes adjoint/backprojection helpers for dirty-map sky updates.
 """
 
 import numpy as np
@@ -158,7 +160,16 @@ class ForwardModel:
             setattr(self, attr, None)
         return self
 
-    def set_sky_dpss(self, A_sky):
+    def set_sky_basis(self, A_sky):
+        """Set the sky spectral basis and (re-)JIT the simulation.
+
+        Parameters
+        ----------
+        A_sky : array_like, shape (nfreq, nmodes)
+            Any compact spectral basis whose columns span the sky frequency
+            structure — DPSS modes, eigenbasis rows, or custom vectors.
+            Reconstruction convention: ``sky_spec = sky_coeffs @ A_sky.T``.
+        """
         self.A_sky = jnp.array(A_sky, dtype=DTYPE_R)
         self._jit_one = jax.jit(self._simulate_one_precomputed)
 
@@ -268,7 +279,7 @@ class ForwardModel:
 
     def simulate(self, sky_coeffs, rot_matrices):
         if self._jit_one is None:
-            raise RuntimeError('Call set_sky_dpss() before simulate().')
+            raise RuntimeError('Call set_sky_basis() before simulate().')
         if (not self._geom_ready) or (self._topo_all.shape[0] != rot_matrices.shape[0]):
             self.precompute_time_geometry(rot_matrices)
         inds = jnp.arange(rot_matrices.shape[0], dtype=jnp.int32)
