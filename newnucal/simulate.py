@@ -235,23 +235,26 @@ class ForwardModel:
         self._jit_one = jax.jit(self._simulate_one_precomputed)
         return self
 
-    def _forward_components_from_cache(self, sky_coeffs, tind):
+    def _forward_components_from_cache_sky_spec(self, sky_spec, tind):
         topo = self._topo_all[tind]
         horizon = self._horizon_all[tind]
         beam_spec_h = self._beam_spec_horizon_all[tind]   # (npix_sky, nfreq), already * horizon
-        sky_spec = sky_coeffs @ self.A_sky.T               # (npix_sky, nfreq)
         W = sky_spec * beam_spec_h
         W_eta_full = jnp.fft.fft(W, axis=1) * self._phase_full[None, :]
         W_eta = W_eta_full[:, self._eta_idx]
         return topo, horizon, beam_spec_h, W, W_eta
+
+    def _forward_components_from_cache(self, sky_coeffs, tind):
+        sky_spec = sky_coeffs @ self.A_sky.T
+        return self._forward_components_from_cache_sky_spec(sky_spec, tind)
 
     def forward_components_one_time(self, sky_coeffs, tind):
         if not self._geom_ready:
             raise RuntimeError('Call precompute_time_geometry() first.')
         return self._forward_components_from_cache(sky_coeffs, tind)
 
-    def _simulate_one_precomputed(self, sky_coeffs, tind):
-        _, _, _, _, W_eta = self._forward_components_from_cache(sky_coeffs, tind)
+    def _simulate_one_precomputed_sky_spec(self, sky_spec, tind):
+        _, _, _, _, W_eta = self._forward_components_from_cache_sky_spec(sky_spec, tind)
         vis_flat = nufft3(
             W_eta.ravel().astype(DTYPE_C),
             self._src_x_all[tind], self._src_y_all[tind], self._src_z_all[tind],
@@ -261,11 +264,16 @@ class ForwardModel:
         )
         return vis_flat.reshape(self.nfreq, self.nbls)
 
+    def _simulate_one_precomputed(self, sky_coeffs, tind):
+        sky_spec = sky_coeffs @ self.A_sky.T
+        return self._simulate_one_precomputed_sky_spec(sky_spec, tind)
+
     def simulate(self, sky_coeffs, rot_matrices):
         if (not self._geom_ready) or (self._topo_all.shape[0] != rot_matrices.shape[0]):
             self.precompute_time_geometry(rot_matrices)
+        sky_spec = sky_coeffs @ self.A_sky.T
         inds = jnp.arange(rot_matrices.shape[0], dtype=jnp.int32)
-        return jax.vmap(lambda tind: self._jit_one(sky_coeffs, tind))(inds)
+        return jax.vmap(lambda tind: self._simulate_one_precomputed_sky_spec(sky_spec, tind))(inds)
 
     def adjoint_residual_one_time(self, residual_fb, tind):
         """Backproject one-time residuals to a pixel-delay dirty map."""
@@ -309,14 +317,16 @@ class ForwardModel:
         beam_reg: float = 1e-3,
     ):
         """Accumulate a global equatorial sky update from all times."""
-        num = jnp.zeros((self.npix_sky, self.nfreq), dtype=DTYPE_C)
-        den = jnp.zeros((self.npix_sky, self.nfreq), dtype=DTYPE_R)
-        for tind in range(int(residual_vis.shape[0])):
-            delta_eq, weight_eq = self.apparent_sky_update_one_time(
-                residual_vis[tind], tind, step_size=step_size, beam_reg=beam_reg
+        inds = jnp.arange(int(residual_vis.shape[0]), dtype=jnp.int32)
+
+        def one_time(resid_t, tind):
+            return self.apparent_sky_update_one_time(
+                resid_t, tind, step_size=step_size, beam_reg=beam_reg
             )
-            num = num + weight_eq.astype(DTYPE_C) * delta_eq
-            den = den + weight_eq.real.astype(DTYPE_R)
+
+        delta_all, weight_all = jax.vmap(one_time)(residual_vis, inds)
+        num = jnp.sum(weight_all.astype(DTYPE_C) * delta_all, axis=0)
+        den = jnp.sum(weight_all.real.astype(DTYPE_R), axis=0)
         delta_eq_pf = num / (den.astype(DTYPE_C) + 1e-6)
         delta_eq_pf = delta_eq_pf / residual_vis.shape[0]  # divide by ntimes
         delta_coeffs = (delta_eq_pf.real @ self.A_sky).astype(DTYPE_R)
@@ -335,70 +345,37 @@ class ForwardModel:
         held fixed, this backprojects the gain-calibrated residuals through the
         sky model to estimate the beam-coefficient correction that best reduces
         the residual.
-
-        Math sketch (one time step *t*, pixel *p*, frequency *f*):
-
-        * Backproject: ``dirty[p,f] = NUFFT^H(r[t]) → IFFT → pixel×freq``
-        * Matched filter in sky: ``δb[p,f] = step_size · sky^* · dirty / (|sky|² + reg)``
-        * Project to beam DPSS: ``δbᵢ[p,m] = real(δb[p,:]) · horizon[p] @ A_beam``
-        * Adjoint scatter to beam pixels:
-          ``δbc[q,m] += wgt[k,p] · |sky|² · δbᵢ[p,m]``  for each neighbour *k*
-
-        Accumulate numerator/denominator over all times, then normalise.
-
-        Parameters
-        ----------
-        sky_coeffs : array_like, shape (npix_sky, nmodes_sky)
-        residual_vis : array_like, shape (ntime, nfreq, nbls)
-            Gain-calibrated residual ``data_cal − vis_model`` (no gain factor).
-        step_size : float
-        sky_reg : float
-            Regularisation added to ``|sky_spec|²`` denominator (prevents
-            blow-up where the sky is faint).
-
-        Returns
-        -------
-        delta_bc : jnp.ndarray, shape (npix_beam, nmodes_beam)
         """
-        ab_np = np.asarray(self.A_beam, dtype=DTYPE_R_NPY)   # (nfreq, nmodes_beam)
+        ab_np = np.asarray(self.A_beam, dtype=DTYPE_R_NPY)
 
         # Sky spectrum in pixel × frequency space (complex for matched filter)
-        sky_spec = np.asarray(
-            (jnp.array(sky_coeffs) @ self.A_sky.T).astype(DTYPE_C)
-        )                                                    # (npix_sky, nfreq)
-        sky_weight = (sky_spec.real ** 2 + sky_spec.imag ** 2).astype(
-            DTYPE_R_NPY
-        )                                                    # |sky_spec|² (npix_sky, nfreq)
-        # Per-pixel sky power (summed over frequency) used to weight the scatter
-        sky_pow = sky_weight.sum(axis=1)                     # (npix_sky,)
+        sky_spec = np.asarray((jnp.array(sky_coeffs) @ self.A_sky.T).astype(DTYPE_C))
+        sky_weight = (sky_spec.real ** 2 + sky_spec.imag ** 2).astype(DTYPE_R_NPY)
+        sky_pow = sky_weight.sum(axis=1)
 
         num = np.zeros((self.npix_beam, self.nmodes_beam), dtype=DTYPE_R_NPY)
         den = np.zeros(self.npix_beam, dtype=DTYPE_R_NPY)
 
         ntime = int(residual_vis.shape[0])
         for tind in range(ntime):
-            # Backproject residuals to apparent pixel×frequency map (complex)
-            dirty_pf = np.asarray(
-                self.dirty_apparent_sky_one_time(residual_vis[tind], tind)
-            )                                                # (npix_sky, nfreq)
-            horizon = np.asarray(self._horizon_all[tind])   # (npix_sky,)
+            dirty_pf = np.asarray(self.dirty_apparent_sky_one_time(residual_vis[tind], tind))
+            horizon = np.asarray(self._horizon_all[tind])
 
-            # Matched-filter update in apparent-beam space
-            delta_bsf = (
-                step_size * np.conj(sky_spec) * dirty_pf / (sky_weight + sky_reg)
-            )                                                # (npix_sky, nfreq) complex
-
-            # Project real part onto beam DPSS, masked by horizon
+            delta_bsf = step_size * np.conj(sky_spec) * dirty_pf / (sky_weight + sky_reg)
             delta_bi = (np.real(delta_bsf) * horizon[:, None]) @ ab_np
-            # (npix_sky, nmodes_beam)
 
-            # Adjoint scatter-add: sky pixel → its 4 beam-pixel neighbours
-            px  = self._interp_px_all[tind]   # (4, npix_sky) int32
-            wgt = self._interp_wgt_all[tind]  # (4, npix_sky) float32
-            for k in range(4):
-                w_k = wgt[k] * sky_pow         # (npix_sky,) scatter weight
-                np.add.at(num, px[k], w_k[:, None] * delta_bi)
-                np.add.at(den, px[k], w_k)
+            px  = self._interp_px_all[tind]
+            wgt = self._interp_wgt_all[tind]
+
+            px_flat = px.reshape(-1)
+            w_flat = (wgt * sky_pow[None, :]).reshape(-1)
+            contrib = (
+                w_flat[:, None]
+                * np.repeat(delta_bi[None, :, :], 4, axis=0).reshape(-1, self.nmodes_beam)
+            )
+
+            np.add.at(num, px_flat, contrib)
+            np.add.at(den, px_flat, w_flat)
 
         delta_bc = num / (den[:, None] + 1e-6)
         delta_bc /= ntime
@@ -462,20 +439,12 @@ class ForwardModel:
         # Invalidate compiled simulation so the new precomputed beam is used.
         self._jit_one = jax.jit(self._simulate_one_precomputed)
 
-    def _simulate_one_variable_beam(self, sky_coeffs, beam_coeffs, tind):
-        """Forward model for one time step with *beam_coeffs* as a traced input.
-
-        Differentiable w.r.t. both *sky_coeffs* and *beam_coeffs* via JAX AD.
-        Uses the bilinear stencil stored during :meth:`precompute_time_geometry`.
-        Only supports the non-zenith-cut path.
-        """
-        px  = self._interp_px_all[tind]   # numpy (4, npix_sky) — static indices
-        wgt = jnp.array(self._interp_wgt_all[tind])  # (4, npix_sky)
-        # Interpolate beam coeffs to sky-pixel positions.
-        # beam_coeffs[px] gathers with static indices — JAX differentiates via scatter-add.
-        bi = jnp.sum(wgt[:, :, None] * beam_coeffs[px], axis=0)   # (npix_sky, nmodes_beam)
-        beam_spec_h = (bi @ self.A_beam.T) * self._horizon_all[tind][:, None]  # (npix_sky, nfreq)
-        sky_spec = sky_coeffs @ self.A_sky.T                        # (npix_sky, nfreq)
+    def _simulate_one_variable_beam_sky_spec(self, sky_spec, beam_coeffs, tind):
+        """Forward model for one time step with *beam_coeffs* as a traced input."""
+        px  = self._interp_px_all[tind]
+        wgt = jnp.array(self._interp_wgt_all[tind])
+        bi = jnp.sum(wgt[:, :, None] * beam_coeffs[px], axis=0)
+        beam_spec_h = (bi @ self.A_beam.T) * self._horizon_all[tind][:, None]
         W = sky_spec * beam_spec_h
         W_eta_full = jnp.fft.fft(W, axis=1) * self._phase_full[None, :]
         W_eta = W_eta_full[:, self._eta_idx]
@@ -488,32 +457,18 @@ class ForwardModel:
         )
         return vis_flat.reshape(self.nfreq, self.nbls)
 
+    def _simulate_one_variable_beam(self, sky_coeffs, beam_coeffs, tind):
+        sky_spec = sky_coeffs @ self.A_sky.T
+        return self._simulate_one_variable_beam_sky_spec(sky_spec, beam_coeffs, tind)
+
     def simulate_variable_beam(self, sky_coeffs, beam_coeffs, rot_matrices):
-        """Simulate all time steps with *beam_coeffs* as a differentiable input.
-
-        Unlike :meth:`simulate`, this path computes the beam interpolation
-        on-the-fly inside the computation graph, making the output differentiable
-        w.r.t. *beam_coeffs*.  The Python loop is unrolled by JAX when JIT-compiled
-        (e.g. by jaxopt), so no Python overhead appears in gradient computation.
-
-        The zenith-cut optimisation is not supported here; the full pixel set is
-        always used.
-
-        Parameters
-        ----------
-        sky_coeffs : array_like, shape (npix_sky, nmodes_sky)
-        beam_coeffs : array_like, shape (npix_beam, nmodes_beam)
-        rot_matrices : array_like, shape (ntime, 3, 3)  — passed for API symmetry
-
-        Returns
-        -------
-        vis : jnp.ndarray, shape (ntime, nfreq, nbls)
-        """
+        """Simulate all time steps with *beam_coeffs* as a differentiable input."""
         if not self._geom_ready:
             raise RuntimeError('Call precompute_time_geometry() first.')
         ntime = len(self._interp_px_all)
+        sky_spec = sky_coeffs @ self.A_sky.T
         return jnp.stack([
-            self._simulate_one_variable_beam(sky_coeffs, beam_coeffs, t)
+            self._simulate_one_variable_beam_sky_spec(sky_spec, beam_coeffs, t)
             for t in range(ntime)
         ])
 

@@ -210,6 +210,7 @@ class Calibrator:
         rot_matrices,
         data,
         eps: float = 1e-6,
+        eta_max: float | None = None,
         eta_padding: float = 0.0,
         channel_weights=None,
         inv_noise_var=None,
@@ -237,7 +238,7 @@ class Calibrator:
             beam_model,
             freqs,
             eps=eps,
-            eta_max=None,
+            eta_max=eta_max,
             eta_padding=eta_padding,
         )
         self.fwd.precompute_time_geometry(self.rot_matrices)
@@ -453,63 +454,98 @@ class Calibrator:
     # Pixel-cut helpers
     # ------------------------------------------------------------------
 
-    def apply_horizon_cut(self):
+    def apply_horizon_cut(self, params=None):
         """Remove sky pixels that are never above the horizon.
 
-        Permanently reduces ``npix_sky``; call *before* initialising sky
-        coefficients.  Returns the number of pixels retained.
+        Idempotent: after the first call, later calls reuse the stored full-sky
+        mask instead of recomputing it on the already-masked active sky.
+
+        If *params* is provided, return a horizon-cut parameter dict with
+        ``sky_coeffs`` masked consistently and store the mask on the calibrator.
         """
-        mask = self.fwd.build_ever_visible_mask(self.rot_matrices)
-        self.fwd.apply_pixel_mask(mask)
-        self.fwd.precompute_time_geometry(self.rot_matrices)
-        n_keep = int(mask.sum())
-        n_drop = int((~mask).sum())
-        print(f'  Horizon cut: {n_keep} pixels retained, {n_drop} removed.')
-        return n_keep
+        if getattr(self, 'horizon_mask', None) is None:
+            mask = self.fwd.build_ever_visible_mask(self.rot_matrices)
+            self.horizon_mask = np.asarray(mask, dtype=bool)
+            self.horizon_npix_full = int(mask.size)
+            self.fwd.apply_pixel_mask(mask)
+            self.fwd.precompute_time_geometry(self.rot_matrices)
+            self._recompile_jit()
+            n_keep = int(mask.sum())
+            n_drop = int((~mask).sum())
+            print(f'  Horizon cut: {n_keep} pixels retained, {n_drop} removed.')
+        else:
+            mask = self.horizon_mask
+
+        if params is None:
+            return int(mask.sum())
+        return self.apply_horizon_mask_to_params(params)
+
+    def apply_horizon_mask_to_params(self, params):
+        """Return a copy of *params* with sky_coeffs masked to active pixels."""
+        mask = getattr(self, 'horizon_mask', None)
+        if mask is None:
+            raise RuntimeError('apply_horizon_cut() must be called before masking parameters.')
+
+        out = dict(params)
+        if 'sky_coeffs' in out and out['sky_coeffs'] is not None:
+            sky = np.asarray(out['sky_coeffs'])
+            if sky.shape[0] == mask.size:
+                out['sky_coeffs'] = jnp.array(sky[mask], dtype=DTYPE_R)
+            elif sky.shape[0] == int(mask.sum()):
+                out['sky_coeffs'] = jnp.array(sky, dtype=DTYPE_R)
+            else:
+                raise ValueError(
+                    f"sky_coeffs first dimension {sky.shape[0]} does not match "
+                    f"full sky npix {mask.size} or masked npix {int(mask.sum())}"
+                )
+        if 'beam_coeffs' in out and out['beam_coeffs'] is not None:
+            out['beam_coeffs'] = jnp.array(out['beam_coeffs'], dtype=DTYPE_R)
+        for key in ('log_amp', 'phase', 'phi'):
+            if key in out and out[key] is not None:
+                out[key] = jnp.array(out[key], dtype=DTYPE_R)
+        return out
+
+    def expand_sky_to_full(self, sky_coeffs_masked):
+        """Expand masked sky coefficients back onto the full sky grid."""
+        mask = getattr(self, 'horizon_mask', None)
+        if mask is None:
+            raise RuntimeError('No horizon mask has been applied.')
+        sky = np.asarray(sky_coeffs_masked, dtype=DTYPE_R_NPY)
+        full = np.zeros((mask.size, sky.shape[1]), dtype=DTYPE_R_NPY)
+        full[mask] = sky
+        return full
 
     def fit_gains_linear(self, sky_coeffs):
         vis_model = self._jit_simulate(sky_coeffs, self.rot_matrices)
-        # Per-time optimal complex gain: data · conj(model) / |model|²
-        # Shape: (ntime, nfreq, nbls)
-        den = np.array(jnp.abs(vis_model) ** 2)          # (ntime, nfreq, nbls), weights
-        g_opt = np.array(self.data * jnp.conj(vis_model)) / (den + 1e-30)
-        log_g = np.log(g_opt + 0j)                        # complex log, (ntime, nfreq, nbls)
 
-        # log_amp: baseline-weighted mean of Re(log g) per (time, freq)
-        w_sum = den.sum(axis=2) + 1e-30                   # (ntime, nfreq)
-        log_amp = (den * np.real(log_g)).sum(axis=2) / w_sum  # (ntime, nfreq)
+        den = jnp.abs(vis_model) ** 2
+        g_opt = self.data * jnp.conj(vis_model) / (den + 1e-30)
+        log_g = jnp.log(g_opt + 0j)
 
-        # phase and phi: weighted lstsq over baselines, independently per (time, freq)
-        # Design matrix X: (nbls, 3) — [1, bl_E, bl_N]
-        bls = np.array(self.bls)
-        X = np.column_stack([np.ones(self.nbls), bls[:, 0], bls[:, 1]])  # (nbls, 3)
+        w_sum = den.sum(axis=2) + 1e-30
+        log_amp = (den * jnp.real(log_g)).sum(axis=2) / w_sum
 
-        # Xy[t, f, k] = sum_b X[b, k] * den[t, f, b] * Im(log_g[t, f, b])
-        Xy = np.einsum('bk,tfb->tfk', X, den * np.imag(log_g))   # (ntime, nfreq, 3)
-        # XTX[t, f, k, l] = sum_b X[b, k] * den[t, f, b] * X[b, l]
-        XTX = np.einsum('bk,tfb,bl->tfkl', X, den, X)             # (ntime, nfreq, 3, 3)
-        XTX += 1e-10 * np.eye(3)                                   # regularise
+        X = jnp.column_stack([
+            jnp.ones(self.nbls, dtype=DTYPE_R),
+            self.bls[:, 0].astype(DTYPE_R),
+            self.bls[:, 1].astype(DTYPE_R),
+        ])
 
-        # Solve all (time, freq) systems at once via numpy broadcasting.
-        # Add trailing dim so solve sees (..., 3, 1) not (..., 3) — required
-        # by numpy ≥2.0 which no longer treats b.ndim == a.ndim-1 as a vector.
-        theta = np.linalg.solve(XTX, Xy[..., None])[..., 0]       # (ntime, nfreq, 3)
+        Xy = jnp.einsum('bk,tfb->tfk', X, den * jnp.imag(log_g))
+        XTX = jnp.einsum('bk,tfb,bl->tfkl', X, den, X)
+        XTX = XTX + 1e-10 * jnp.eye(3, dtype=DTYPE_R)
+
+        theta = jnp.linalg.solve(XTX, Xy[..., None])[..., 0]
 
         gain_params = {
-            'log_amp': jnp.array(log_amp, dtype=DTYPE_R),             # (ntime, nfreq)
-            'phase':   jnp.array(theta[:, :, 0], dtype=DTYPE_R),      # (ntime, nfreq)
-            'phi':     jnp.array(                                       # (ntime, 2, nfreq)
-                theta[:, :, 1:].transpose(0, 2, 1), dtype=DTYPE_R
-            ),
+            'log_amp': log_amp.astype(DTYPE_R),
+            'phase':   theta[:, :, 0].astype(DTYPE_R),
+            'phi':     theta[:, :, 1:].transpose(0, 2, 1).astype(DTYPE_R),
         }
         loss = float(self._jit_loss({'sky_coeffs': sky_coeffs, **gain_params}, self._effective_weights()))
-        # Cache by object identity so that an immediate calc_loss(params) call
-        # returns the same float without a second NUFFT evaluation.
-        # jax_finufft.nufft is non-deterministic: two calls with identical inputs
-        # can give slightly different values, causing large relative differences
-        # when the loss is near zero.  Returning the cached value avoids this.
         self._fit_gains_linear_cache = (sky_coeffs, gain_params, loss)
         return gain_params, loss
+
 
     def _recompile_jit(self):
         """Recompile cached-beam JIT functions after precomputed arrays change."""
