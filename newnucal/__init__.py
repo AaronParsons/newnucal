@@ -5,7 +5,6 @@ from .sky import SkyModel
 from .simulate import ForwardModel
 from .gains import apply_gains, init_gain_params
 from .calibrator import Calibrator
-from .grid_fitter import GridFitter
 
 __all__ = [
     "HERAArray",
@@ -17,5 +16,4 @@ __all__ = [
     "apply_gains",
     "init_gain_params",
     "Calibrator",
-    "GridFitter",
 ]

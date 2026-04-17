@@ -2,9 +2,7 @@
 Spectral basis classes for beam and sky models.
 
 :class:`BeamBasis` and :class:`SkyBasis` each store a pre-built orthonormal
-spectral basis matrix ``A`` (nfreq, nmodes) along with optional SVD metadata
-used by :func:`~newnucal.grid_fitter._derive_product_basis` to form the joint
-sky×beam product basis.
+spectral basis matrix ``A`` (nfreq, nmodes) along with optional SVD metadata.
 
 Construction paths
 ------------------
