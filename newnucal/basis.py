@@ -22,8 +22,58 @@ File format (``.npz``)
 """
 
 import numpy as np
-from .dpss import dpss_matrix
+from hera_filters.dspec import dpss_operator
 from .utils import DTYPE_R_NPY as DTYPE_R
+
+
+def dpss_matrix(freqs, eta_max, eigenval_cutoff=1e-9):
+    """
+    Build the DPSS basis matrix A of shape (nfreq, nmodes).
+
+    Each column of A is a DPSS eigenvector (spectral window of half-width
+    eta_max in delay space).  For unflagged data the columns are approximately
+    orthonormal, so the fit matrix is just A itself (i.e. projection =
+    data @ A  and  reconstruction = coeffs @ A.T).
+
+    Parameters
+    ----------
+    freqs : array_like, shape (nfreq,)
+        Frequency array in Hz.
+    eta_max : float
+        Maximum delay in seconds (half-width of the DPSS filter).
+    eigenval_cutoff : float
+        Drop eigenmodes whose eigenvalue is below this threshold.
+
+    Returns
+    -------
+    A : ndarray, shape (nfreq, nmodes), dtype
+    """
+    A, _ = dpss_operator(
+        np.asarray(freqs, dtype=DTYPE_R),
+        filter_centers=[0.0],
+        filter_half_widths=[eta_max],
+        eigenval_cutoff=[eigenval_cutoff],
+    )
+    return A.real.astype(DTYPE_R)
+
+
+def basis_project(data, A):
+    """
+    Project data onto spectral basis:
+    data (..., nfreq) @ A (nfreq, nmodes) → (..., nmodes)
+    """
+    data = np.asarray(data)
+    A = np.asarray(A)
+    return data @ A  # (..., nfreq) @ (nfreq, nmodes) → (..., nmodes)
+
+def basis_reconstruct(coeffs, A):
+    """
+    Reconstruct frequency data from basis coefficients.
+    coeffs (..., nmodes) @ A.T (nmodes, nfreq) → (..., nfreq)
+    """
+    coeffs = np.asarray(coeffs)
+    A = np.asarray(A)
+    return coeffs @ A.T  # (..., nmodes) @ (nmodes, nfreq) → (..., nfreq)
 
 
 class _SpectralBasis:

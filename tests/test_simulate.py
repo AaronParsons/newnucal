@@ -15,7 +15,7 @@ import jax.numpy as jnp
 import pytest
 import healpy
 
-from newnucal.dpss import dpss_matrix, dpss_project
+from newnucal.basis import dpss_matrix, basis_project
 
 
 # ---------------------------------------------------------------------------
@@ -36,7 +36,7 @@ def _zenith_sky_coeffs(sky_nside, A_sky, flux_per_pixel: float = 1.0):
     npix = healpy.nside2npix(sky_nside)
     nfreq = A_sky.shape[0]
     flat_flux = np.full((npix, nfreq), flux_per_pixel, dtype=np.float32)
-    coeffs = dpss_project(flat_flux, A_sky)
+    coeffs = basis_project(flat_flux, A_sky)
     return jnp.array(coeffs, dtype=jnp.float32)
 
 

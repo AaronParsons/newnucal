@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 from newnucal.beam import BeamModel
-from newnucal.dpss import dpss_reconstruct
+from newnucal.basis import basis_reconstruct, dpss_matrix
 from newnucal.basis import BeamBasis, SkyBasis
 from newnucal.sky import SkyModel
 
@@ -39,7 +39,7 @@ def test_beam_model_shapes(beam_model, freqs):
 
 def test_beam_reconstruction_positive(beam_model):
     """Reconstructed beam power should be non-negative everywhere."""
-    rec = dpss_reconstruct(beam_model.coeffs, beam_model.A)
+    rec = basis_reconstruct(beam_model.coeffs, beam_model.A)
     # Reconstruction can have small ringing below horizon; above horizon
     # (first pixel = north pole / zenith for nside=8) must be positive.
     assert rec[0, :].min() > 0, "Zenith beam power should be positive"
@@ -48,7 +48,7 @@ def test_beam_reconstruction_positive(beam_model):
 def test_beam_zenith_brightest(beam_model):
     """Airy beam should be brightest at zenith (pixel 0 in RING, th=0)."""
     import healpy
-    rec = dpss_reconstruct(beam_model.coeffs, beam_model.A)
+    rec = basis_reconstruct(beam_model.coeffs, beam_model.A)
     # Average power across frequencies
     mean_power = rec.mean(axis=1)
     # Zenith pixel (theta closest to 0)
@@ -151,7 +151,6 @@ class TestCalibratorSkyModel:
 
     def test_array_sky_basis(self, array, beam_model, freqs, rot_matrices):
         """SkyModel wrapping a raw-array SkyBasis gives the right shape."""
-        from newnucal.dpss import dpss_matrix
         A_raw = dpss_matrix(freqs, eta_max=40e-9)
         sb    = SkyBasis(A=A_raw)
         sm    = SkyModel(nside=8, freqs=freqs, basis=sb)

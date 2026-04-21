@@ -15,7 +15,7 @@ import jax.numpy as jnp
 import healpy
 import pytest
 
-from newnucal.dpss import dpss_matrix, dpss_project
+from newnucal.basis import dpss_matrix, basis_project
 from newnucal.simulate import ForwardModel
 from newnucal.array import HERAArray
 from newnucal.beam import BeamModel
@@ -82,7 +82,7 @@ def _zenith_sky(fwd, A_sky, px=0):
     nfreq = fwd.nfreq
     flux = np.zeros((fwd.npix_sky, nfreq), dtype=np.float32)
     flux[px] = 1.0
-    return jnp.array(dpss_project(flux, A_sky), dtype=jnp.float32)
+    return jnp.array(basis_project(flux, A_sky), dtype=jnp.float32)
 
 
 # =============================================================================
@@ -202,7 +202,7 @@ class TestApplyPixelMask:
         # Full model: pixel 0 (zenith)
         flux_full = np.zeros((npix_full, f.nfreq), dtype=np.float32)
         flux_full[0] = 1.0
-        sky_full = jnp.array(dpss_project(flux_full, A), dtype=jnp.float32)
+        sky_full = jnp.array(basis_project(flux_full, A), dtype=jnp.float32)
         f.precompute_time_geometry(rot1)
         vis_full = f.simulate(sky_full, rot1)
 
@@ -215,7 +215,7 @@ class TestApplyPixelMask:
         px0_compressed = int(np.searchsorted(f._pixel_indices, 0))
         flux_masked = np.zeros((f.npix_sky, f.nfreq), dtype=np.float32)
         flux_masked[px0_compressed] = 1.0
-        sky_masked = jnp.array(dpss_project(flux_masked, A), dtype=jnp.float32)
+        sky_masked = jnp.array(basis_project(flux_masked, A), dtype=jnp.float32)
         vis_masked = f.simulate(sky_masked, rot1)
 
         rms_err = float(jnp.sqrt(jnp.mean(jnp.abs(vis_full - vis_masked) ** 2)))

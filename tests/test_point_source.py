@@ -25,7 +25,7 @@ import jax.numpy as jnp
 import pytest
 import healpy
 
-from newnucal.dpss import dpss_matrix, dpss_project, dpss_reconstruct
+from newnucal.basis import dpss_matrix, basis_project, basis_reconstruct
 from newnucal.simulate import compute_rotation_matrices, ForwardModel
 
 
@@ -88,7 +88,7 @@ class TestPointSourcePhaseGradient:
         # This simulates a zenith source (constant in all directions)
         flat_flux = np.ones((npix, freqs.shape[0]), dtype=np.float32)
 
-        sky_coeffs = dpss_project(flat_flux, forward_model_small.A_sky)
+        sky_coeffs = basis_project(flat_flux, forward_model_small.A_sky)
         sky_coeffs = jnp.array(sky_coeffs, dtype=jnp.float32)
 
         # Identity rotation
@@ -139,7 +139,7 @@ class TestPointSourcePhaseGradient:
 
         flat_flux = np.zeros((npix, freqs_arr.shape[0]), dtype=np.float32)
         flat_flux[px, :] = 1.0
-        sky_coeffs = jnp.array(dpss_project(flat_flux, A_sky), dtype=jnp.float32)
+        sky_coeffs = jnp.array(basis_project(flat_flux, A_sky), dtype=jnp.float32)
 
         rot_m = jnp.eye(3, dtype=jnp.float32)[None, :, :]
         vis   = np.array(forward_model_small.simulate(sky_coeffs, rot_m)[0])   # (nfreq, nbls)
@@ -198,7 +198,7 @@ class TestPointSourcePhaseGradient:
         flat_flux = np.zeros((npix, freqs_arr.shape[0]), dtype=np.float32)
         flat_flux[east_px, :] = 1.0
 
-        sky_coeffs = dpss_project(flat_flux, forward_model_small.A_sky)
+        sky_coeffs = basis_project(flat_flux, forward_model_small.A_sky)
         sky_coeffs = jnp.array(sky_coeffs, dtype=jnp.float32)
 
         rot_m = jnp.eye(3, dtype=jnp.float32)[None, :, :]
@@ -264,7 +264,7 @@ class TestFringeRate:
         # Create uniform flux (simpler, more robust test)
         flat_flux = np.ones((npix, freqs_arr.shape[0]), dtype=np.float32)
 
-        sky_coeffs = dpss_project(flat_flux, forward_model_with_times.A_sky)
+        sky_coeffs = basis_project(flat_flux, forward_model_with_times.A_sky)
         sky_coeffs = jnp.array(sky_coeffs, dtype=jnp.float32)
 
         # Two times separated by 1 hour
@@ -301,7 +301,7 @@ class TestFringeRate:
         # Create uniform flux (robust, simple test)
         flat_flux = np.ones((npix, freqs_arr.shape[0]), dtype=np.float32)
 
-        sky_coeffs = dpss_project(flat_flux, forward_model_with_times.A_sky)
+        sky_coeffs = basis_project(flat_flux, forward_model_with_times.A_sky)
         sky_coeffs = jnp.array(sky_coeffs, dtype=jnp.float32)
 
         # 1 hour separation
@@ -332,8 +332,8 @@ class TestLinearity:
         flat_flux_1x = np.ones((npix, nfreq), dtype=np.float32)
         flat_flux_2x = 2.0 * flat_flux_1x
 
-        coeffs_1x = dpss_project(flat_flux_1x, A_sky)
-        coeffs_2x = dpss_project(flat_flux_2x, A_sky)
+        coeffs_1x = basis_project(flat_flux_1x, A_sky)
+        coeffs_2x = basis_project(flat_flux_2x, A_sky)
 
         coeffs_1x = jnp.array(coeffs_1x, dtype=jnp.float32)
         coeffs_2x = jnp.array(coeffs_2x, dtype=jnp.float32)
@@ -374,9 +374,9 @@ class TestLinearity:
         flux_sum = flux1 + flux2
 
         # Project to DPSS
-        coeffs1 = dpss_project(flux1, A_sky)
-        coeffs2 = dpss_project(flux2, A_sky)
-        coeffs_sum = dpss_project(flux_sum, A_sky)
+        coeffs1 = basis_project(flux1, A_sky)
+        coeffs2 = basis_project(flux2, A_sky)
+        coeffs_sum = basis_project(flux_sum, A_sky)
 
         # Coefficients should be additive (DPSS projection is linear)
         # Allow some numerical tolerance due to floating-point precision and
@@ -421,7 +421,7 @@ class TestZeroAndNonzeroFlux:
 
         # Uniform positive flux
         flat_flux = np.ones((npix, nfreq), dtype=np.float32)
-        sky_coeffs = dpss_project(flat_flux, A_sky)
+        sky_coeffs = basis_project(flat_flux, A_sky)
         sky_coeffs = jnp.array(sky_coeffs, dtype=jnp.float32)
 
         rot_m = jnp.eye(3, dtype=jnp.float32)[None, :, :]
@@ -436,7 +436,7 @@ class TestZeroAndNonzeroFlux:
         nfreq = int(forward_model.freqs.shape[0])
 
         flat_flux = np.ones((npix, nfreq), dtype=np.float32)
-        sky_coeffs = dpss_project(flat_flux, A_sky)
+        sky_coeffs = basis_project(flat_flux, A_sky)
         sky_coeffs = jnp.array(sky_coeffs, dtype=jnp.float32)
 
         rot_m = jnp.eye(3, dtype=jnp.float32)[None, :, :]
@@ -465,7 +465,7 @@ class TestHorizonMasking:
         flat_flux = np.zeros((npix, nfreq), dtype=np.float32)
         flat_flux[bright_px, :] = 10.0  # Bright
 
-        sky_coeffs = dpss_project(flat_flux, A_sky)
+        sky_coeffs = basis_project(flat_flux, A_sky)
         sky_coeffs = jnp.array(sky_coeffs, dtype=jnp.float32)
 
         # Check if this pixel is above or below horizon in equatorial frame
@@ -501,7 +501,7 @@ class TestHorizonMasking:
         flat_flux = np.zeros((npix, nfreq), dtype=np.float32)
         flat_flux[0, :] = 1.0
 
-        sky_coeffs = dpss_project(flat_flux, A_sky)
+        sky_coeffs = basis_project(flat_flux, A_sky)
         sky_coeffs = jnp.array(sky_coeffs, dtype=jnp.float32)
 
         rot_m = jnp.eye(3, dtype=jnp.float32)[None, :, :]
@@ -531,7 +531,7 @@ class TestShapesAndDtypes:
         nfreq = int(forward_model.freqs.shape[0])
 
         flat_flux = np.ones((npix, nfreq), dtype=np.float32)
-        sky_coeffs = dpss_project(flat_flux, A_sky)
+        sky_coeffs = basis_project(flat_flux, A_sky)
         sky_coeffs = jnp.array(sky_coeffs, dtype=jnp.float32)
 
         rot_m = jnp.eye(3, dtype=jnp.float32)[None, :, :]
@@ -562,7 +562,7 @@ class TestGradients:
 
         nfreq = int(forward_model.freqs.shape[0])
         flat_flux = np.ones((npix, nfreq), dtype=np.float32)
-        sky_coeffs = dpss_project(flat_flux, A_sky)
+        sky_coeffs = basis_project(flat_flux, A_sky)
         sky_coeffs = jnp.array(sky_coeffs, dtype=jnp.float32)
 
         rot_m = jnp.eye(3, dtype=jnp.float32)[None, :, :]
@@ -582,7 +582,7 @@ class TestGradients:
 
         nfreq = int(forward_model.freqs.shape[0])
         flat_flux = np.ones((npix, nfreq), dtype=np.float32)
-        sky_coeffs = dpss_project(flat_flux, A_sky)
+        sky_coeffs = basis_project(flat_flux, A_sky)
         sky_coeffs = jnp.array(sky_coeffs, dtype=jnp.float32)
 
         rot_m = jnp.eye(3, dtype=jnp.float32)[None, :, :]

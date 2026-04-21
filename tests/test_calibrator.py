@@ -9,7 +9,7 @@ import numpy as np
 import jax.numpy as jnp
 import pytest
 
-from newnucal.dpss import dpss_project
+from newnucal.basis import basis_project
 from newnucal.gains import apply_gains, init_gain_params
 
 # Mirror the conftest sizes
@@ -27,7 +27,7 @@ def sky_coeffs_true(forward_model, A_sky, freqs):
     spec_idx = rng.normal(-0.7, 0.1, npix).astype(np.float32)
     ref_flux  = rng.exponential(scale=1.0, size=npix).astype(np.float32)
     flux_map  = ref_flux[:, None] * (freqs[None, :] / ref_freq) ** spec_idx[:, None]
-    return jnp.array(dpss_project(flux_map, A_sky), dtype=jnp.float32)
+    return jnp.array(basis_project(flux_map, A_sky), dtype=jnp.float32)
 
 
 @pytest.fixture

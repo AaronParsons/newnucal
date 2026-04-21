@@ -20,7 +20,7 @@ from astropy.time import Time
 from astropy.coordinates import EarthLocation
 
 from newnucal.array import HERAArray
-from newnucal.dpss import dpss_matrix
+from newnucal.basis import dpss_matrix
 
 
 HERA_LOC = EarthLocation.from_geodetic(
