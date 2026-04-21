@@ -13,6 +13,7 @@ import healpy
 import jax
 import jax.numpy as jnp
 from jax_finufft import nufft1, nufft2, nufft3
+from jax_finufft.options import Opts as _NufftOpts
 from healjax import get_interp_weights
 import healjax
 
@@ -54,11 +55,13 @@ class ForwardModel:
         eps: float = 1e-6,
         eta_max: float | None = None,
         eta_padding: float = 0.0,
+        nufft_upsampfac: float = 1.25,
     ):
         self.array = array
         self.sky_model = sky_model
         self.beam_model = beam_model
         self.eps = eps
+        self._nufft_opts = _NufftOpts(upsampfac=nufft_upsampfac)
         self.eta_max = eta_max
         self.eta_padding = float(eta_padding)
 
@@ -130,6 +133,8 @@ class ForwardModel:
         self._src_y_all = None
         self._src_z_all = None
         self._xi_all = None
+        self._2d_x_flat = None   # (ntime*nfreq, npix) — cached NUFFT source coords
+        self._2d_y_flat = None
 
     # ------------------------------------------------------------------
     # Pixel masking helpers
@@ -244,6 +249,25 @@ class ForwardModel:
         self._src_y_all = jnp.array(np.stack(src_y_all), dtype=DTYPE_R)
         self._src_z_all = jnp.array(np.stack(src_z_all), dtype=DTYPE_R)
         self._xi_all = jnp.array(np.stack(xi_all), dtype=DTYPE_R)   # (ntime, 2, npix_sky)
+
+        # 2D path: precompute flattened NUFFT source coords for all (time, freq) pairs.
+        # x_flat[t*nfreq + f, j] = 2π * freqs[f] / C * xi[t, 0, j]
+        # Shape: (ntime*nfreq, npix_sky).  Cached here so simulate_2d avoids
+        # recomputing the freq-scale per call.
+        _two_pi_over_c = 2.0 * np.pi / C
+        _xi_j = self._xi_all                          # (ntime, 2, npix)
+        _freqs = self.freqs                            # (nfreq,)
+        self._2d_x_flat = (
+            (_two_pi_over_c * _xi_j[:, 0:1, :] * _freqs[None, :, None])
+            .reshape(ntime * self.nfreq, self.npix_sky)
+            .astype(DTYPE_R)
+        )
+        self._2d_y_flat = (
+            (_two_pi_over_c * _xi_j[:, 1:2, :] * _freqs[None, :, None])
+            .reshape(ntime * self.nfreq, self.npix_sky)
+            .astype(DTYPE_R)
+        )
+
         # Bilinear stencil for beam solving — list of (4, npix_sky) numpy arrays,
         # one per time step.  Kept as a list so that beam solving can be done with
         # a per-time Python loop without stacking into a single large array.
@@ -517,7 +541,7 @@ class ForwardModel:
             W_fi, nu = args
             x_j = (2.0 * jnp.pi * nu / C * xi[0]).astype(DTYPE_R)
             y_j = (2.0 * jnp.pi * nu / C * xi[1]).astype(DTYPE_R)
-            grid = nufft1((n_q, n_r), W_fi, x_j, y_j, iflag=1, eps=self.eps)
+            grid = nufft1((n_q, n_r), W_fi, x_j, y_j, iflag=1, eps=self.eps, opts=self._nufft_opts)
             return grid[q_idx, r_idx]
 
         return jax.vmap(one_freq)((W.T, freqs))   # (nfreq, nbls)
@@ -567,13 +591,27 @@ class ForwardModel:
         -------
         vis : jnp.ndarray, shape (ntime, nfreq, nbls), complex64
         """
-        if (not self._geom_ready) or (self._xi_all is None) or (self._topo_all.shape[0] != rot_matrices.shape[0]):
+        if (not self._geom_ready) or (self._2d_x_flat is None) or (self._topo_all.shape[0] != rot_matrices.shape[0]):
             self.precompute_time_geometry(rot_matrices)
-        sky_spec = sky_coeffs @ self.A_sky.T
-        inds = jnp.arange(rot_matrices.shape[0], dtype=jnp.int32)
-        return jax.vmap(
-            lambda tind: self._simulate_one_2d_precomputed_sky_spec(sky_spec, tind)
-        )(inds)
+        ntime = self._topo_all.shape[0]
+        sky_spec = (sky_coeffs @ self.A_sky.T).astype(DTYPE_C)   # (npix, nfreq)
+        # sky × beam for all times: (ntime, npix, nfreq) → (ntime*nfreq, npix)
+        W_flat = (
+            (sky_spec[None, :, :] * self._beam_spec_horizon_all)
+            .transpose(0, 2, 1)
+            .reshape(ntime * self.nfreq, self.npix_sky)
+        )
+        n_q, n_r = self._2d_n_q, self._2d_n_r
+        q_idx, r_idx = self._2d_q_idx, self._2d_r_idx
+
+        def _one(args):
+            return nufft1(
+                (n_q, n_r), args[0], args[1], args[2],
+                iflag=1, eps=self.eps, opts=self._nufft_opts,
+            )[q_idx, r_idx]
+
+        vis_flat = jax.vmap(_one)((W_flat, self._2d_x_flat, self._2d_y_flat))
+        return vis_flat.reshape(ntime, self.nfreq, self.nbls)
 
     def simulate_variable_beam_2d(self, sky_coeffs, beam_coeffs, rot_matrices):
         """Simulate all times with explicit *beam_coeffs* via the 2D path."""
@@ -622,7 +660,7 @@ class ForwardModel:
             x_j = (2.0 * jnp.pi * nu / C * xi[0]).astype(DTYPE_R)     # (npix_sky,)
             y_j = (2.0 * jnp.pi * nu / C * xi[1]).astype(DTYPE_R)
             # nufft2 with iflag=-1 is the adjoint of nufft1 with iflag=+1
-            return nufft2(grid, x_j, y_j, iflag=-1, eps=self.eps)      # (npix_sky,)
+            return nufft2(grid, x_j, y_j, iflag=-1, eps=self.eps, opts=self._nufft_opts)  # (npix_sky,)
 
         dirty_freq_first = jax.vmap(one_freq)((resid, freqs))  # (nfreq, npix_sky)
         return (dirty_freq_first.T / (self.nfreq * self.nbls))     # (npix_sky, nfreq)
