@@ -191,6 +191,8 @@ class AlternatingDirtyFitState:
 
 
 class Calibrator:
+    _GAIN_PARAM_KEYS = ('log_amp', 'phase', 'phi')
+
     def __init__(
         self,
         array: HERAArray,
@@ -244,7 +246,9 @@ class Calibrator:
         self.fwd.precompute_time_geometry(self.rot_matrices)
 
         self.pixel_mask = None  # No mask initially
-        self.npix_full = self.fwd.npix_sky  # Store full-sky pixel count
+        self._npix_full = self.fwd.npix_sky  # Store original full-sky size (before any masking)
+        self._active_size = self._npix_full   # cached; updated by apply_pixel_mask
+        self._pixel_indices = None            # int32 indices of active pixels; None means all
 
         self._select_methods()
         self._jit_loss = jax.jit(self._loss)
@@ -271,22 +275,20 @@ class Calibrator:
 
     def _get_active_size(self):
         """Return number of active pixels after masking."""
-        if self.pixel_mask is None:
-            return self.npix_full
-        return int(self.pixel_mask.sum())
+        return self._active_size
 
     def _ensure_sky_is_active(self, sky_coeffs):
         """Convert full-sky to active pixels if needed, return active sky."""
-        if sky_coeffs.shape[0] == self.npix_full:
-            if self.pixel_mask is not None:
-                return sky_coeffs[self.pixel_mask]
+        if sky_coeffs.shape[0] == self._npix_full:
+            if self._pixel_indices is not None:
+                return sky_coeffs[self._pixel_indices]
             return sky_coeffs
-        elif sky_coeffs.shape[0] == self._get_active_size():
+        elif sky_coeffs.shape[0] == self._active_size:
             return sky_coeffs
         else:
             raise ValueError(
                 f"sky_coeffs size {sky_coeffs.shape[0]} doesn't match "
-                f"full {self.npix_full} or active {self._get_active_size()}"
+                f"full {self._npix_full} or active {self._active_size}"
             )
 
     def _params_to_active_space(self, params):
@@ -303,7 +305,7 @@ class Calibrator:
         # Beam coeffs are never masked (independent of sky pixel mask)
         out['beam_coeffs'] = params.get('beam_coeffs')
 
-        for key in ('log_amp', 'phase', 'phi'):
+        for key in self._GAIN_PARAM_KEYS:
             out[key] = params.get(key)
         return out
 
@@ -322,12 +324,12 @@ class Calibrator:
         if 'sky_coeffs' in params_active and params_active['sky_coeffs'] is not None:
             val_active = np.asarray(params_active['sky_coeffs'])
             nmodes = val_active.shape[1] if val_active.ndim > 1 else 1
-            val_full = np.zeros((self.npix_full, nmodes), dtype=val_active.dtype)
+            val_full = np.zeros((self._npix_full, nmodes), dtype=val_active.dtype)
             if params_input_full is not None and 'sky_coeffs' in params_input_full:
                 orig = params_input_full['sky_coeffs']
-                if orig is not None and orig.shape[0] == self.npix_full:
+                if orig is not None and orig.shape[0] == self._npix_full:
                     val_full[:] = np.asarray(orig)
-            val_full[self.pixel_mask] = val_active
+            val_full[self._pixel_indices] = val_active
             out['sky_coeffs'] = jnp.array(val_full, dtype=DTYPE_R_JAX)
         else:
             out['sky_coeffs'] = params_active.get('sky_coeffs')
@@ -335,7 +337,7 @@ class Calibrator:
         # Beam coeffs are never masked (pass through as-is)
         out['beam_coeffs'] = params_active.get('beam_coeffs')
 
-        for key in ('log_amp', 'phase', 'phi'):
+        for key in self._GAIN_PARAM_KEYS:
             out[key] = params_active.get(key)
         return out
 
@@ -483,7 +485,7 @@ class Calibrator:
 
 
     def init_params(self):
-        npix_sky = self.fwd.npix_sky
+        npix_sky = self._npix_full
         nmodes_sky = self.A_sky.shape[1]
         return {
             'sky_coeffs':  jnp.zeros((npix_sky, nmodes_sky), dtype=DTYPE_R_JAX),
@@ -520,10 +522,9 @@ class Calibrator:
             vis_model, params['log_amp'], params['phase'], params['phi'], self.bls
         )
 
-    @staticmethod
-    def _invert_gains(gain_params):
+    def _invert_gains(self, gain_params):
         """Return gain parameters with negated log_amp, phase, and phi."""
-        return {k: -gain_params[k] for k in ('log_amp', 'phase', 'phi')}
+        return {k: -gain_params[k] for k in self._GAIN_PARAM_KEYS}
 
     def calibrated_residual(self, params):
         inv = self._invert_gains(params)
@@ -562,12 +563,14 @@ class Calibrator:
             Boolean mask of pixels to keep.
         """
         mask = np.asarray(mask, dtype=bool)
-        if mask.shape[0] != self.npix_full:
+        if mask.shape[0] != self._npix_full:
             raise ValueError(
-                f"mask size {mask.shape[0]} != full sky npix_full {self.npix_full}"
+                f"mask size {mask.shape[0]} != full sky npix_full {self._npix_full}"
             )
 
         self.pixel_mask = mask.copy()
+        self._active_size = int(mask.sum())
+        self._pixel_indices = np.where(mask)[0].astype(np.int32)
         self.fwd.apply_pixel_mask(mask)
         self.fwd.precompute_time_geometry(self.rot_matrices)
         self._recompile_jit()
@@ -585,7 +588,7 @@ class Calibrator:
         mask = self.fwd.build_ever_visible_mask(self.rot_matrices)
         mask = np.asarray(mask, dtype=bool)
 
-        if self.pixel_mask is None or mask.shape[0] == self.npix_full:
+        if self.pixel_mask is None or mask.shape[0] == self._npix_full:
             self.apply_pixel_mask(mask)
         else:
             raise RuntimeError('Cannot apply horizon cut after a mask is already applied.')
@@ -599,11 +602,11 @@ class Calibrator:
 
     def expand_sky_to_full(self, sky_coeffs_masked):
         """Expand masked sky coefficients back onto the full sky grid."""
-        if self.pixel_mask is None:
+        if self._pixel_indices is None:
             raise RuntimeError('No pixel mask has been applied.')
         sky = np.asarray(sky_coeffs_masked, dtype=DTYPE_R_NPY)
-        full = np.zeros((self.npix_full, sky.shape[1]), dtype=DTYPE_R_NPY)
-        full[self.pixel_mask] = sky
+        full = np.zeros((self._npix_full, sky.shape[1]), dtype=DTYPE_R_NPY)
+        full[self._pixel_indices] = sky
         return full
 
     def fit_gains_linear(self, sky_coeffs):
@@ -682,7 +685,7 @@ class Calibrator:
         params = self._params_to_active_space(params)
 
         sky_coeffs  = params['sky_coeffs']
-        gain_params = {k: params[k] for k in ('log_amp', 'phase', 'phi')}
+        gain_params = {k: params[k] for k in self._GAIN_PARAM_KEYS}
         beam_coeffs = params['beam_coeffs']
 
         best_bc = beam_coeffs
@@ -737,18 +740,23 @@ class Calibrator:
             If a pixel mask has been applied, masked pixels have zero weighting.
         """
         ntime = self.ntime
-        npix_sky = self.fwd.npix_sky
+        npix_sky = self._npix_full
 
-        beam_weights_masked = np.zeros(npix_sky, dtype=DTYPE_R_NPY)
+        beam_weights_full = np.zeros(npix_sky, dtype=DTYPE_R_NPY)
 
         for tind in range(ntime):
             beam_spec_h = np.asarray(self.fwd._beam_spec_horizon_all[tind], dtype=DTYPE_R_NPY)
             weight = (beam_spec_h ** 2).sum(axis=-1)
-            beam_weights_masked += weight
 
-        if self.pixel_mask is not None:
-            return self.expand_sky_to_full(beam_weights_masked[:, None])[:, 0]
-        return beam_weights_masked
+            if self.pixel_mask is not None:
+                # weight is in masked space; expand to full-sky before accumulating
+                weight_full = np.zeros(npix_sky, dtype=DTYPE_R_NPY)
+                weight_full[self.fwd._pixel_indices] = weight
+                beam_weights_full += weight_full
+            else:
+                beam_weights_full += weight
+
+        return beam_weights_full
 
     def fit_sky_dirty(
         self,
@@ -778,7 +786,7 @@ class Calibrator:
         """
         sky_input_full = None
         sky_active = self._ensure_sky_is_active(sky_coeffs)
-        if sky_coeffs.shape[0] == self.npix_full:
+        if sky_coeffs.shape[0] == self._npix_full:
             sky_input_full = np.asarray(sky_coeffs)
 
         velocity = jnp.zeros_like(sky_active)
@@ -971,7 +979,7 @@ class Calibrator:
 
         sky_coeffs = state.params['sky_coeffs']
         beam_coeffs = state.params['beam_coeffs']
-        gain_params = {k: state.params[k] for k in ('log_amp', 'phase', 'phi')}
+        gain_params = {k: state.params[k] for k in self._GAIN_PARAM_KEYS}
         loss = float(state.loss)
         step = state.step
 

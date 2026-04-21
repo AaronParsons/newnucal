@@ -64,7 +64,8 @@ class ForwardModel:
 
         self.A_sky = jnp.array(sky_model.A, dtype=DTYPE_R_JAX)
 
-        self.eq_coords = jnp.array(sky_model.eq_vec)
+        self._eq_coords_full = jnp.array(sky_model.eq_vec)
+        self.eq_coords = self._eq_coords_full
 
         nfreq = len(freqs_np)
         dnu = float(freqs_np[1] - freqs_np[0])
@@ -133,13 +134,13 @@ class ForwardModel:
 
     def build_ever_visible_mask(self, rot_matrices):
         """
-        Return a boolean array of shape (npix_sky,) that is True for every
+        Return a boolean array of shape (npix_sky_full,) that is True for every
         sky pixel above the horizon (topo_z > 0) at any of the given times.
 
         Call this before :meth:`apply_pixel_mask`.
         """
         rot_ms = np.asarray(rot_matrices, dtype=DTYPE_R_NPY)
-        eq = np.asarray(self.eq_coords)   # (3, npix)
+        eq = np.asarray(self._eq_coords_full)   # (3, npix_full)
         ever_visible = np.zeros(eq.shape[1], dtype=bool)
         for i in range(rot_ms.shape[0]):
             ever_visible |= (rot_ms[i] @ eq)[2] > 0
@@ -160,7 +161,7 @@ class ForwardModel:
         mask = np.asarray(mask, dtype=bool)
         self._pixel_mask = mask
         self._pixel_indices = np.where(mask)[0].astype(np.int32)
-        eq_full = np.asarray(self.eq_coords)   # (3, npix_full)
+        eq_full = np.asarray(self._eq_coords_full)   # (3, npix_full)
         self.eq_coords = jnp.array(eq_full[:, mask], dtype=DTYPE_R_JAX)
         # Invalidate geometry
         self._geom_ready = False

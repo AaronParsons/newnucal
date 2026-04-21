@@ -357,7 +357,7 @@ class TestPixelMasking:
     def test_apply_pixel_mask_custom_mask(self, calibrator_gains_setup):
         """apply_pixel_mask should accept and apply custom masks."""
         cal, _ = calibrator_gains_setup
-        npix_full = cal.npix_full
+        npix_full = cal.fwd.npix_sky
 
         # Create a mask for first half of pixels
         mask = np.zeros(npix_full, dtype=bool)
@@ -372,7 +372,7 @@ class TestPixelMasking:
     def test_apply_pixel_mask_invalid_size(self, calibrator_gains_setup):
         """apply_pixel_mask should reject masks of wrong size."""
         cal, _ = calibrator_gains_setup
-        bad_mask = np.ones(cal.npix_full + 10, dtype=bool)
+        bad_mask = np.ones(cal.fwd.npix_sky + 10, dtype=bool)
 
         with pytest.raises(ValueError, match="mask size"):
             cal.apply_pixel_mask(bad_mask)
@@ -380,7 +380,7 @@ class TestPixelMasking:
     def test_fit_gains_linear_with_full_sky_input(self, calibrator_gains_setup, sky_coeffs_true):
         """fit_gains_linear should accept full-sky parameters."""
         cal, _ = calibrator_gains_setup
-        npix_full = cal.npix_full
+        npix_full = cal.fwd.npix_sky
 
         # Apply mask
         mask = np.zeros(npix_full, dtype=bool)
@@ -399,7 +399,7 @@ class TestPixelMasking:
     def test_fit_gains_linear_with_masked_input(self, calibrator_gains_setup, sky_coeffs_true):
         """fit_gains_linear should accept masked parameters."""
         cal, _ = calibrator_gains_setup
-        npix_full = cal.npix_full
+        npix_full = cal.fwd.npix_sky
 
         # Apply mask
         mask = np.zeros(npix_full, dtype=bool)
@@ -418,7 +418,7 @@ class TestPixelMasking:
     def test_fit_sky_dirty_returns_full_sky(self, calibrator_gains_setup, sky_coeffs_true):
         """fit_sky_dirty should always return full-sky parameters."""
         cal, _ = calibrator_gains_setup
-        npix_full = cal.npix_full
+        npix_full = cal.fwd.npix_sky
 
         # Apply mask
         mask = np.zeros(npix_full, dtype=bool)
@@ -436,7 +436,7 @@ class TestPixelMasking:
     def test_fit_sky_dirty_unsolved_pixels_unchanged(self, calibrator_gains_setup, sky_coeffs_true):
         """Unsolved sky pixels should keep their original values."""
         cal, _ = calibrator_gains_setup
-        npix_full = cal.npix_full
+        npix_full = cal.fwd.npix_sky
 
         # Apply mask (first half only)
         mask = np.zeros(npix_full, dtype=bool)
@@ -457,7 +457,7 @@ class TestPixelMasking:
     def test_fit_alternating_dirty_returns_full_sky(self, calibrator_gains_setup):
         """fit_alternating_dirty should always return full-sky parameters."""
         cal, _ = calibrator_gains_setup
-        npix_full = cal.npix_full
+        npix_full = cal.fwd.npix_sky
 
         # Apply mask
         mask = np.zeros(npix_full, dtype=bool)
@@ -470,6 +470,29 @@ class TestPixelMasking:
 
         # Output should be full-sky
         assert params_out['sky_coeffs'].shape[0] == npix_full
+
+    def test_apply_pixel_mask_twice(self, calibrator_gains_setup):
+        """Applying two different masks sequentially should work correctly."""
+        cal, _ = calibrator_gains_setup
+        npix_full = cal.fwd.npix_sky
+
+        # First mask: first half of pixels
+        mask1 = np.zeros(npix_full, dtype=bool)
+        mask1[:npix_full//2] = True
+        cal.apply_pixel_mask(mask1)
+        npix_after_first = cal.fwd.npix_sky
+        assert npix_after_first == int(mask1.sum())
+
+        # Second mask: within the remaining pixels, keep every other one
+        mask2 = np.zeros(npix_full, dtype=bool)
+        mask2[::2] = True
+        mask2 = mask2 & mask1  # Combine masks
+        cal.apply_pixel_mask(mask2)
+        npix_after_second = cal.fwd.npix_sky
+        assert npix_after_second == int(mask2.sum())
+
+        # Verify coordinates have correct size
+        assert cal.fwd.eq_coords.shape[1] == npix_after_second
 
 
 class TestSkyBeamWeighting:
@@ -498,7 +521,7 @@ class TestSkyBeamWeighting:
     def test_beam_weighting_expanded_after_horizon_cut(self, calibrator_gains_setup, sky_coeffs_true):
         """After horizon cut, beam weights should be expanded to full sky with zeros for masked pixels."""
         cal, _ = calibrator_gains_setup
-        npix_full_before = cal.npix_full
+        npix_full_before = cal.fwd.npix_sky
         npix_active = cal.apply_horizon_cut()
 
         weights_after_cut = cal.get_sky_beam_weighting()
