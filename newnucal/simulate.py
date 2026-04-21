@@ -308,6 +308,7 @@ class ForwardModel:
             self._tgt_x, self._tgt_y, self._tgt_z,
             iflag=1,
             eps=self.eps,
+            opts=self._nufft_opts,
         )
         return vis_flat.reshape(self.nfreq, self.nbls)
 
@@ -331,6 +332,7 @@ class ForwardModel:
             self._src_x_all[tind], self._src_y_all[tind], self._src_z_all[tind],
             iflag=1,
             eps=self.eps,
+            opts=self._nufft_opts,
         )
         dirty = jnp.conj(dirty_flat.reshape(self.npix_sky, self.ndelay_eff))
         return dirty / (self.nfreq * self.nbls)
@@ -508,6 +510,7 @@ class ForwardModel:
             self._tgt_x, self._tgt_y, self._tgt_z,
             iflag=1,
             eps=self.eps,
+            opts=self._nufft_opts,
         )
         return vis_flat.reshape(self.nfreq, self.nbls)
 
