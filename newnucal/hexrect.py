@@ -31,11 +31,13 @@ k + N//2, so integer axial coords q, r map to indices q + n_q//2, r + n_r//2.
 
 import numpy as np
 
+DTYPE_R = np.float32
+
 try:
     from fftvis.utils import speed_of_light as _C_import
-    C = float(_C_import)
+    C = DTYPE_R(_C_import)
 except ImportError:
-    C = 299_792_458.0
+    C = DTYPE_R(299_792_458.0)
 
 
 def critical_channel_spacing(bmax_m, field_radius=1.0, safety=1.0):
@@ -78,9 +80,9 @@ def hex_lattice_matrix(array):
 
     Returns
     -------
-    A_lat : np.ndarray, shape (2, 2), float64
+    A_lat : np.ndarray, shape (2, 2)
     """
-    return (-C * array.basis_matrix[:2, :2].T).astype(np.float64)
+    return -C * array.basis_matrix[:2, :2].T
 
 
 def axial_grid_size(bl_grid):

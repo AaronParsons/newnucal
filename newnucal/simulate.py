@@ -65,7 +65,7 @@ class ForwardModel:
         self.eta_max = eta_max
         self.eta_padding = float(eta_padding)
 
-        freqs_np = np.asarray(freqs, dtype=np.float64)
+        freqs_np = np.asarray(freqs, dtype=DTYPE_R_NPY)
         self.freqs = jnp.array(freqs_np, dtype=DTYPE_R)
 
         self.A_beam = jnp.array(beam_model.A, dtype=DTYPE_R)
@@ -100,7 +100,7 @@ class ForwardModel:
         self._phase = self._phase_full[self._eta_idx]
         self.ndelay_eff = int(eta_idx_np.size)
 
-        bls_np = np.asarray(array.bls, dtype=np.float64)
+        bls_np = np.asarray(array.bls, dtype=DTYPE_R_NPY)
         nbls = bls_np.shape[0]
         tgt_x = (freqs_np[:, None] * bls_np[None, :, 0] / C).ravel()
         tgt_y = (freqs_np[:, None] * bls_np[None, :, 1] / C).ravel()
@@ -272,7 +272,7 @@ class ForwardModel:
         # one per time step.  Kept as a list so that beam solving can be done with
         # a per-time Python loop without stacking into a single large array.
         self._interp_px_all  = interp_px_all   # list[np.ndarray(4, npix_sky), int32]
-        self._interp_wgt_all = interp_wgt_all  # list[np.ndarray(4, npix_sky), float32]
+        self._interp_wgt_all = interp_wgt_all  # list[np.ndarray(4, npix_sky), DTYPE_R]
 
         self._geom_ready = True
         # Invalidate any cached JIT compilation: the precomputed arrays are

@@ -22,6 +22,7 @@ from typing import Any
 
 import numpy as np
 
+DTYPE_R = np.float32
 
 @dataclass(slots=True)
 class RFIConfig:
@@ -68,15 +69,15 @@ class RFIConfig:
 
 def _as_tf(arr: np.ndarray | None, ntime: int, nfreq: int, fill_value: float = 1.0) -> np.ndarray:
     if arr is None:
-        return np.full((ntime, nfreq), fill_value, dtype=np.float32)
-    arr = np.asarray(arr, dtype=np.float32)
+        return np.full((ntime, nfreq), fill_value, dtype=DTYPE_R)
+    arr = np.asarray(arr, dtype=DTYPE_R)
     if arr.shape == (nfreq,):
         arr = np.broadcast_to(arr[None, :], (ntime, nfreq))
     elif arr.shape == (ntime, nfreq):
         pass
     else:
         raise ValueError(f"Expected shape ({nfreq},) or ({ntime}, {nfreq}), got {arr.shape}")
-    return np.array(arr, dtype=np.float32, copy=True)
+    return np.array(arr, dtype=DTYPE_R, copy=True)
 
 
 
@@ -102,8 +103,8 @@ def prepare_initial_channel_weights(
     w = _as_tf(initial_weights, ntime, nfreq, fill_value=1.0)
     if initial_flags is not None:
         flags = _as_tf(np.asarray(initial_flags, dtype=bool), ntime, nfreq, fill_value=False).astype(bool)
-        w = np.where(flags, np.float32(flagged_weight), w)
-    return np.clip(w, 0.0, 1.0).astype(np.float32)
+        w = np.where(flags, DTYPE_R(flagged_weight), w)
+    return np.clip(w, 0.0, 1.0).astype(DTYPE_R)
 
 
 
@@ -130,13 +131,13 @@ def channel_chi2_statistic(
     ntime, nfreq, _ = resid.shape
     inv_var_tf = _as_tf(inv_noise_var, ntime, nfreq, fill_value=1.0)
     chi2_tf = np.mean(np.abs(resid) ** 2, axis=2) * inv_var_tf
-    return chi2_tf.astype(np.float32)
+    return chi2_tf.astype(DTYPE_R)
 
 
 
 def smooth_frequency_statistic(stat_f: np.ndarray, window: int = 9) -> np.ndarray:
     """Rolling-median spectral baseline for a 1-D channel statistic."""
-    stat_f = np.asarray(stat_f, dtype=np.float32)
+    stat_f = np.asarray(stat_f, dtype=DTYPE_R)
     if stat_f.ndim != 1:
         raise ValueError(f"Expected 1-D statistic, got {stat_f.shape}")
     window = int(max(1, window))
@@ -160,11 +161,11 @@ def score_to_soft_weights(
     max_weight: float = 1.0,
 ) -> np.ndarray:
     """Map a positive excess score to a soft weight in ``[min_weight, max_weight]``."""
-    score = np.asarray(score, dtype=np.float32)
+    score = np.asarray(score, dtype=DTYPE_R)
     center = max(float(center), 1e-6)
     slope = max(float(slope), 1e-6)
     core = 1.0 / (1.0 + np.power(np.maximum(score, 0.0) / center, slope))
-    return np.clip(core, min_weight, max_weight).astype(np.float32)
+    return np.clip(core, min_weight, max_weight).astype(DTYPE_R)
 
 
 
@@ -219,13 +220,13 @@ def update_channel_weights_from_residuals(
         min_weight=cfg.min_weight,
         max_weight=cfg.max_weight,
     )
-    model_tf = np.broadcast_to(model_weights_f[None, :], (ntime, nfreq)).astype(np.float32)
+    model_tf = np.broadcast_to(model_weights_f[None, :], (ntime, nfreq)).astype(DTYPE_R)
 
     combined = np.power(np.clip(prior_tf, cfg.min_weight, cfg.max_weight), cfg.prior_power)
     combined *= np.power(np.clip(model_tf, cfg.min_weight, cfg.max_weight), cfg.model_power)
     combined = np.clip(combined, cfg.min_weight, cfg.max_weight)
     new_weights = cfg.blend * current_tf + (1.0 - cfg.blend) * combined
-    new_weights = np.clip(new_weights, cfg.min_weight, cfg.max_weight).astype(np.float32)
+    new_weights = np.clip(new_weights, cfg.min_weight, cfg.max_weight).astype(DTYPE_R)
 
     diagnostics = {
         "chi2_tf": chi2_tf,

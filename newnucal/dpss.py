@@ -33,7 +33,7 @@ def dpss_matrix(freqs, eta_max, eigenval_cutoff=1e-9):
 
     Returns
     -------
-    A : ndarray, shape (nfreq, nmodes), dtype float32
+    A : ndarray, shape (nfreq, nmodes), dtype
     """
     A, _ = dpss_operator(
         np.asarray(freqs, dtype=DTYPE_R),

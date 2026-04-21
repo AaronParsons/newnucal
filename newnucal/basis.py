@@ -13,11 +13,11 @@ Construction paths
 
 File format (``.npz``)
 ----------------------
-``A``          (nfreq, nmodes) float32   — orthonormal basis matrix
+``A``          (nfreq, nmodes)           — orthonormal basis matrix
 ``freqs_hz``   (nfreq,) float64          — frequency array (optional)
-``svd_mean``   (nfreq,) float32          — mean spectrum (optional)
-``svd_modes``  (n_modes, nfreq) float32  — raw SVD row-vectors (optional)
-``svd_svals``  (n_modes,) float32        — singular values (optional)
+``svd_mean``   (nfreq,)                  — mean spectrum (optional)
+``svd_modes``  (n_modes, nfreq)          — raw SVD row-vectors (optional)
+``svd_svals``  (n_modes,)                — singular values (optional)
 ``n_samples``  scalar int64              — ensemble size (optional)
 """
 
@@ -32,14 +32,14 @@ class _SpectralBasis:
 
     Parameters
     ----------
-    A : array_like, (nfreq, nmodes) float32
+    A : array_like, (nfreq, nmodes)        
         Orthonormal basis matrix.
     freqs_hz : array_like, (nfreq,) float64, optional
-    svd_mean : array_like, (nfreq,) float32, optional
+    svd_mean : array_like, (nfreq,)        , optional
         Mean spectrum used to build ``A``.
-    svd_modes : array_like, (n_modes, nfreq) float32, optional
+    svd_modes : array_like, (n_modes, nfreq)        , optional
         Raw SVD row-vectors (before QR orthonormalisation).
-    svd_svals : array_like, (n_modes,) float32, optional
+    svd_svals : array_like, (n_modes,)        , optional
         Singular values corresponding to ``svd_modes``.
     n_samples : int, optional
         Number of ensemble samples from which SVD was derived.
@@ -55,7 +55,7 @@ class _SpectralBasis:
         n_samples=None,
     ):
         self.A        = np.asarray(A, dtype=DTYPE_R)
-        self.freqs_hz = np.asarray(freqs_hz, dtype=np.float64) if freqs_hz is not None else None
+        self.freqs_hz = np.asarray(freqs_hz, dtype=DTYPE_R) if freqs_hz is not None else None
         self.svd_mean  = np.asarray(svd_mean,  dtype=DTYPE_R) if svd_mean  is not None else None
         self.svd_modes = np.asarray(svd_modes, dtype=DTYPE_R) if svd_modes is not None else None
         self.svd_svals = np.asarray(svd_svals, dtype=DTYPE_R) if svd_svals is not None else None
