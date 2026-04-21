@@ -351,3 +351,161 @@ class TestResumableAndChi2Tol:
         assert state.step < 20
         assert state.reduced_chi2 is not None
         assert state.reduced_chi2 <= 1.5
+
+
+class TestPixelMasking:
+    def test_apply_pixel_mask_custom_mask(self, calibrator_gains_setup):
+        """apply_pixel_mask should accept and apply custom masks."""
+        cal, _ = calibrator_gains_setup
+        npix_full = cal.npix_full
+
+        # Create a mask for first half of pixels
+        mask = np.zeros(npix_full, dtype=bool)
+        mask[:npix_full//2] = True
+
+        cal.apply_pixel_mask(mask)
+
+        assert cal.pixel_mask is not None
+        assert np.array_equal(cal.pixel_mask, mask)
+        assert cal.fwd.npix_sky == int(mask.sum())
+
+    def test_apply_pixel_mask_invalid_size(self, calibrator_gains_setup):
+        """apply_pixel_mask should reject masks of wrong size."""
+        cal, _ = calibrator_gains_setup
+        bad_mask = np.ones(cal.npix_full + 10, dtype=bool)
+
+        with pytest.raises(ValueError, match="mask size"):
+            cal.apply_pixel_mask(bad_mask)
+
+    def test_fit_gains_linear_with_full_sky_input(self, calibrator_gains_setup, sky_coeffs_true):
+        """fit_gains_linear should accept full-sky parameters."""
+        cal, _ = calibrator_gains_setup
+        npix_full = cal.npix_full
+
+        # Apply mask
+        mask = np.zeros(npix_full, dtype=bool)
+        mask[:npix_full//2] = True
+        cal.apply_pixel_mask(mask)
+
+        # Pass full-sky sky_coeffs
+        sky_full = sky_coeffs_true
+        assert sky_full.shape[0] == npix_full
+
+        gains, loss = cal.fit_gains_linear(sky_full)
+
+        assert gains['log_amp'].shape == (cal.ntime, cal.nfreq)
+        assert loss >= 0.0
+
+    def test_fit_gains_linear_with_masked_input(self, calibrator_gains_setup, sky_coeffs_true):
+        """fit_gains_linear should accept masked parameters."""
+        cal, _ = calibrator_gains_setup
+        npix_full = cal.npix_full
+
+        # Apply mask
+        mask = np.zeros(npix_full, dtype=bool)
+        mask[:npix_full//2] = True
+        cal.apply_pixel_mask(mask)
+
+        # Pass masked sky_coeffs
+        sky_masked = sky_coeffs_true[mask]
+        assert sky_masked.shape[0] == int(mask.sum())
+
+        gains, loss = cal.fit_gains_linear(sky_masked)
+
+        assert gains['log_amp'].shape == (cal.ntime, cal.nfreq)
+        assert loss >= 0.0
+
+    def test_fit_sky_dirty_returns_full_sky(self, calibrator_gains_setup, sky_coeffs_true):
+        """fit_sky_dirty should always return full-sky parameters."""
+        cal, _ = calibrator_gains_setup
+        npix_full = cal.npix_full
+
+        # Apply mask
+        mask = np.zeros(npix_full, dtype=bool)
+        mask[:npix_full//2] = True
+        cal.apply_pixel_mask(mask)
+
+        # Fit
+        sky_input = sky_coeffs_true
+        gain_params, _ = cal.fit_gains_linear(sky_input)
+        sky_out, _ = cal.fit_sky_dirty(sky_input, gain_params, n_iter=1)
+
+        # Output should be full-sky
+        assert sky_out.shape[0] == npix_full
+
+    def test_fit_sky_dirty_unsolved_pixels_unchanged(self, calibrator_gains_setup, sky_coeffs_true):
+        """Unsolved sky pixels should keep their original values."""
+        cal, _ = calibrator_gains_setup
+        npix_full = cal.npix_full
+
+        # Apply mask (first half only)
+        mask = np.zeros(npix_full, dtype=bool)
+        mask[:npix_full//2] = True
+        cal.apply_pixel_mask(mask)
+
+        # Store original values
+        sky_input = np.asarray(sky_coeffs_true)
+        sky_unsolved = sky_input[~mask].copy()
+
+        # Fit
+        gain_params, _ = cal.fit_gains_linear(sky_input)
+        sky_out, _ = cal.fit_sky_dirty(sky_input, gain_params, n_iter=1)
+
+        # Check unsolved pixels unchanged
+        np.testing.assert_array_almost_equal(sky_out[~mask], sky_unsolved, decimal=5)
+
+    def test_fit_alternating_dirty_returns_full_sky(self, calibrator_gains_setup):
+        """fit_alternating_dirty should always return full-sky parameters."""
+        cal, _ = calibrator_gains_setup
+        npix_full = cal.npix_full
+
+        # Apply mask
+        mask = np.zeros(npix_full, dtype=bool)
+        mask[: npix_full//2] = True
+        cal.apply_pixel_mask(mask)
+
+        # Fit
+        params = cal.init_params()
+        params_out, _ = cal.fit_alternating_dirty(params, n_iter=1, verbose=False)
+
+        # Output should be full-sky
+        assert params_out['sky_coeffs'].shape[0] == npix_full
+
+
+class TestSkyBeamWeighting:
+    def test_beam_weighting_shape_full_sky(self, calibrator_gains_setup):
+        """get_sky_beam_weighting should return per-pixel weights for full sky."""
+        cal, _ = calibrator_gains_setup
+        weights = cal.get_sky_beam_weighting()
+
+        assert weights.shape == (cal.fwd.npix_sky,)
+
+    def test_beam_weighting_positive(self, calibrator_gains_setup):
+        """Beam weights should be non-negative (squared magnitudes)."""
+        cal, _ = calibrator_gains_setup
+        weights = cal.get_sky_beam_weighting()
+
+        assert np.all(weights >= 0.0)
+
+    def test_beam_weighting_data_independent(self, calibrator_gains_setup):
+        """Beam weights should be independent of data, only depend on beam/geometry."""
+        cal, _ = calibrator_gains_setup
+        weights1 = cal.get_sky_beam_weighting()
+        weights2 = cal.get_sky_beam_weighting()
+
+        np.testing.assert_array_equal(weights1, weights2)
+
+    def test_beam_weighting_expanded_after_horizon_cut(self, calibrator_gains_setup, sky_coeffs_true):
+        """After horizon cut, beam weights should be expanded to full sky with zeros for masked pixels."""
+        cal, _ = calibrator_gains_setup
+        npix_full_before = cal.npix_full
+        npix_active = cal.apply_horizon_cut()
+
+        weights_after_cut = cal.get_sky_beam_weighting()
+
+        # After horizon cut, result is expanded back to full sky
+        assert weights_after_cut.shape == (npix_full_before,)
+        # Masked pixels have zero weight
+        assert np.all(weights_after_cut[~cal.pixel_mask] == 0.0)
+        # Active pixels have nonzero weight (from the reduced set)
+        assert np.sum(weights_after_cut[cal.pixel_mask]) > 0.0

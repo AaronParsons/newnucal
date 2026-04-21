@@ -243,6 +243,9 @@ class Calibrator:
         )
         self.fwd.precompute_time_geometry(self.rot_matrices)
 
+        self.pixel_mask = None  # No mask initially
+        self.npix_full = self.fwd.npix_sky  # Store full-sky pixel count
+
         self._select_methods()
         self._jit_loss = jax.jit(self._loss)
         self._jit_val_grad = jax.jit(jax.value_and_grad(self._loss))
@@ -266,6 +269,76 @@ class Calibrator:
             self._sky_update_fn   = self.fwd.accumulate_equatorial_sky_update
             self._beam_update_fn  = self.fwd.accumulate_beam_update
 
+    def _get_active_size(self):
+        """Return number of active pixels after masking."""
+        if self.pixel_mask is None:
+            return self.npix_full
+        return int(self.pixel_mask.sum())
+
+    def _ensure_sky_is_active(self, sky_coeffs):
+        """Convert full-sky to active pixels if needed, return active sky."""
+        if sky_coeffs.shape[0] == self.npix_full:
+            if self.pixel_mask is not None:
+                return sky_coeffs[self.pixel_mask]
+            return sky_coeffs
+        elif sky_coeffs.shape[0] == self._get_active_size():
+            return sky_coeffs
+        else:
+            raise ValueError(
+                f"sky_coeffs size {sky_coeffs.shape[0]} doesn't match "
+                f"full {self.npix_full} or active {self._get_active_size()}"
+            )
+
+    def _params_to_active_space(self, params):
+        """Convert parameter dict from full-sky to active pixels if masked.
+
+        Only sky_coeffs are masked; beam_coeffs are always full-size.
+        """
+        out = {}
+        if 'sky_coeffs' in params and params['sky_coeffs'] is not None:
+            out['sky_coeffs'] = self._ensure_sky_is_active(params['sky_coeffs'])
+        else:
+            out['sky_coeffs'] = params.get('sky_coeffs')
+
+        # Beam coeffs are never masked (independent of sky pixel mask)
+        out['beam_coeffs'] = params.get('beam_coeffs')
+
+        for key in ('log_amp', 'phase', 'phi'):
+            out[key] = params.get(key)
+        return out
+
+    def _params_to_full_space(self, params_active, params_input_full=None):
+        """Convert parameter dict from active space back to full-sky.
+
+        Only sky_coeffs are expanded to full-sky; beam_coeffs are never masked.
+        Unsolved sky pixels keep their original values from params_input_full.
+        """
+        if self.pixel_mask is None:
+            return params_active
+
+        out = {}
+
+        # Expand sky_coeffs to full-sky
+        if 'sky_coeffs' in params_active and params_active['sky_coeffs'] is not None:
+            val_active = np.asarray(params_active['sky_coeffs'])
+            nmodes = val_active.shape[1] if val_active.ndim > 1 else 1
+            val_full = np.zeros((self.npix_full, nmodes), dtype=val_active.dtype)
+            if params_input_full is not None and 'sky_coeffs' in params_input_full:
+                orig = params_input_full['sky_coeffs']
+                if orig is not None and orig.shape[0] == self.npix_full:
+                    val_full[:] = np.asarray(orig)
+            val_full[self.pixel_mask] = val_active
+            out['sky_coeffs'] = jnp.array(val_full, dtype=DTYPE_R_JAX)
+        else:
+            out['sky_coeffs'] = params_active.get('sky_coeffs')
+
+        # Beam coeffs are never masked (pass through as-is)
+        out['beam_coeffs'] = params_active.get('beam_coeffs')
+
+        for key in ('log_amp', 'phase', 'phi'):
+            out[key] = params_active.get(key)
+        return out
+
     def _effective_weights(self):
         return (self.channel_weights * self.inv_noise_var).astype(DTYPE_R_JAX)
 
@@ -281,14 +354,16 @@ class Calibrator:
 
     def _loss(self, params, weights):
         """Loss function with weights passed explicitly to avoid JIT constant baking."""
-        vis_model = self._sim_fn(params['sky_coeffs'], self.rot_matrices)
+        sky_coeffs = self._ensure_sky_is_active(params['sky_coeffs'])
+        vis_model = self._sim_fn(sky_coeffs, self.rot_matrices)
         vis_cal = apply_gains(vis_model, params['log_amp'], params['phase'], params['phi'], self.bls)
         return jnp.sum(weights[:, :, None] * (jnp.abs(self.data - vis_cal) ** 2))
 
     def _loss_variable_beam(self, params, weights):
         """Loss function (variable beam) with weights passed explicitly."""
+        sky_coeffs = self._ensure_sky_is_active(params['sky_coeffs'])
         vis_model = self._var_beam_sim_fn(
-            params['sky_coeffs'], params['beam_coeffs'], self.rot_matrices
+            sky_coeffs, params['beam_coeffs'], self.rot_matrices
         )
         vis_cal = apply_gains(vis_model, params['log_amp'], params['phase'], params['phi'], self.bls)
         return jnp.sum(weights[:, :, None] * (jnp.abs(self.data - vis_cal) ** 2))
@@ -428,17 +503,19 @@ class Calibrator:
             Must include ``sky_coeffs``, ``log_amp``, ``phase``, ``phi``.
             If ``beam_coeffs`` is present, ``simulate_variable_beam`` is used;
             otherwise the precomputed beam cache is used.
+            sky_coeffs can be full-sky or masked format.
 
         Returns
         -------
         vis : jnp.ndarray, shape (ntime, nfreq, nbls), complex64
         """
+        sky_coeffs = self._ensure_sky_is_active(params['sky_coeffs'])
         if 'beam_coeffs' in params:
             vis_model = self._var_beam_sim_fn(
-                params['sky_coeffs'], params['beam_coeffs'], self.rot_matrices
+                sky_coeffs, params['beam_coeffs'], self.rot_matrices
             )
         else:
-            vis_model = self._sim_fn(params['sky_coeffs'], self.rot_matrices)
+            vis_model = self._sim_fn(sky_coeffs, self.rot_matrices)
         return apply_gains(
             vis_model, params['log_amp'], params['phase'], params['phi'], self.bls
         )
@@ -451,15 +528,17 @@ class Calibrator:
     def calibrated_residual(self, params):
         inv = self._invert_gains(params)
         data_cal = apply_gains(self.data, inv['log_amp'], inv['phase'], inv['phi'], self.bls)
-        vis_model = self._sim_fn(params['sky_coeffs'], self.rot_matrices)
+        sky_coeffs = self._ensure_sky_is_active(params['sky_coeffs'])
+        vis_model = self._sim_fn(sky_coeffs, self.rot_matrices)
         resid = data_cal - vis_model
         return resid * (self.channel_weights * self.inv_noise_var)[:, :, None].astype(DTYPE_C_JAX)
 
     def calibrated_residual_variable_beam(self, params):
         inv = self._invert_gains(params)
         data_cal = apply_gains(self.data, inv['log_amp'], inv['phase'], inv['phi'], self.bls)
+        sky_coeffs = self._ensure_sky_is_active(params['sky_coeffs'])
         vis_model = self._var_beam_sim_fn(
-            params['sky_coeffs'], params['beam_coeffs'], self.rot_matrices
+            sky_coeffs, params['beam_coeffs'], self.rot_matrices
         )
         resid = data_cal - vis_model
         return resid * (self.channel_weights * self.inv_noise_var)[:, :, None].astype(DTYPE_C_JAX)
@@ -468,69 +547,82 @@ class Calibrator:
     # Pixel-cut helpers
     # ------------------------------------------------------------------
 
+    def apply_pixel_mask(self, mask):
+        """Apply an arbitrary pixel mask controlling which pixels are solved.
+
+        Pixels where mask is True will be simulated and solved for.
+        Pixels where mask is False are left at their original values.
+
+        Note: Masks are permanent and cannot be removed; create a new Calibrator
+        if you need to work with different masks.
+
+        Parameters
+        ----------
+        mask : array_like, shape (npix_full,)
+            Boolean mask of pixels to keep.
+        """
+        mask = np.asarray(mask, dtype=bool)
+        if mask.shape[0] != self.npix_full:
+            raise ValueError(
+                f"mask size {mask.shape[0]} != full sky npix_full {self.npix_full}"
+            )
+
+        self.pixel_mask = mask.copy()
+        self.fwd.apply_pixel_mask(mask)
+        self.fwd.precompute_time_geometry(self.rot_matrices)
+        self._recompile_jit()
+
+        n_keep = int(mask.sum())
+        n_drop = int((~mask).sum())
+        print(f'  Pixel mask: {n_keep} pixels retained, {n_drop} removed.')
+
     def apply_horizon_cut(self, params=None):
         """Remove sky pixels that are never above the horizon.
 
-        Idempotent: after the first call, later calls reuse the stored full-sky
-        mask instead of recomputing it on the already-masked active sky.
-
-        If *params* is provided, return a horizon-cut parameter dict with
-        ``sky_coeffs`` masked consistently and store the mask on the calibrator.
+        Convenience wrapper around apply_pixel_mask.
+        Always returns number of kept pixels (no longer takes params).
         """
-        if getattr(self, 'horizon_mask', None) is None:
-            mask = self.fwd.build_ever_visible_mask(self.rot_matrices)
-            self.horizon_mask = np.asarray(mask, dtype=bool)
-            self.horizon_npix_full = int(mask.size)
-            self.fwd.apply_pixel_mask(mask)
-            self.fwd.precompute_time_geometry(self.rot_matrices)
-            self._recompile_jit()
-            n_keep = int(mask.sum())
-            n_drop = int((~mask).sum())
-            print(f'  Horizon cut: {n_keep} pixels retained, {n_drop} removed.')
+        mask = self.fwd.build_ever_visible_mask(self.rot_matrices)
+        mask = np.asarray(mask, dtype=bool)
+
+        if self.pixel_mask is None or mask.shape[0] == self.npix_full:
+            self.apply_pixel_mask(mask)
         else:
-            mask = self.horizon_mask
+            raise RuntimeError('Cannot apply horizon cut after a mask is already applied.')
 
-        if params is None:
-            return int(mask.sum())
-        return self.apply_horizon_mask_to_params(params)
-
-    def apply_horizon_mask_to_params(self, params):
-        """Return a copy of *params* with sky_coeffs masked to active pixels."""
-        mask = getattr(self, 'horizon_mask', None)
-        if mask is None:
-            raise RuntimeError('apply_horizon_cut() must be called before masking parameters.')
-
-        out = dict(params)
-        if 'sky_coeffs' in out and out['sky_coeffs'] is not None:
-            sky = np.asarray(out['sky_coeffs'])
-            if sky.shape[0] == mask.size:
-                out['sky_coeffs'] = jnp.array(sky[mask], dtype=DTYPE_R_JAX)
-            elif sky.shape[0] == int(mask.sum()):
-                out['sky_coeffs'] = jnp.array(sky, dtype=DTYPE_R_JAX)
-            else:
-                raise ValueError(
-                    f"sky_coeffs first dimension {sky.shape[0]} does not match "
-                    f"full sky npix {mask.size} or masked npix {int(mask.sum())}"
-                )
-        if 'beam_coeffs' in out and out['beam_coeffs'] is not None:
-            out['beam_coeffs'] = jnp.array(out['beam_coeffs'], dtype=DTYPE_R_JAX)
-        for key in ('log_amp', 'phase', 'phi'):
-            if key in out and out[key] is not None:
-                out[key] = jnp.array(out[key], dtype=DTYPE_R_JAX)
-        return out
+        if params is not None:
+            raise ValueError(
+                'apply_horizon_cut no longer takes params. '
+                'Parameters are always returned in full-sky format.'
+            )
+        return int(mask.sum())
 
     def expand_sky_to_full(self, sky_coeffs_masked):
         """Expand masked sky coefficients back onto the full sky grid."""
-        mask = getattr(self, 'horizon_mask', None)
-        if mask is None:
-            raise RuntimeError('No horizon mask has been applied.')
+        if self.pixel_mask is None:
+            raise RuntimeError('No pixel mask has been applied.')
         sky = np.asarray(sky_coeffs_masked, dtype=DTYPE_R_NPY)
-        full = np.zeros((mask.size, sky.shape[1]), dtype=DTYPE_R_NPY)
-        full[mask] = sky
+        full = np.zeros((self.npix_full, sky.shape[1]), dtype=DTYPE_R_NPY)
+        full[self.pixel_mask] = sky
         return full
 
     def fit_gains_linear(self, sky_coeffs):
-        vis_model = self._jit_simulate(sky_coeffs, self.rot_matrices)  # uses _sim_fn
+        """Solve for gains with sky held fixed.
+
+        Parameters
+        ----------
+        sky_coeffs : array, shape (npix,) or (npix, nmodes)
+            Sky coefficients. Can be full-sky or active (masked) pixels.
+
+        Returns
+        -------
+        gain_params : dict
+            Gain parameters (per time/frequency, same for full/masked).
+        loss : float
+            Chi-squared loss.
+        """
+        sky_active = self._ensure_sky_is_active(sky_coeffs)
+        vis_model = self._jit_simulate(sky_active, self.rot_matrices)
 
         den = jnp.abs(vis_model) ** 2
         g_opt = self.data * jnp.conj(vis_model) / (den + 1e-30)
@@ -556,8 +648,8 @@ class Calibrator:
             'phase':   theta[:, :, 0].astype(DTYPE_R_JAX),
             'phi':     theta[:, :, 1:].transpose(0, 2, 1).astype(DTYPE_R_JAX),
         }
-        loss = float(self._jit_loss({'sky_coeffs': sky_coeffs, **gain_params}, self._effective_weights()))
-        self._fit_gains_linear_cache = (sky_coeffs, gain_params, loss)
+        loss = float(self._jit_loss({'sky_coeffs': sky_active, **gain_params}, self._effective_weights()))
+        self._fit_gains_linear_cache = (sky_active, gain_params, loss)
         return gain_params, loss
 
 
@@ -583,7 +675,12 @@ class Calibrator:
         on every inner beam step.  Candidate beam states are evaluated through
         the explicit-beam forward path and the cache is updated only once at the
         end with the best accepted beam.
+
+        Parameters are always returned in full-sky format.
         """
+        params_input = params
+        params = self._params_to_active_space(params)
+
         sky_coeffs  = params['sky_coeffs']
         gain_params = {k: params[k] for k in ('log_amp', 'phase', 'phi')}
         beam_coeffs = params['beam_coeffs']
@@ -620,7 +717,38 @@ class Calibrator:
         # Synchronize cached beam once at the end.
         self.fwd.update_beam_cache(best_bc)
         self._recompile_jit()
-        return {**params, 'beam_coeffs': best_bc}, best_loss
+
+        params_out = {'sky_coeffs': sky_coeffs, 'beam_coeffs': best_bc, **gain_params}
+        params_out_full = self._params_to_full_space(params_out, params_input)
+        return params_out_full, best_loss
+
+    def get_sky_beam_weighting(self):
+        """Return design matrix normal (Gram) diagonal for all sky pixels.
+
+        Computes the sum of squared beam-weighting coefficients across all times
+        and frequencies. This is the effective per-pixel weighting in the fixed-point
+        sky update iteration and is independent of data.
+
+        Returns
+        -------
+        beam_weights : np.ndarray, shape (npix_full,)
+            Sum of |beam_spec_h|² per sky pixel across all times and frequencies,
+            where beam_spec_h = beam × horizon mask in topocentric frame.
+            If a pixel mask has been applied, masked pixels have zero weighting.
+        """
+        ntime = self.ntime
+        npix_sky = self.fwd.npix_sky
+
+        beam_weights_masked = np.zeros(npix_sky, dtype=DTYPE_R_NPY)
+
+        for tind in range(ntime):
+            beam_spec_h = np.asarray(self.fwd._beam_spec_horizon_all[tind], dtype=DTYPE_R_NPY)
+            weight = (beam_spec_h ** 2).sum(axis=-1)
+            beam_weights_masked += weight
+
+        if self.pixel_mask is not None:
+            return self.expand_sky_to_full(beam_weights_masked[:, None])[:, 0]
+        return beam_weights_masked
 
     def fit_sky_dirty(
         self,
@@ -632,24 +760,50 @@ class Calibrator:
         momentum: float = 0.0,
         verbose: bool = False,
     ):
-        velocity = jnp.zeros_like(sky_coeffs)
-        best_sky = sky_coeffs
+        """Dirty-map sky update with optional momentum.
+
+        Parameters
+        ----------
+        sky_coeffs : array
+            Sky coefficients (full-sky or active/masked).
+        gain_params : dict
+            Gain parameters.
+
+        Returns
+        -------
+        best_sky : array
+            Updated sky coefficients in full-sky format.
+        best_loss : float
+            Best loss achieved.
+        """
+        sky_input_full = None
+        sky_active = self._ensure_sky_is_active(sky_coeffs)
+        if sky_coeffs.shape[0] == self.npix_full:
+            sky_input_full = np.asarray(sky_coeffs)
+
+        velocity = jnp.zeros_like(sky_active)
+        best_sky_active = sky_active
         _w = self._effective_weights()
-        best_loss = float(self._jit_loss({'sky_coeffs': sky_coeffs, **gain_params}, _w))
+        best_loss = float(self._jit_loss({'sky_coeffs': sky_active, **gain_params}, _w))
         for i in range(n_iter):
-            resid = self.calibrated_residual({'sky_coeffs': sky_coeffs, **gain_params})
+            resid = self.calibrated_residual({'sky_coeffs': sky_active, **gain_params})
             delta = self._sky_update_fn(resid, step_size=step_size, beam_reg=beam_reg)
             velocity = momentum * velocity + delta
-            sky_coeffs = sky_coeffs + velocity
-            loss = float(self._jit_loss({'sky_coeffs': sky_coeffs, **gain_params}, _w))
+            sky_active = sky_active + velocity
+            loss = float(self._jit_loss({'sky_coeffs': sky_active, **gain_params}, _w))
             if loss < best_loss:
                 best_loss = loss
-                best_sky = sky_coeffs
+                best_sky_active = sky_active
             else:
-                print('    WARNING: loss increased')
+                if verbose:
+                    print('    WARNING: loss increased')
             if verbose:
                 print(f'    dirty iter {i:03d}: loss={loss:.4e}')
-        return best_sky, best_loss
+
+        best_sky_full = self._params_to_full_space(
+            {'sky_coeffs': best_sky_active}, {'sky_coeffs': sky_input_full}
+        )['sky_coeffs']
+        return best_sky_full, best_loss
 
     def fit_with_rfi_reweighting(
         self,
@@ -743,19 +897,25 @@ class Calibrator:
         target_reduced_chi2: float | None = None,
         reduced_chi2_check_every: int = 1,
     ):
-        """Create a persistent state for resumable dirty alternating fits."""
+        """Create a persistent state for resumable dirty alternating fits.
+
+        Input params can be in full-sky or active (masked) format.
+        Internal state uses active format; output params are always full-sky.
+        """
         if solve_every is None:
             solve_every = {}
         if beam_anderson_history is None:
             beam_anderson_history = sky_anderson_history
 
+        params_active = self._params_to_active_space(params)
+
         state = AlternatingDirtyFitState(
             params={
-                'sky_coeffs': params['sky_coeffs'],
-                'beam_coeffs': params.get('beam_coeffs', self.fwd.beam_coeffs),
-                'log_amp': params['log_amp'],
-                'phase': params['phase'],
-                'phi': params['phi'],
+                'sky_coeffs': params_active['sky_coeffs'],
+                'beam_coeffs': params_active.get('beam_coeffs', self.fwd.beam_coeffs),
+                'log_amp': params_active['log_amp'],
+                'phase': params_active['phase'],
+                'phi': params_active['phi'],
             },
             settings=dict(
                 sky_step_size=sky_step_size,
@@ -777,11 +937,10 @@ class Calibrator:
             ),
         )
 
+        # Store full input params for later expansion to full-sky
+        state.settings['params_input_full'] = params
+
         # Only update beam cache and recompile JIT when the beam actually changed.
-        # update_beam_cache always creates a new fwd._jit_one, and _recompile_jit
-        # creates several new JIT wrappers — unnecessary churn when beam is
-        # unchanged fills JAX's LRU compilation cache, evicting previous compiled
-        # functions and causing non-deterministic recompilation.
         new_bc = state.params['beam_coeffs']
         if not np.array_equal(np.asarray(new_bc), np.asarray(self.fwd.beam_coeffs)):
             self.fwd.update_beam_cache(new_bc)
@@ -1056,6 +1215,8 @@ class Calibrator:
         Use :meth:`init_alternating_dirty_state`, :meth:`run_alternating_dirty_state`,
         and :meth:`iter_alternating_dirty` to pause and resume fits while preserving
         Anderson histories, efficiency estimates, and cadence counters.
+
+        Parameters are always returned in full-sky format.
         """
         state = self.init_alternating_dirty_state(
             params,
@@ -1079,7 +1240,8 @@ class Calibrator:
             reduced_chi2_check_every=reduced_chi2_check_every,
         )
         state = self.run_alternating_dirty_state(state, n_iter=n_iter, verbose=verbose, _stop_flag=_stop_flag)
-        return state.params, float(state.loss)
+        params_full = self._params_to_full_space(state.params, state.settings.get('params_input_full'))
+        return params_full, float(state.loss)
 
     @property
     def nfreq(self) -> int:
