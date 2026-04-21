@@ -520,7 +520,7 @@ class ForwardModel:
             grid = nufft1((n_q, n_r), W_fi, x_j, y_j, iflag=1, eps=self.eps)
             return grid[q_idx, r_idx]
 
-        return jax.lax.map(one_freq, (W.T, freqs))   # (nfreq, nbls)
+        return jax.vmap(one_freq)((W.T, freqs))   # (nfreq, nbls)
 
     def _simulate_one_2d_precomputed_sky_spec(self, sky_spec, tind):
         """2D hex-rect NUFFT forward for one time step (cached beam).
@@ -624,7 +624,7 @@ class ForwardModel:
             # nufft2 with iflag=-1 is the adjoint of nufft1 with iflag=+1
             return nufft2(grid, x_j, y_j, iflag=-1, eps=self.eps)      # (npix_sky,)
 
-        dirty_freq_first = jax.lax.map(one_freq, (resid, freqs))  # (nfreq, npix_sky)
+        dirty_freq_first = jax.vmap(one_freq)((resid, freqs))  # (nfreq, npix_sky)
         return (dirty_freq_first.T / (self.nfreq * self.nbls))     # (npix_sky, nfreq)
 
     def dirty_apparent_sky_one_time_2d(self, residual_fb, tind):
