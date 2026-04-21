@@ -12,13 +12,14 @@ import numpy as np
 import healpy
 import jax
 import jax.numpy as jnp
-from jax_finufft import nufft3
+from jax_finufft import nufft1, nufft2, nufft3
 from healjax import get_interp_weights
 import healjax
 
 from .array import HERAArray
 from .beam import BeamModel
 from .sky import SkyModel
+from .hexrect import hex_lattice_matrix, axial_grid_size
 
 DTYPE_R = jnp.float32
 DTYPE_C = jnp.complex64
@@ -106,7 +107,20 @@ class ForwardModel:
         self._tgt_y = jnp.array(tgt_y, dtype=DTYPE_R)
         self._tgt_z = jnp.array(tgt_z, dtype=DTYPE_R)
 
+        # 2D hex-rect NUFFT path.  A_lat columns are the two physical lattice
+        # basis vectors (metres); satisfies A_lat @ bl_grid[i] == bls[i,:2].
+        lat_mat = hex_lattice_matrix(array)  # (2,2) float64 metres
+        self._lat_mat_2d = jnp.array(lat_mat.astype(DTYPE_R_NPY), dtype=DTYPE_R)
+        n_q, n_r = axial_grid_size(array.bl_grid)
+        self._2d_n_q = n_q
+        self._2d_n_r = n_r
+        # FINUFFT shifted-centre convention: mode k is at array index k + N//2.
+        bl_grid_np = np.asarray(array.bl_grid[:, :2], dtype=np.int32)
+        self._2d_q_idx = jnp.array(bl_grid_np[:, 0] + n_q // 2, dtype=jnp.int32)
+        self._2d_r_idx = jnp.array(bl_grid_np[:, 1] + n_r // 2, dtype=jnp.int32)
+
         self._jit_one = jax.jit(self._simulate_one_precomputed)
+        self._jit_one_2d = jax.jit(self._simulate_one_2d_precomputed_sky_spec)
 
         self._geom_ready = False
         self._topo_all = None
@@ -115,6 +129,7 @@ class ForwardModel:
         self._src_x_all = None
         self._src_y_all = None
         self._src_z_all = None
+        self._xi_all = None
 
     # ------------------------------------------------------------------
     # Pixel masking helpers
@@ -154,7 +169,7 @@ class ForwardModel:
         # Invalidate geometry
         self._geom_ready = False
         for attr in ('_topo_all', '_horizon_all', '_beam_spec_horizon_all',
-                     '_src_x_all', '_src_y_all', '_src_z_all'):
+                     '_src_x_all', '_src_y_all', '_src_z_all', '_xi_all'):
             setattr(self, attr, None)
         return self
 
@@ -177,6 +192,7 @@ class ForwardModel:
         src_x_all = []
         src_y_all = []
         src_z_all = []
+        xi_all = []
         interp_px_all = []
         interp_wgt_all = []
 
@@ -184,6 +200,7 @@ class ForwardModel:
         bc_np = np.asarray(self.beam_coeffs)   # (npix_beam, nmodes_beam)
         ab_np = np.asarray(self.A_beam)         # (nfreq, nmodes_beam)
         eta_np = np.asarray(self._eta, dtype=DTYPE_R_NPY)
+        lat_mat_np = np.asarray(self._lat_mat_2d, dtype=DTYPE_R_NPY)  # (2,2) metres
         for i in range(ntime):
             topo = np.array(rot_ms[i] @ self.eq_coords, dtype=DTYPE_R_NPY)
             horizon = (topo[2] > 0).astype(DTYPE_R_NPY)
@@ -210,11 +227,15 @@ class ForwardModel:
             src_y = np.repeat(topo[1], ndelay).astype(DTYPE_R_NPY) * two_pi
             src_z = np.tile(eta_np, npix).astype(DTYPE_R_NPY) * two_pi
 
+            # 2D path: axial sky coordinates xi = A_lat.T @ topo[:2]
+            xi = (lat_mat_np.T @ topo[:2, :]).astype(DTYPE_R_NPY)   # (2, npix_sky)
+
             topo_all.append(topo)
             horizon_all.append(horizon)
             src_x_all.append(src_x)
             src_y_all.append(src_y)
             src_z_all.append(src_z)
+            xi_all.append(xi)
 
         self._topo_all = jnp.array(np.stack(topo_all), dtype=DTYPE_R)
         self._horizon_all = jnp.array(np.stack(horizon_all), dtype=DTYPE_R)
@@ -222,6 +243,7 @@ class ForwardModel:
         self._src_x_all = jnp.array(np.stack(src_x_all), dtype=DTYPE_R)
         self._src_y_all = jnp.array(np.stack(src_y_all), dtype=DTYPE_R)
         self._src_z_all = jnp.array(np.stack(src_z_all), dtype=DTYPE_R)
+        self._xi_all = jnp.array(np.stack(xi_all), dtype=DTYPE_R)   # (ntime, 2, npix_sky)
         # Bilinear stencil for beam solving — list of (4, npix_sky) numpy arrays,
         # one per time step.  Kept as a list so that beam solving can be done with
         # a per-time Python loop without stacking into a single large array.
@@ -233,6 +255,7 @@ class ForwardModel:
         # captured by value in the trace, so a fresh jit is needed after each
         # geometry recompute to avoid stale compiled code.
         self._jit_one = jax.jit(self._simulate_one_precomputed)
+        self._jit_one_2d = jax.jit(self._simulate_one_2d_precomputed_sky_spec)
         return self
 
     def _forward_components_from_cache_sky_spec(self, sky_spec, tind):
@@ -436,8 +459,9 @@ class ForwardModel:
         )
         self.beam_coeffs = jnp.array(bc_np, dtype=DTYPE_R)
         self.beam_model.coeffs = bc_np
-        # Invalidate compiled simulation so the new precomputed beam is used.
+        # Invalidate compiled simulations so the new precomputed beam is used.
         self._jit_one = jax.jit(self._simulate_one_precomputed)
+        self._jit_one_2d = jax.jit(self._simulate_one_2d_precomputed_sky_spec)
 
     def _simulate_one_variable_beam_sky_spec(self, sky_spec, beam_coeffs, tind):
         """Forward model for one time step with *beam_coeffs* as a traced input."""
@@ -471,6 +495,249 @@ class ForwardModel:
             self._simulate_one_variable_beam_sky_spec(sky_spec, beam_coeffs, t)
             for t in range(ntime)
         ])
+
+    # ------------------------------------------------------------------
+    # 2D hex-rect NUFFT path — forward model
+    # ------------------------------------------------------------------
+
+    def _simulate_one_2d_precomputed_sky_spec(self, sky_spec, tind):
+        """2D hex-rect NUFFT forward for one time step (cached beam).
+
+        One type-1 2D NUFFT per frequency maps sky × beam onto the uniform
+        integer-lattice uv grid; baselines are read from the grid at their
+        integer axial positions.
+
+        Parameters
+        ----------
+        sky_spec : jnp.ndarray, shape (npix_sky, nfreq)
+        tind     : int
+
+        Returns
+        -------
+        vis : jnp.ndarray, shape (nfreq, nbls), complex64
+        """
+        beam_spec_h = self._beam_spec_horizon_all[tind]   # (npix_sky, nfreq)
+        W = (sky_spec * beam_spec_h).astype(DTYPE_C)       # (npix_sky, nfreq)
+        xi = self._xi_all[tind]                            # (2, npix_sky) metres
+
+        n_q = self._2d_n_q
+        n_r = self._2d_n_r
+        q_idx = self._2d_q_idx   # (nbls,) shifted: bl_grid[:,0] + n_q//2
+        r_idx = self._2d_r_idx   # (nbls,) shifted: bl_grid[:,1] + n_r//2
+        freqs = self.freqs        # (nfreq,)
+
+        def one_freq(args):
+            W_fi, nu = args                                              # (npix_sky,), scalar
+            x_j = (2.0 * jnp.pi * nu / C * xi[0]).astype(DTYPE_R)      # (npix_sky,)
+            y_j = (2.0 * jnp.pi * nu / C * xi[1]).astype(DTYPE_R)      # (npix_sky,)
+            grid = nufft1((n_q, n_r), W_fi, x_j, y_j, iflag=1, eps=self.eps)   # (n_q, n_r)
+            return grid[q_idx, r_idx]                                   # (nbls,)
+
+        return jax.lax.map(one_freq, (W.T, freqs))   # (nfreq, nbls)
+
+    def _simulate_one_2d_precomputed(self, sky_coeffs, tind):
+        sky_spec = sky_coeffs @ self.A_sky.T
+        return self._simulate_one_2d_precomputed_sky_spec(sky_spec, tind)
+
+    def _simulate_one_2d_variable_beam_sky_spec(self, sky_spec, beam_coeffs, tind):
+        """2D forward for one time step with *beam_coeffs* as a traced input."""
+        px  = self._interp_px_all[tind]
+        wgt = jnp.array(self._interp_wgt_all[tind])
+        bi = jnp.sum(wgt[:, :, None] * beam_coeffs[px], axis=0)
+        beam_spec_h = (bi @ self.A_beam.T) * self._horizon_all[tind][:, None]
+        W = (sky_spec * beam_spec_h).astype(DTYPE_C)
+        xi = self._xi_all[tind]
+
+        n_q = self._2d_n_q
+        n_r = self._2d_n_r
+        q_idx = self._2d_q_idx
+        r_idx = self._2d_r_idx
+        freqs = self.freqs
+
+        def one_freq(args):
+            W_fi, nu = args
+            x_j = (2.0 * jnp.pi * nu / C * xi[0]).astype(DTYPE_R)
+            y_j = (2.0 * jnp.pi * nu / C * xi[1]).astype(DTYPE_R)
+            grid = nufft1((n_q, n_r), W_fi, x_j, y_j, iflag=1, eps=self.eps)
+            return grid[q_idx, r_idx]
+
+        return jax.lax.map(one_freq, (W.T, freqs))
+
+    def simulate_2d(self, sky_coeffs, rot_matrices):
+        """Simulate all times using the 2D hex-rect NUFFT path.
+
+        Each frequency is handled by a type-1 2D NUFFT that maps sky × beam
+        weighted pixels to a compact uniform uv grid; baselines are read from
+        that grid at their integer axial positions.
+
+        The channel spacing of *freqs* should satisfy
+        :func:`~newnucal.hexrect.critical_channel_spacing` to avoid aliasing.
+
+        Returns
+        -------
+        vis : jnp.ndarray, shape (ntime, nfreq, nbls), complex64
+        """
+        if not self._geom_ready or self._xi_all is None:
+            self.precompute_time_geometry(rot_matrices)
+        if self._topo_all.shape[0] != rot_matrices.shape[0]:
+            self.precompute_time_geometry(rot_matrices)
+        sky_spec = sky_coeffs @ self.A_sky.T
+        inds = jnp.arange(rot_matrices.shape[0], dtype=jnp.int32)
+        return jax.vmap(
+            lambda tind: self._simulate_one_2d_precomputed_sky_spec(sky_spec, tind)
+        )(inds)
+
+    def simulate_variable_beam_2d(self, sky_coeffs, beam_coeffs, rot_matrices):
+        """Simulate all times with explicit *beam_coeffs* via the 2D path."""
+        if not self._geom_ready:
+            raise RuntimeError('Call precompute_time_geometry() first.')
+        ntime = len(self._interp_px_all)
+        sky_spec = sky_coeffs @ self.A_sky.T
+        return jnp.stack([
+            self._simulate_one_2d_variable_beam_sky_spec(sky_spec, beam_coeffs, t)
+            for t in range(ntime)
+        ])
+
+    # ------------------------------------------------------------------
+    # 2D hex-rect NUFFT path — adjoint / dirty-map helpers
+    # ------------------------------------------------------------------
+
+    def adjoint_residual_one_time_2d(self, residual_fb, tind):
+        """Backproject one-time residuals to a pixel × frequency dirty map.
+
+        Adjoint of the 2D forward: scatters baseline residuals to the uniform
+        uv grid then applies a type-2 NUFFT to evaluate at sky pixel positions.
+        Returns a complex ``(npix_sky, nfreq)`` array already in frequency
+        domain — no IFFT is needed (unlike the 3D path).
+
+        Parameters
+        ----------
+        residual_fb : jnp.ndarray, shape (nfreq, nbls), complex64
+        tind        : int
+
+        Returns
+        -------
+        dirty_pf : jnp.ndarray, shape (npix_sky, nfreq), complex64
+        """
+        xi = self._xi_all[tind]    # (2, npix_sky)
+        n_q = self._2d_n_q
+        n_r = self._2d_n_r
+        q_idx = self._2d_q_idx    # (nbls,) shifted
+        r_idx = self._2d_r_idx    # (nbls,) shifted
+        freqs = self.freqs         # (nfreq,)
+        resid = residual_fb.astype(DTYPE_C)   # (nfreq, nbls)
+
+        def one_freq(args):
+            resid_f, nu = args                                          # (nbls,), scalar
+            # Scatter residuals to (n_q, n_r) grid at shifted bl positions
+            grid = jnp.zeros((n_q, n_r), dtype=DTYPE_C).at[q_idx, r_idx].set(resid_f)
+            x_j = (2.0 * jnp.pi * nu / C * xi[0]).astype(DTYPE_R)     # (npix_sky,)
+            y_j = (2.0 * jnp.pi * nu / C * xi[1]).astype(DTYPE_R)
+            # nufft2 with iflag=-1 is the adjoint of nufft1 with iflag=+1
+            return nufft2(grid, x_j, y_j, iflag=-1, eps=self.eps)      # (npix_sky,)
+
+        dirty_freq_first = jax.lax.map(one_freq, (resid, freqs))  # (nfreq, npix_sky)
+        return (dirty_freq_first.T / (self.nfreq * self.nbls))     # (npix_sky, nfreq)
+
+    def dirty_apparent_sky_one_time_2d(self, residual_fb, tind):
+        """Backproject to dirty apparent sky in frequency domain (2D path).
+
+        Unlike the 3D path, the 2D adjoint already returns a frequency-domain
+        quantity, so no IFFT is needed.  This method is provided for API
+        symmetry with :meth:`dirty_apparent_sky_one_time`.
+        """
+        return self.adjoint_residual_one_time_2d(residual_fb, tind)
+
+    def apparent_sky_update_one_time_2d(
+        self,
+        residual_fb,
+        tind,
+        step_size: float = 1.0,
+        beam_reg: float = 1e-3,
+    ):
+        """Beam-weighted apparent-sky correction for one time (2D path)."""
+        dirty_pf = self.dirty_apparent_sky_one_time_2d(residual_fb, tind)
+        beam_spec_h = self._beam_spec_horizon_all[tind]   # (npix_sky, nfreq)
+        weight = jnp.abs(beam_spec_h) ** 2
+        delta_app = (
+            step_size
+            * jnp.conj(beam_spec_h.astype(DTYPE_C))
+            * dirty_pf
+            / (weight.astype(DTYPE_C) + beam_reg)
+        )
+        return delta_app, weight
+
+    def accumulate_equatorial_sky_update_2d(
+        self,
+        residual_vis,
+        step_size: float = 1.0,
+        beam_reg: float = 1e-3,
+    ):
+        """Accumulate a global equatorial sky update from all times (2D path).
+
+        Mirrors :meth:`accumulate_equatorial_sky_update` but uses the 2D
+        adjoint.
+        """
+        inds = jnp.arange(int(residual_vis.shape[0]), dtype=jnp.int32)
+
+        def one_time(resid_t, tind):
+            return self.apparent_sky_update_one_time_2d(
+                resid_t, tind, step_size=step_size, beam_reg=beam_reg
+            )
+
+        delta_all, weight_all = jax.vmap(one_time)(residual_vis, inds)
+        num = jnp.sum(weight_all.astype(DTYPE_C) * delta_all, axis=0)
+        den = jnp.sum(weight_all.real.astype(DTYPE_R), axis=0)
+        delta_eq_pf = num / (den.astype(DTYPE_C) + 1e-6)
+        delta_eq_pf = delta_eq_pf / residual_vis.shape[0]
+        delta_coeffs = (delta_eq_pf.real @ self.A_sky).astype(DTYPE_R)
+        return delta_coeffs
+
+    def accumulate_beam_update_2d(
+        self,
+        sky_coeffs,
+        residual_vis,
+        step_size: float = 1.0,
+        sky_reg: float = 1e-3,
+    ):
+        """Accumulate a global beam-coefficient update from all times (2D path).
+
+        Mirrors :meth:`accumulate_beam_update` but uses the 2D adjoint for
+        dirty apparent sky computation.
+        """
+        ab_np = np.asarray(self.A_beam, dtype=DTYPE_R_NPY)
+
+        sky_spec = np.asarray((jnp.array(sky_coeffs) @ self.A_sky.T).astype(DTYPE_C))
+        sky_weight = (sky_spec.real ** 2 + sky_spec.imag ** 2).astype(DTYPE_R_NPY)
+        sky_pow = sky_weight.sum(axis=1)
+
+        num = np.zeros((self.npix_beam, self.nmodes_beam), dtype=DTYPE_R_NPY)
+        den = np.zeros(self.npix_beam, dtype=DTYPE_R_NPY)
+
+        ntime = int(residual_vis.shape[0])
+        for tind in range(ntime):
+            dirty_pf = np.asarray(self.dirty_apparent_sky_one_time_2d(residual_vis[tind], tind))
+            horizon = np.asarray(self._horizon_all[tind])
+
+            delta_bsf = step_size * np.conj(sky_spec) * dirty_pf / (sky_weight + sky_reg)
+            delta_bi = (np.real(delta_bsf) * horizon[:, None]) @ ab_np
+
+            px  = self._interp_px_all[tind]
+            wgt = self._interp_wgt_all[tind]
+
+            px_flat = px.reshape(-1)
+            w_flat = (wgt * sky_pow[None, :]).reshape(-1)
+            contrib = (
+                w_flat[:, None]
+                * np.repeat(delta_bi[None, :, :], 4, axis=0).reshape(-1, self.nmodes_beam)
+            )
+
+            np.add.at(num, px_flat, contrib)
+            np.add.at(den, px_flat, w_flat)
+
+        delta_bc = num / (den[:, None] + 1e-6)
+        delta_bc /= ntime
+        return jnp.array(delta_bc, dtype=DTYPE_R)
 
     # ------------------------------------------------------------------
     # Properties

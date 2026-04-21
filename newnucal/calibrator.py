@@ -215,13 +215,23 @@ class Calibrator:
         channel_weights=None,
         inv_noise_var=None,
         noise_sigma=None,
+        method: str = '3d',
     ):
         """
         Parameters
         ----------
         sky_model : SkyModel
             Sky model providing ``nside`` and the spectral basis ``A_sky``.
+        method : {'3d', '2d'}
+            Forward-model path.  ``'3d'`` uses a single type-3 NUFFT per time
+            step (default).  ``'2d'`` uses per-frequency type-1 2D NUFFTs on
+            the compact hex-rect grid — typically 10–30× faster when the
+            channel spacing satisfies the critical Nyquist condition.
         """
+        if method not in ('3d', '2d'):
+            raise ValueError(f"method must be '3d' or '2d', got {method!r}")
+        self.method = method
+
         self.freqs = jnp.array(freqs, dtype=DTYPE_R)
         self.rot_matrices = jnp.array(rot_matrices, dtype=DTYPE_R)
         self.data = jnp.array(data, dtype=DTYPE_C)
@@ -243,14 +253,28 @@ class Calibrator:
         )
         self.fwd.precompute_time_geometry(self.rot_matrices)
 
+        self._select_methods()
         self._jit_loss = jax.jit(self._loss)
         self._jit_val_grad = jax.jit(jax.value_and_grad(self._loss))
         self._jit_loss_variable_beam = jax.jit(self._loss_variable_beam)
-        self._jit_simulate = jax.jit(self.fwd.simulate)
+        self._jit_simulate = jax.jit(self._sim_fn)
         self.set_channel_weights(channel_weights)
         self.set_inv_noise_var(inv_noise_var)
         if noise_sigma is not None:
             self.set_noise_sigma(noise_sigma)
+
+    def _select_methods(self):
+        """Bind forward/adjoint callables based on self.method."""
+        if self.method == '2d':
+            self._sim_fn          = self.fwd.simulate_2d
+            self._var_beam_sim_fn = self.fwd.simulate_variable_beam_2d
+            self._sky_update_fn   = self.fwd.accumulate_equatorial_sky_update_2d
+            self._beam_update_fn  = self.fwd.accumulate_beam_update_2d
+        else:
+            self._sim_fn          = self.fwd.simulate
+            self._var_beam_sim_fn = self.fwd.simulate_variable_beam
+            self._sky_update_fn   = self.fwd.accumulate_equatorial_sky_update
+            self._beam_update_fn  = self.fwd.accumulate_beam_update
 
     def _effective_weights(self):
         return (self.channel_weights * self.inv_noise_var).astype(DTYPE_R)
@@ -267,13 +291,13 @@ class Calibrator:
 
     def _loss(self, params, weights):
         """Loss function with weights passed explicitly to avoid JIT constant baking."""
-        vis_model = self.fwd.simulate(params['sky_coeffs'], self.rot_matrices)
+        vis_model = self._sim_fn(params['sky_coeffs'], self.rot_matrices)
         vis_cal = apply_gains(vis_model, params['log_amp'], params['phase'], params['phi'], self.bls)
         return jnp.sum(weights[:, :, None] * (jnp.abs(self.data - vis_cal) ** 2))
 
     def _loss_variable_beam(self, params, weights):
         """Loss function (variable beam) with weights passed explicitly."""
-        vis_model = self.fwd.simulate_variable_beam(
+        vis_model = self._var_beam_sim_fn(
             params['sky_coeffs'], params['beam_coeffs'], self.rot_matrices
         )
         vis_cal = apply_gains(vis_model, params['log_amp'], params['phase'], params['phi'], self.bls)
@@ -420,11 +444,11 @@ class Calibrator:
         vis : jnp.ndarray, shape (ntime, nfreq, nbls), complex64
         """
         if 'beam_coeffs' in params:
-            vis_model = self.fwd.simulate_variable_beam(
+            vis_model = self._var_beam_sim_fn(
                 params['sky_coeffs'], params['beam_coeffs'], self.rot_matrices
             )
         else:
-            vis_model = self.fwd.simulate(params['sky_coeffs'], self.rot_matrices)
+            vis_model = self._sim_fn(params['sky_coeffs'], self.rot_matrices)
         return apply_gains(
             vis_model, params['log_amp'], params['phase'], params['phi'], self.bls
         )
@@ -437,14 +461,14 @@ class Calibrator:
     def calibrated_residual(self, params):
         inv = self._invert_gains(params)
         data_cal = apply_gains(self.data, inv['log_amp'], inv['phase'], inv['phi'], self.bls)
-        vis_model = self.fwd.simulate(params['sky_coeffs'], self.rot_matrices)
+        vis_model = self._sim_fn(params['sky_coeffs'], self.rot_matrices)
         resid = data_cal - vis_model
         return resid * (self.channel_weights * self.inv_noise_var)[:, :, None].astype(DTYPE_C)
 
     def calibrated_residual_variable_beam(self, params):
         inv = self._invert_gains(params)
         data_cal = apply_gains(self.data, inv['log_amp'], inv['phase'], inv['phi'], self.bls)
-        vis_model = self.fwd.simulate_variable_beam(
+        vis_model = self._var_beam_sim_fn(
             params['sky_coeffs'], params['beam_coeffs'], self.rot_matrices
         )
         resid = data_cal - vis_model
@@ -516,7 +540,7 @@ class Calibrator:
         return full
 
     def fit_gains_linear(self, sky_coeffs):
-        vis_model = self._jit_simulate(sky_coeffs, self.rot_matrices)
+        vis_model = self._jit_simulate(sky_coeffs, self.rot_matrices)  # uses _sim_fn
 
         den = jnp.abs(vis_model) ** 2
         g_opt = self.data * jnp.conj(vis_model) / (den + 1e-30)
@@ -549,10 +573,11 @@ class Calibrator:
 
     def _recompile_jit(self):
         """Recompile cached-beam JIT functions after precomputed arrays change."""
+        self._select_methods()
         self._jit_loss = jax.jit(self._loss)
         self._jit_val_grad = jax.jit(jax.value_and_grad(self._loss))
         self._jit_loss_variable_beam = jax.jit(self._loss_variable_beam)
-        self._jit_simulate = jax.jit(self.fwd.simulate)
+        self._jit_simulate = jax.jit(self._sim_fn)
 
     def fit_beam_only(self, params, maxiter: int = 10, tol: float = 1e-7):
         """L-BFGS on beam_coeffs with sky and gains held fixed.
@@ -581,7 +606,7 @@ class Calibrator:
         bls = self.bls
 
         def beam_loss(bc):
-            vis_model = self.fwd.simulate_variable_beam(sky_coeffs, bc, self.rot_matrices)
+            vis_model = self._var_beam_sim_fn(sky_coeffs, bc, self.rot_matrices)
             vis_cal = apply_gains(
                 vis_model, gain_params['log_amp'], gain_params['phase'],
                 gain_params['phi'], bls,
@@ -633,7 +658,7 @@ class Calibrator:
             resid = self.calibrated_residual_variable_beam(
                 {'sky_coeffs': sky_coeffs, 'beam_coeffs': current_bc, **gain_params}
             )
-            delta_bc = self.fwd.accumulate_beam_update(
+            delta_bc = self._beam_update_fn(
                 sky_coeffs, resid, step_size=step_size, sky_reg=sky_reg,
             )
             trial_bc = current_bc + delta_bc
@@ -665,7 +690,7 @@ class Calibrator:
         data_cal = apply_gains(self.data, inv_gain_params['log_amp'], inv_gain_params['phase'], inv_gain_params['phi'], self.bls)
 
         def sky_loss(sc):
-            vis_model = self.fwd.simulate(sc, self.rot_matrices)
+            vis_model = self._sim_fn(sc, self.rot_matrices)
             return self._weighted_chi2(data_cal - vis_model)
 
         solver = LBFGS(fun=sky_loss, tol=tol, maxiter=maxiter, verbose=False, linesearch='backtracking', increase_factor=5, history_size=10, jit=True)
@@ -690,7 +715,7 @@ class Calibrator:
         best_loss = float(self._jit_loss({'sky_coeffs': sky_coeffs, **gain_params}, _w))
         for i in range(n_iter):
             resid = self.calibrated_residual({'sky_coeffs': sky_coeffs, **gain_params})
-            delta = self.fwd.accumulate_equatorial_sky_update(resid, step_size=step_size, beam_reg=beam_reg)
+            delta = self._sky_update_fn(resid, step_size=step_size, beam_reg=beam_reg)
             velocity = momentum * velocity + delta
             sky_coeffs = sky_coeffs + velocity
             loss = float(self._jit_loss({'sky_coeffs': sky_coeffs, **gain_params}, _w))
@@ -880,7 +905,7 @@ class Calibrator:
 
         def _sky_plain_step(sky, gains, current_loss):
             resid = self.calibrated_residual({'sky_coeffs': sky, **gains})
-            delta = self.fwd.accumulate_equatorial_sky_update(
+            delta = self._sky_update_fn(
                 resid, step_size=s['sky_step_size'], beam_reg=s['sky_beam_reg']
             )
             sky_trial = (sky + delta).astype(DTYPE_R)
@@ -893,7 +918,7 @@ class Calibrator:
             resid = self.calibrated_residual_variable_beam(
                 {'sky_coeffs': sky, 'beam_coeffs': beam, **gains}
             )
-            delta_bc = self.fwd.accumulate_beam_update(
+            delta_bc = self._beam_update_fn(
                 sky, resid, step_size=s['beam_step_size'], sky_reg=s['beam_sky_reg']
             )
             beam_trial = (beam + delta_bc).astype(DTYPE_R)
