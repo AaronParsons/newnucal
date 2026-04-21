@@ -229,9 +229,9 @@ def test_adjoint_consistency_2d(forward_model, A_sky):
     # Inner products (using <a,b> = sum conj(a)*b convention)
     lhs = complex(jnp.sum(jnp.conj(vis[0]) * resid[0]))
 
-    # <W, dirty_pf * norm>  — undo the 1/(nfreq*nbls) normalisation in the adjoint
+    # <W, dirty_pf * norm>  — undo the 1/nbls normalisation in the adjoint
     rhs_unnorm = complex(
-        jnp.sum(jnp.conj(W) * dirty_pf) * (forward_model.nfreq * forward_model.nbls)
+        jnp.sum(jnp.conj(W) * dirty_pf) * forward_model.nbls
     )
 
     ratio = abs(lhs) / (abs(rhs_unnorm) + 1e-30)
@@ -246,6 +246,113 @@ def test_simulate_2d_is_complex(forward_model, A_sky):
     rot_m = _identity_rot()[None, :, :]
     vis = forward_model.simulate_2d(sky_coeffs, rot_m)
     assert jnp.issubdtype(vis.dtype, jnp.complexfloating)
+
+
+def test_adjoint_normalization_2d_matches_3d(forward_model, A_sky):
+    """2D and 3D dirty-sky amplitudes agree for the same residual.
+
+    Both paths implement the same adjoint (F^H of the same forward), so
+    dirty_apparent_sky_one_time_2d and dirty_apparent_sky_one_time should
+    produce maps of the same magnitude at each pixel and frequency.
+    """
+    import numpy as np
+
+    rng = np.random.default_rng(7)
+    npix = forward_model.npix_sky
+    nmodes = A_sky.shape[1]
+    rot_m = _identity_rot()[None, :, :]
+
+    sky_coeffs = jnp.array(rng.standard_normal((npix, nmodes)).astype(np.float32))
+    resid = jnp.array(
+        (rng.standard_normal((forward_model.nfreq, forward_model.nbls))
+         + 1j * rng.standard_normal((forward_model.nfreq, forward_model.nbls))
+        ).astype(np.complex64)
+    )
+
+    dirty_2d = forward_model.dirty_apparent_sky_one_time_2d(resid, 0)   # (npix, nfreq)
+    dirty_3d = forward_model.dirty_apparent_sky_one_time(resid, 0)       # (npix, nfreq)
+
+    rms_2d = float(jnp.sqrt(jnp.mean(jnp.abs(dirty_2d) ** 2)))
+    rms_3d = float(jnp.sqrt(jnp.mean(jnp.abs(dirty_3d) ** 2)))
+    ratio = rms_2d / (rms_3d + 1e-30)
+    assert 0.5 < ratio < 2.0, (
+        f"2D/3D dirty-sky RMS ratio={ratio:.3f}; expected ~1. "
+        f"rms_2d={rms_2d:.3e}, rms_3d={rms_3d:.3e}. "
+        "Possible adjoint normalization mismatch between the two paths."
+    )
+
+
+def test_sky_update_2d_reduces_loss(forward_model, A_sky, rot_matrices):
+    """One dirty-map sky update step should reduce the reconstruction loss.
+
+    Constructs a perturbed sky, computes the residual, applies one 2D dirty
+    step, and verifies the loss decreases.
+    """
+    import numpy as np
+
+    rng = np.random.default_rng(11)
+    npix = forward_model.npix_sky
+    nmodes = A_sky.shape[1]
+
+    sky_true = jnp.array(
+        (rng.standard_normal((npix, nmodes)) * 0.5).astype(np.float32)
+    )
+    vis_true = forward_model.simulate_2d(sky_true, rot_matrices)
+
+    sky_pert = sky_true + jnp.array(
+        (rng.standard_normal((npix, nmodes)) * 0.3 * float(jnp.std(sky_true))).astype(np.float32)
+    )
+    vis_pert = forward_model.simulate_2d(sky_pert, rot_matrices)
+
+    resid = vis_true - vis_pert   # (ntime, nfreq, nbls)
+    loss_before = float(jnp.sum(jnp.abs(resid) ** 2))
+
+    delta = forward_model.accumulate_equatorial_sky_update_2d(
+        resid, step_size=1.0, beam_reg=1e-3
+    )
+    sky_updated = (sky_pert + delta).astype(jnp.float32)
+    vis_updated = forward_model.simulate_2d(sky_updated, rot_matrices)
+    loss_after = float(jnp.sum(jnp.abs(vis_true - vis_updated) ** 2))
+
+    assert loss_after < loss_before, (
+        f"2D sky update increased loss: {loss_before:.4e} → {loss_after:.4e}. "
+        "Adjoint or sign error in the 2D update path."
+    )
+
+
+def test_sky_update_2d_direction_matches_3d(forward_model, A_sky, rot_matrices):
+    """2D and 3D accumulated sky updates point in the same direction.
+
+    For the same residual, the sky update from the 2D adjoint and the 3D
+    adjoint should have positive cosine similarity (same direction).
+    """
+    import numpy as np
+
+    rng = np.random.default_rng(17)
+    npix = forward_model.npix_sky
+    nmodes = A_sky.shape[1]
+
+    resid = jnp.array(
+        (rng.standard_normal((rot_matrices.shape[0], forward_model.nfreq, forward_model.nbls))
+         + 1j * rng.standard_normal((rot_matrices.shape[0], forward_model.nfreq, forward_model.nbls))
+        ).astype(np.complex64)
+    )
+
+    delta_2d = forward_model.accumulate_equatorial_sky_update_2d(
+        resid, step_size=1.0, beam_reg=1e-3
+    )
+    delta_3d = forward_model.accumulate_equatorial_sky_update(
+        resid, step_size=1.0, beam_reg=1e-3
+    )
+
+    cosine = float(
+        jnp.sum(delta_2d * delta_3d) /
+        (jnp.linalg.norm(delta_2d) * jnp.linalg.norm(delta_3d) + 1e-30)
+    )
+    assert cosine > 0.5, (
+        f"2D and 3D sky updates point in different directions: cosine={cosine:.3f}. "
+        "Normalization or sign mismatch in the 2D adjoint path."
+    )
 
 
 def test_calibrator_method_2d(forward_model, A_sky, rot_matrices):

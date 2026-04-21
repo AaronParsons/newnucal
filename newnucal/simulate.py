@@ -663,7 +663,10 @@ class ForwardModel:
             return nufft2(grid, x_j, y_j, iflag=-1, eps=self.eps, opts=self._nufft_opts)  # (npix_sky,)
 
         dirty_freq_first = jax.vmap(one_freq)((resid, freqs))  # (nfreq, npix_sky)
-        return (dirty_freq_first.T / (self.nfreq * self.nbls))     # (npix_sky, nfreq)
+        # Divide by nbls (per-frequency PSF amplitude) to match the 3D path scale.
+        # The 3D path's extra 1/nfreq from ifft is cancelled by 1/phase ~ nfreq,
+        # so the 3D dirty sky has amplitude ~|resid| — divide 2D by nbls to match.
+        return (dirty_freq_first.T / self.nbls)     # (npix_sky, nfreq)
 
     def dirty_apparent_sky_one_time_2d(self, residual_fb, tind):
         """Backproject to dirty apparent sky in frequency domain (2D path).
