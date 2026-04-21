@@ -25,6 +25,7 @@ import fftvis.core.antenna_gridding as _fg
 import fftvis.utils as _fu
 from .utils import DTYPE_R_NPY as DTYPE_R
 from .utils import C
+from . import hexrect
 
 class HERAArray:
     """
@@ -102,3 +103,39 @@ class HERAArray:
     @property
     def nbls(self) -> int:
         return self.antpairs.shape[0]
+
+    @property
+    def bmax(self) -> float:
+        """Maximum baseline length (m) in the East-North plane."""
+        return float(np.max(np.linalg.norm(self.bls[:, :2], axis=1)))
+
+    @property
+    def critical_channel_spacing(self) -> float:
+        """Minimum channel spacing (Hz) for alias-free 2D NUFFT path.
+
+        Uses the longest baseline length and default parameters (field_radius=1.0, safety=1.0).
+        """
+        return hexrect.critical_channel_spacing(self.bmax)
+
+    def freq_array(self, freq_min: float, freq_max: float, field_radius: float = 1.0, safety: float = 1.0) -> np.ndarray:
+        """Generate frequency array with critical channel spacing.
+
+        Parameters
+        ----------
+        freq_min : float
+            Minimum frequency (Hz).
+        freq_max : float
+            Maximum frequency (Hz).
+        field_radius : float, optional
+            Maximum sky radius in direction cosines (1.0 = full horizon). Default 1.0.
+        safety : float, optional
+            Safety factor to increase channel density (> 1). Default 1.0.
+
+        Returns
+        -------
+        np.ndarray
+            Frequency array from freq_min to freq_max with critical spacing.
+        """
+        dnu = hexrect.critical_channel_spacing(self.bmax, field_radius=field_radius, safety=safety)
+        nfreqs = int(np.ceil((freq_max - freq_min) / dnu)) + 1
+        return np.linspace(freq_min, freq_max, nfreqs, dtype=DTYPE_R)

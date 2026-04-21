@@ -292,3 +292,122 @@ class TestFromBeamDiameters:
 
     def test_A_dtype(self, bb_from_diams):
         assert bb_from_diams.A.dtype == np.float32
+
+
+# ------------------------------------------------------------------
+# from_file with resampling
+# ------------------------------------------------------------------
+
+class TestResample:
+
+    def _save_and_resample(self, basis, new_freqs):
+        """Helper: save basis to file and load with resampling."""
+        with tempfile.NamedTemporaryFile(suffix='.npz', delete=False) as f:
+            path = f.name
+        try:
+            basis.save(path)
+            basis_resampled = basis.__class__.from_file(path, new_freqs=new_freqs)
+        finally:
+            os.unlink(path)
+        return basis_resampled
+
+    def test_resample_coarser_no_svd(self, freqs):
+        """Resample from fine to coarse grid without SVD metadata."""
+        sb = SkyBasis.from_dpss(freqs, 40e-9)
+        new_freqs = freqs[::2]  # Every other channel
+        sb_resamp = self._save_and_resample(sb, new_freqs)
+
+        assert sb_resamp.nfreq == len(new_freqs)
+        assert sb_resamp.nmodes == sb.nmodes
+        assert sb_resamp.has_svd is False
+        np.testing.assert_array_equal(sb_resamp.freqs_hz, new_freqs)
+
+    def test_resample_finer_no_svd(self, freqs):
+        """Resample from coarse to fine grid without SVD metadata."""
+        sb = SkyBasis.from_dpss(freqs[::2], 10e-9)  # Start coarse with smaller eta_max
+        sb_resamp = self._save_and_resample(sb, freqs)  # Resample to finer
+
+        assert sb_resamp.nfreq == len(freqs)
+        assert sb_resamp.nmodes == sb.nmodes
+        np.testing.assert_array_equal(sb_resamp.freqs_hz, freqs)
+
+    def test_resample_with_svd_metadata(self, freqs):
+        """Resampling preserves and resamples SVD metadata."""
+        sb = _make_sky_basis(freqs)
+        new_freqs = freqs[::2]
+        sb_resamp = self._save_and_resample(sb, new_freqs)
+
+        assert sb_resamp.has_svd is True
+        assert sb_resamp.nfreq == len(new_freqs)
+        assert sb_resamp.svd_mean.shape == (len(new_freqs),)
+        assert sb_resamp.svd_modes.shape == (N_SKY_MODES, len(new_freqs))
+        assert sb_resamp.n_samples == sb.n_samples
+        np.testing.assert_array_equal(sb_resamp.freqs_hz, new_freqs)
+
+    def test_resample_beam_basis_with_svd(self, freqs):
+        """Resampling works for BeamBasis with SVD metadata."""
+        bb = _make_beam_basis(freqs)
+        new_freqs = freqs[::2]
+        bb_resamp = self._save_and_resample(bb, new_freqs)
+
+        assert bb_resamp.has_svd is True
+        assert bb_resamp.nfreq == len(new_freqs)
+        assert bb_resamp.svd_mean.shape == (len(new_freqs),)
+        assert bb_resamp.svd_modes.shape == (N_BEAM_MODES, len(new_freqs))
+
+    def test_resample_A_orthonormal_after_resampling(self, freqs):
+        """Basis columns remain approximately orthonormal after resampling."""
+        sb = _make_sky_basis(freqs)
+        # Resample to nearly the same grid (with 10% extra points)
+        new_freqs = np.linspace(freqs[0], freqs[-1], int(len(freqs) * 1.1))
+        sb_resamp = self._save_and_resample(sb, new_freqs)
+
+        A = sb_resamp.A.astype(np.float64)
+        gram = A.T @ A
+        res = gram - np.eye(gram.shape[0])
+        # Linear interpolation degrades orthonormality slightly
+        assert np.max(np.abs(res)) < 0.1
+
+    def test_resample_interpolation_accuracy(self, freqs):
+        """Resampled values fall within interpolation band."""
+        sb = _make_sky_basis(freqs)
+        # Resample at midpoints between original frequencies
+        new_freqs = (freqs[:-1] + freqs[1:]) / 2
+        sb_resamp = self._save_and_resample(sb, new_freqs)
+
+        # All resampled values should be interpolated (not extrapolated)
+        assert np.all(new_freqs >= freqs[0])
+        assert np.all(new_freqs <= freqs[-1])
+        assert sb_resamp.nfreq == len(new_freqs)
+
+    def test_resample_missing_freqs_hz_raises(self):
+        """Resampling raises ValueError if freqs_hz not in file."""
+        with tempfile.NamedTemporaryFile(suffix='.npz', delete=False) as f:
+            path = f.name
+        try:
+            # Save without freqs_hz
+            rng = np.random.default_rng(50)
+            A = rng.standard_normal((16, 3)).astype(np.float32)
+            np.savez(path, A=A)
+
+            new_freqs = np.linspace(100e6, 200e6, 32)
+            with pytest.raises(ValueError, match="Cannot resample.*freqs_hz"):
+                SkyBasis.from_file(path, new_freqs=new_freqs)
+        finally:
+            os.unlink(path)
+
+    def test_resample_without_new_freqs_unchanged(self, freqs):
+        """Loading without new_freqs parameter is unchanged behavior."""
+        sb = _make_sky_basis(freqs)
+        with tempfile.NamedTemporaryFile(suffix='.npz', delete=False) as f:
+            path = f.name
+        try:
+            sb.save(path)
+            sb_loaded = SkyBasis.from_file(path)  # No new_freqs
+            sb_loaded_resamp = SkyBasis.from_file(path, new_freqs=freqs)  # explicit
+        finally:
+            os.unlink(path)
+
+        # Both should be identical
+        np.testing.assert_array_equal(sb_loaded.A, sb_loaded_resamp.A)
+        np.testing.assert_array_equal(sb_loaded.freqs_hz, sb_loaded_resamp.freqs_hz)

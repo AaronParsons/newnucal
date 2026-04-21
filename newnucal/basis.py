@@ -216,24 +216,95 @@ class _SpectralBasis:
         return dict(np.load(path, allow_pickle=False))
 
     @classmethod
-    def _from_npz(cls, d):
+    def _from_npz(cls, d, new_freqs=None):
+        # Load the basis and optional metadata
+        A = d['A']
+        freqs_hz = d.get('freqs_hz')
+        svd_mean = d.get('svd_mean')
+        svd_modes = d.get('svd_modes')
+        svd_svals = d.get('svd_svals')
+        n_samples = int(d['n_samples']) if 'n_samples' in d else None
+
+        # Resample if requested
+        if new_freqs is not None:
+            if freqs_hz is None:
+                raise ValueError("Cannot resample: freqs_hz not found in file")
+            A, svd_mean, svd_modes = cls._resample_basis(
+                A, freqs_hz, new_freqs, svd_mean, svd_modes
+            )
+            freqs_hz = np.asarray(new_freqs, dtype=DTYPE_R)
+
         return cls(
-            A=d['A'],
-            freqs_hz=d.get('freqs_hz'),
-            svd_mean=d.get('svd_mean'),
-            svd_modes=d.get('svd_modes'),
-            svd_svals=d.get('svd_svals'),
-            n_samples=int(d['n_samples']) if 'n_samples' in d else None,
+            A=A,
+            freqs_hz=freqs_hz,
+            svd_mean=svd_mean,
+            svd_modes=svd_modes,
+            svd_svals=svd_svals,
+            n_samples=n_samples,
         )
+
+    @staticmethod
+    def _resample_basis(A, old_freqs, new_freqs, svd_mean=None, svd_modes=None):
+        """Resample basis matrix and optional SVD metadata to new frequency grid.
+
+        Parameters
+        ----------
+        A : ndarray, (nfreq_old, nmodes)
+            Basis matrix on old frequency grid.
+        old_freqs : array_like, (nfreq_old,)
+            Original frequency array.
+        new_freqs : array_like, (nfreq_new,)
+            Target frequency array.
+        svd_mean : ndarray, (nfreq_old,), optional
+            Mean spectrum to resample.
+        svd_modes : ndarray, (nmodes, nfreq_old), optional
+            SVD modes to resample (each row).
+
+        Returns
+        -------
+        A_new : ndarray, (nfreq_new, nmodes)
+        svd_mean_new : ndarray, (nfreq_new,), or None
+        svd_modes_new : ndarray, (nmodes, nfreq_new), or None
+        """
+        old_freqs = np.asarray(old_freqs)
+        new_freqs = np.asarray(new_freqs)
+
+        # Resample basis matrix: interpolate each column independently
+        A_new = np.empty((len(new_freqs), A.shape[1]), dtype=A.dtype)
+        for col in range(A.shape[1]):
+            A_new[:, col] = np.interp(new_freqs, old_freqs, A[:, col])
+
+        # Resample SVD mean if present
+        svd_mean_new = None
+        if svd_mean is not None:
+            svd_mean_new = np.interp(new_freqs, old_freqs, svd_mean).astype(svd_mean.dtype)
+
+        # Resample SVD modes if present (resample each row independently)
+        svd_modes_new = None
+        if svd_modes is not None:
+            svd_modes_new = np.empty((svd_modes.shape[0], len(new_freqs)), dtype=svd_modes.dtype)
+            for row in range(svd_modes.shape[0]):
+                svd_modes_new[row] = np.interp(new_freqs, old_freqs, svd_modes[row])
+
+        return A_new, svd_mean_new, svd_modes_new
 
 
 class BeamBasis(_SpectralBasis):
     """Spectral basis for beam models."""
 
     @classmethod
-    def from_file(cls, path):
-        """Load a :class:`BeamBasis` from a ``.npz`` file."""
-        return cls._from_npz(cls._load_arrays(path))
+    def from_file(cls, path, new_freqs=None):
+        """Load a :class:`BeamBasis` from a ``.npz`` file.
+
+        Parameters
+        ----------
+        path : str
+            Path to the ``.npz`` file.
+        new_freqs : array_like, (nfreq_new,), optional
+            If provided, resample the basis to this frequency grid using linear
+            interpolation. Requires ``freqs_hz`` to be present in the file.
+        """
+        return cls._from_npz(cls._load_arrays(path), new_freqs=new_freqs)
 
     @classmethod
     def from_beam_diameters(
@@ -294,6 +365,15 @@ class SkyBasis(_SpectralBasis):
     """Spectral basis for sky models."""
 
     @classmethod
-    def from_file(cls, path):
-        """Load a :class:`SkyBasis` from a ``.npz`` file."""
-        return cls._from_npz(cls._load_arrays(path))
+    def from_file(cls, path, new_freqs=None):
+        """Load a :class:`SkyBasis` from a ``.npz`` file.
+
+        Parameters
+        ----------
+        path : str
+            Path to the ``.npz`` file.
+        new_freqs : array_like, (nfreq_new,), optional
+            If provided, resample the basis to this frequency grid using linear
+            interpolation. Requires ``freqs_hz`` to be present in the file.
+        """
+        return cls._from_npz(cls._load_arrays(path), new_freqs=new_freqs)
