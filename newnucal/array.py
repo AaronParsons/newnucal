@@ -23,10 +23,8 @@ import numpy as np
 import hera_sim.antpos
 import fftvis.core.antenna_gridding as _fg
 import fftvis.utils as _fu
-
-DTYPE_R = np.float32
-C = _fu.speed_of_light  # m / s
-
+from .utils import DTYPE_R_NPY as DTYPE_R
+from .utils import C
 
 class HERAArray:
     """

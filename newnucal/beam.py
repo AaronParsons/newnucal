@@ -26,8 +26,7 @@ import healpy
 from pyuvdata.analytic_beam import AiryBeam
 
 from .basis import BeamBasis
-
-DTYPE_R = np.float32
+from .utils import DTYPE_R_NPY as DTYPE_R
 
 
 class BeamModel:

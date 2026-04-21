@@ -11,8 +11,7 @@ import numpy as np
 import healpy
 
 from .basis import SkyBasis
-
-DTYPE_R = np.float32
+from .utils import DTYPE_R_NPY as DTYPE_R
 
 class SkyModel:
     """Sky model on an equatorial HEALPix grid with a spectral basis.

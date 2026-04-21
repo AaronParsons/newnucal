@@ -18,11 +18,7 @@ from .dpss import dpss_project
 from .simulate import ForwardModel
 from .gains import apply_gains, init_gain_params
 from .rfi import RFIConfig, prepare_initial_channel_weights, update_channel_weights_from_residuals
-
-DTYPE_R = jnp.float32
-DTYPE_R_NPY = np.float32
-DTYPE_C = jnp.complex64
-
+from .utils import DTYPE_R_JAX, DTYPE_R_NPY, DTYPE_C_JAX
 
 class _StopFitFlag:
     def __init__(self):
@@ -232,12 +228,12 @@ class Calibrator:
             raise ValueError(f"method must be '3d' or '2d', got {method!r}")
         self.method = method
 
-        self.freqs = jnp.array(freqs, dtype=DTYPE_R)
-        self.rot_matrices = jnp.array(rot_matrices, dtype=DTYPE_R)
-        self.data = jnp.array(data, dtype=DTYPE_C)
-        self.bls = jnp.array(array.bls, dtype=DTYPE_R)
-        self.channel_weights = jnp.ones(self.data.shape[:2], dtype=DTYPE_R)
-        self.inv_noise_var = jnp.ones(self.data.shape[:2], dtype=DTYPE_R)
+        self.freqs = jnp.array(freqs, dtype=DTYPE_R_JAX)
+        self.rot_matrices = jnp.array(rot_matrices, dtype=DTYPE_R_JAX)
+        self.data = jnp.array(data, dtype=DTYPE_C_JAX)
+        self.bls = jnp.array(array.bls, dtype=DTYPE_R_JAX)
+        self.channel_weights = jnp.ones(self.data.shape[:2], dtype=DTYPE_R_JAX)
+        self.inv_noise_var = jnp.ones(self.data.shape[:2], dtype=DTYPE_R_JAX)
 
         self.A_sky = np.asarray(sky_model.A, dtype=DTYPE_R_NPY)  # (nfreq, nmodes)
         sky_nside  = sky_model.nside
@@ -277,7 +273,7 @@ class Calibrator:
             self._beam_update_fn  = self.fwd.accumulate_beam_update
 
     def _effective_weights(self):
-        return (self.channel_weights * self.inv_noise_var).astype(DTYPE_R)
+        return (self.channel_weights * self.inv_noise_var).astype(DTYPE_R_JAX)
 
     def _weighted_chi2(self, resid):
         """Weighted chi2 using the current channel_weights * inv_noise_var."""
@@ -348,9 +344,9 @@ class Calibrator:
             ``[0, 1]``. ``None`` restores unit weights.
         """
         if channel_weights is None:
-            arr = jnp.ones(self.data.shape[:2], dtype=DTYPE_R)
+            arr = jnp.ones(self.data.shape[:2], dtype=DTYPE_R_JAX)
         else:
-            arr = jnp.array(channel_weights, dtype=DTYPE_R)
+            arr = jnp.array(channel_weights, dtype=DTYPE_R_JAX)
             if arr.ndim == 1:
                 arr = jnp.broadcast_to(arr[None, :], self.data.shape[:2])
             elif arr.shape != self.data.shape[:2]:
@@ -358,14 +354,14 @@ class Calibrator:
                     f"channel_weights must have shape {(self.ntime, self.nfreq)} "
                     f"or {(self.nfreq,)}, got {arr.shape}"
                 )
-        self.channel_weights = jnp.clip(arr, 0.0, 1.0).astype(DTYPE_R)
+        self.channel_weights = jnp.clip(arr, 0.0, 1.0).astype(DTYPE_R_JAX)
 
     def set_inv_noise_var(self, inv_noise_var=None):
         """Set per-time/per-frequency inverse noise variance."""
         if inv_noise_var is None:
-            arr = jnp.ones(self.data.shape[:2], dtype=DTYPE_R)
+            arr = jnp.ones(self.data.shape[:2], dtype=DTYPE_R_JAX)
         else:
-            arr = jnp.array(inv_noise_var, dtype=DTYPE_R)
+            arr = jnp.array(inv_noise_var, dtype=DTYPE_R_JAX)
             if arr.ndim == 1:
                 arr = jnp.broadcast_to(arr[None, :], self.data.shape[:2])
             elif arr.shape != self.data.shape[:2]:
@@ -373,7 +369,7 @@ class Calibrator:
                     f"inv_noise_var must have shape {(self.ntime, self.nfreq)} "
                     f"or {(self.nfreq,)}, got {arr.shape}"
                 )
-        self.inv_noise_var = jnp.clip(arr, 0.0, jnp.inf).astype(DTYPE_R)
+        self.inv_noise_var = jnp.clip(arr, 0.0, jnp.inf).astype(DTYPE_R_JAX)
 
     def set_noise_sigma(self, noise_sigma=None):
         """Set per-time/per-frequency noise sigma.
@@ -387,7 +383,7 @@ class Calibrator:
         if noise_sigma is None:
             self.set_inv_noise_var(None)
             return
-        arr = jnp.array(noise_sigma, dtype=DTYPE_R)
+        arr = jnp.array(noise_sigma, dtype=DTYPE_R_JAX)
         if arr.ndim == 1:
             arr = jnp.broadcast_to(arr[None, :], self.data.shape[:2])
         elif arr.shape != self.data.shape[:2]:
@@ -396,7 +392,7 @@ class Calibrator:
                 f"or {(self.nfreq,)}, got {arr.shape}"
             )
         arr = jnp.clip(arr, 1e-20, jnp.inf)
-        self.inv_noise_var = (1.0 / (arr ** 2)).astype(DTYPE_R)
+        self.inv_noise_var = (1.0 / (arr ** 2)).astype(DTYPE_R_JAX)
 
     def calc_reduced_chi2(self, params, explicit_beam: bool = False, subtract_params=0):
         """Approximate reduced chi-squared under the current weights/noise model.
@@ -421,13 +417,13 @@ class Calibrator:
         npix_sky = self.fwd.npix_sky
         nmodes_sky = self.A_sky.shape[1]
         return {
-            'sky_coeffs':  jnp.zeros((npix_sky, nmodes_sky), dtype=DTYPE_R),
+            'sky_coeffs':  jnp.zeros((npix_sky, nmodes_sky), dtype=DTYPE_R_JAX),
             'beam_coeffs': jnp.array(self.fwd.beam_coeffs),
             **init_gain_params(self.ntime, self.nfreq),
         }
 
     def init_sky_from_flux(self, flux):
-        return jnp.array(dpss_project(np.asarray(flux), self.A_sky), dtype=DTYPE_R)
+        return jnp.array(dpss_project(np.asarray(flux), self.A_sky), dtype=DTYPE_R_JAX)
 
     def simulate(self, params):
         """Return gain-calibrated model visibilities for the given parameters.
@@ -463,7 +459,7 @@ class Calibrator:
         data_cal = apply_gains(self.data, inv['log_amp'], inv['phase'], inv['phi'], self.bls)
         vis_model = self._sim_fn(params['sky_coeffs'], self.rot_matrices)
         resid = data_cal - vis_model
-        return resid * (self.channel_weights * self.inv_noise_var)[:, :, None].astype(DTYPE_C)
+        return resid * (self.channel_weights * self.inv_noise_var)[:, :, None].astype(DTYPE_C_JAX)
 
     def calibrated_residual_variable_beam(self, params):
         inv = self._invert_gains(params)
@@ -472,7 +468,7 @@ class Calibrator:
             params['sky_coeffs'], params['beam_coeffs'], self.rot_matrices
         )
         resid = data_cal - vis_model
-        return resid * (self.channel_weights * self.inv_noise_var)[:, :, None].astype(DTYPE_C)
+        return resid * (self.channel_weights * self.inv_noise_var)[:, :, None].astype(DTYPE_C_JAX)
 
     # ------------------------------------------------------------------
     # Pixel-cut helpers
@@ -514,19 +510,19 @@ class Calibrator:
         if 'sky_coeffs' in out and out['sky_coeffs'] is not None:
             sky = np.asarray(out['sky_coeffs'])
             if sky.shape[0] == mask.size:
-                out['sky_coeffs'] = jnp.array(sky[mask], dtype=DTYPE_R)
+                out['sky_coeffs'] = jnp.array(sky[mask], dtype=DTYPE_R_JAX)
             elif sky.shape[0] == int(mask.sum()):
-                out['sky_coeffs'] = jnp.array(sky, dtype=DTYPE_R)
+                out['sky_coeffs'] = jnp.array(sky, dtype=DTYPE_R_JAX)
             else:
                 raise ValueError(
                     f"sky_coeffs first dimension {sky.shape[0]} does not match "
                     f"full sky npix {mask.size} or masked npix {int(mask.sum())}"
                 )
         if 'beam_coeffs' in out and out['beam_coeffs'] is not None:
-            out['beam_coeffs'] = jnp.array(out['beam_coeffs'], dtype=DTYPE_R)
+            out['beam_coeffs'] = jnp.array(out['beam_coeffs'], dtype=DTYPE_R_JAX)
         for key in ('log_amp', 'phase', 'phi'):
             if key in out and out[key] is not None:
-                out[key] = jnp.array(out[key], dtype=DTYPE_R)
+                out[key] = jnp.array(out[key], dtype=DTYPE_R_JAX)
         return out
 
     def expand_sky_to_full(self, sky_coeffs_masked):
@@ -550,21 +546,21 @@ class Calibrator:
         log_amp = (den * jnp.real(log_g)).sum(axis=2) / w_sum
 
         X = jnp.column_stack([
-            jnp.ones(self.nbls, dtype=DTYPE_R),
-            self.bls[:, 0].astype(DTYPE_R),
-            self.bls[:, 1].astype(DTYPE_R),
+            jnp.ones(self.nbls, dtype=DTYPE_R_JAX),
+            self.bls[:, 0].astype(DTYPE_R_JAX),
+            self.bls[:, 1].astype(DTYPE_R_JAX),
         ])
 
         Xy = jnp.einsum('bk,tfb->tfk', X, den * jnp.imag(log_g))
         XTX = jnp.einsum('bk,tfb,bl->tfkl', X, den, X)
-        XTX = XTX + 1e-10 * jnp.eye(3, dtype=DTYPE_R)
+        XTX = XTX + 1e-10 * jnp.eye(3, dtype=DTYPE_R_JAX)
 
         theta = jnp.linalg.solve(XTX, Xy[..., None])[..., 0]
 
         gain_params = {
-            'log_amp': log_amp.astype(DTYPE_R),
-            'phase':   theta[:, :, 0].astype(DTYPE_R),
-            'phi':     theta[:, :, 1:].transpose(0, 2, 1).astype(DTYPE_R),
+            'log_amp': log_amp.astype(DTYPE_R_JAX),
+            'phase':   theta[:, :, 0].astype(DTYPE_R_JAX),
+            'phi':     theta[:, :, 1:].transpose(0, 2, 1).astype(DTYPE_R_JAX),
         }
         loss = float(self._jit_loss({'sky_coeffs': sky_coeffs, **gain_params}, self._effective_weights()))
         self._fit_gains_linear_cache = (sky_coeffs, gain_params, loss)
@@ -908,7 +904,7 @@ class Calibrator:
             delta = self._sky_update_fn(
                 resid, step_size=s['sky_step_size'], beam_reg=s['sky_beam_reg']
             )
-            sky_trial = (sky + delta).astype(DTYPE_R)
+            sky_trial = (sky + delta).astype(DTYPE_R_JAX)
             loss_trial = float(self._jit_loss({'sky_coeffs': sky_trial, **gains}, self._effective_weights()))
             if loss_trial < current_loss:
                 return sky_trial, loss_trial
@@ -921,7 +917,7 @@ class Calibrator:
             delta_bc = self._beam_update_fn(
                 sky, resid, step_size=s['beam_step_size'], sky_reg=s['beam_sky_reg']
             )
-            beam_trial = (beam + delta_bc).astype(DTYPE_R)
+            beam_trial = (beam + delta_bc).astype(DTYPE_R_JAX)
             loss_trial = float(self._jit_loss_variable_beam(
                 {'sky_coeffs': sky, 'beam_coeffs': beam_trial, **gains},
                 self._effective_weights(),
@@ -1002,7 +998,7 @@ class Calibrator:
                 np.asarray(sky_plain, dtype=np.float64).ravel(),
             )
             if cand_flat is not None:
-                sky_cand = jnp.array(cand_flat.reshape(sky_coeffs.shape), dtype=DTYPE_R)
+                sky_cand = jnp.array(cand_flat.reshape(sky_coeffs.shape), dtype=DTYPE_R_JAX)
                 gain_cand, _ = self.fit_gains_linear(sky_cand)
                 loss_cand = float(self._jit_loss(_full_params(sky_cand, beam_coeffs, gain_cand), self._effective_weights()))
                 if loss_cand < loss_plain:
@@ -1034,7 +1030,7 @@ class Calibrator:
                 np.asarray(beam_plain, dtype=np.float64).ravel(),
             )
             if cand_flat is not None:
-                beam_cand = jnp.array(cand_flat.reshape(beam_coeffs.shape), dtype=DTYPE_R)
+                beam_cand = jnp.array(cand_flat.reshape(beam_coeffs.shape), dtype=DTYPE_R_JAX)
                 loss_cand = float(self._jit_loss_variable_beam(_full_params(sky_coeffs, beam_cand, gain_params), self._effective_weights()))
                 if loss_cand < loss_plain:
                     beam_next = beam_cand

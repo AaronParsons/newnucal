@@ -10,8 +10,7 @@ axis via  data[..., nfreq] = coeffs[..., nmodes] @ A.T .
 
 import numpy as np
 from hera_filters.dspec import dpss_operator
-
-DTYPE_R = np.float32
+from .utils import DTYPE_R_NPY as DTYPE_R
 
 def dpss_matrix(freqs, eta_max, eigenval_cutoff=1e-9):
     """

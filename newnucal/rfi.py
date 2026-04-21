@@ -21,8 +21,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-
-DTYPE_R = np.float32
+from .utils import DTYPE_R_NPY as DTYPE_R
 
 @dataclass(slots=True)
 class RFIConfig:

@@ -30,14 +30,7 @@ k + N//2, so integer axial coords q, r map to indices q + n_q//2, r + n_r//2.
 """
 
 import numpy as np
-
-DTYPE_R = np.float32
-
-try:
-    from fftvis.utils import speed_of_light as _C_import
-    C = DTYPE_R(_C_import)
-except ImportError:
-    C = DTYPE_R(299_792_458.0)
+from .utils import C
 
 
 def critical_channel_spacing(bmax_m, field_radius=1.0, safety=1.0):

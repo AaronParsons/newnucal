@@ -23,9 +23,7 @@ Applied to a baseline (i→j) with separation bls[bl, :2] = (Δe, Δn):
 
 import numpy as np
 import jax.numpy as jnp
-
-DTYPE_R = jnp.float32
-DTYPE_C = jnp.complex64
+from .utils import DTYPE_R_JAX, DTYPE_C_JAX
 
 def apply_gains(vis, log_amp, phase, phi, bls):
     """
@@ -51,10 +49,10 @@ def apply_gains(vis, log_amp, phase, phi, bls):
     """
     # phi: (ntime, 2, nfreq), bls[:, :2]: (nbls, 2)
     # phs_grad[t, f, b] = sum_x phi[t, x, f] * bls[b, x]
-    phs_grad = jnp.einsum("txf,bx->tfb", phi, bls[:, :2].astype(DTYPE_R))  # (ntime, nfreq, nbls)
+    phs_grad = jnp.einsum("txf,bx->tfb", phi, bls[:, :2].astype(DTYPE_R_JAX))  # (ntime, nfreq, nbls)
     # Total gain factor per (time, freq, baseline)
-    gain = jnp.exp(log_amp[:, :, None].astype(DTYPE_R)) * jnp.exp(
-        1j * (phase[:, :, None] + phs_grad).astype(DTYPE_C)
+    gain = jnp.exp(log_amp[:, :, None].astype(DTYPE_R_JAX)) * jnp.exp(
+        1j * (phase[:, :, None] + phs_grad).astype(DTYPE_C_JAX)
     )  # (ntime, nfreq, nbls), complex64
     return vis * gain
 
@@ -73,7 +71,7 @@ def init_gain_params(ntime: int, nfreq: int):
     params : dict with keys 'log_amp', 'phase', 'phi'
     """
     return {
-        "log_amp": jnp.zeros((ntime, nfreq), dtype=DTYPE_R),
-        "phase":   jnp.zeros((ntime, nfreq), dtype=DTYPE_R),
-        "phi":     jnp.zeros((ntime, 2, nfreq), dtype=DTYPE_R),
+        "log_amp": jnp.zeros((ntime, nfreq), dtype=DTYPE_R_JAX),
+        "phase":   jnp.zeros((ntime, nfreq), dtype=DTYPE_R_JAX),
+        "phi":     jnp.zeros((ntime, 2, nfreq), dtype=DTYPE_R_JAX),
     }

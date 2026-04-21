@@ -23,8 +23,7 @@ File format (``.npz``)
 
 import numpy as np
 from .dpss import dpss_matrix
-
-DTYPE_R = np.float32
+from .utils import DTYPE_R_NPY as DTYPE_R
 
 
 class _SpectralBasis:

@@ -50,7 +50,7 @@ def test_critical_channel_spacing_safety():
 def test_hex_lattice_matrix_shape(array):
     A_lat = hex_lattice_matrix(array)
     assert A_lat.shape == (2, 2)
-    assert A_lat.dtype == np.float64
+    assert A_lat.dtype == np.float32
 
 
 def test_hex_lattice_matrix_recovers_baselines(array):
