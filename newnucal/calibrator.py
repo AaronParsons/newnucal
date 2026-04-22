@@ -136,9 +136,16 @@ class AndersonAccelerator:
     def _solve_coeffs(F: np.ndarray, ridge: float = 1e-8) -> np.ndarray:
         """Constrained least-squares mixing coefficients.
 
-        Solves ``min ||F^T beta||`` subject to ``sum(beta) = 1`` with
-        Tikhonov regularisation ``ridge * trace(G) * I`` added to the
-        Gram matrix ``G = F F^T``.
+        Solves ``min ||F_norm^T beta||`` subject to ``sum(beta) = 1`` with
+        Tikhonov regularisation ``ridge * I`` added to the cosine-similarity
+        Gram matrix ``G = F_norm F_norm^T``, where ``F_norm`` has unit-norm rows.
+
+        Row-normalising F before forming the Gram matrix makes the solve
+        scale-invariant: the mixing weights depend only on the *directions* of
+        past residuals, not their magnitudes.  This prevents large beta
+        oscillations when history residuals are nearly collinear (as occurs
+        with eigenbasis sky parameterisations whose mode amplitudes span many
+        orders of magnitude).
 
         Parameters
         ----------
@@ -150,9 +157,12 @@ class AndersonAccelerator:
         beta : np.ndarray, shape (m,)
         """
         n = F.shape[0]
-        gram = F @ F.T
-        scale = float(np.trace(gram) / max(n, 1)) if n > 0 else 1.0
-        gram = gram + ridge * max(scale, 1.0) * np.eye(n, dtype=gram.dtype)
+        # Normalise rows to unit length so the Gram matrix is a cosine-similarity
+        # matrix with diagonal 1 regardless of residual magnitude.
+        row_norms = np.linalg.norm(F, axis=1, keepdims=True)
+        F_norm = F / np.maximum(row_norms, 1e-30)
+        gram = F_norm @ F_norm.T
+        gram = gram + ridge * np.eye(n, dtype=gram.dtype)
         kkt = np.block([
             [gram, np.ones((n, 1), dtype=gram.dtype)],
             [np.ones((1, n), dtype=gram.dtype), np.zeros((1, 1), dtype=gram.dtype)],
@@ -1125,10 +1135,12 @@ class Calibrator:
                 np.asarray(sky_coeffs, dtype=np.float64).ravel(),
                 np.asarray(sky_plain, dtype=np.float64).ravel(),
             )
+            aa_proposed = False
             if cand_flat is not None:
                 sky_cand = jnp.array(cand_flat.reshape(sky_coeffs.shape), dtype=DTYPE_R_JAX)
                 gain_cand, _ = self.fit_gains_linear(sky_cand)
                 loss_cand = float(self._jit_loss(_full_params(sky_cand, beam_coeffs, gain_cand), self._effective_weights()))
+                aa_proposed = True
                 if loss_cand < loss_plain:
                     sky_next = sky_cand
                     gain_next = gain_cand
@@ -1147,7 +1159,12 @@ class Calibrator:
             state.n_since_gains += 1
             if verbose:
                 tag = 'AA' if used_aa else '  '
-                print(f"    [sky {tag} {state.n_sky - 1:03d}]: loss={loss:.4e}  eff={eff:.2e} frac_Δloss/s")
+                line = f"    [sky {tag} {state.n_sky - 1:03d}]: loss={loss:.4e}  eff={eff:.2e} frac_Δloss/s"
+                if aa_proposed and not used_aa:
+                    line += f"  [AA rejected: cand={loss_cand:.4e} vs plain={loss_plain:.4e}]"
+                elif not aa_proposed and cand_flat is None and state.sky_acc.history > 0 and state.sky_acc._step > state.sky_acc.start and len(state.sky_acc._hist_f) >= 2:
+                    line += "  [AA filtered: beta>max_weight or non-finite]"
+                print(line)
         elif step_type == 'beam':
             beam_plain, loss_plain = _beam_plain_step(sky_coeffs, beam_coeffs, gain_params, loss)
             beam_next = beam_plain
