@@ -113,13 +113,19 @@ def main(args):
         freqs=freqs, rot_matrices=rot_matrices, data=vis_data, eps=1e-5, method='2d'
     )
 
-    # --- Apply pixel masking (same as notebook) ---
+    # --- Remove permanently below-horizon pixels and apply beam weighting ---
+    sky_alt_mask = cal.build_sky_mask_altitude(min_altitude_deg=0.0)
     bm_wgts = cal.get_sky_beam_weighting()
     threshold = bm_wgts.max() / 100
-    mask = bm_wgts > threshold
-    cal.apply_pixel_mask(mask)
-    cal.apply_ever_illuminated_beam_mask()
-    print(f"[Calibrate] Sky pixel mask: {mask.sum()} pixels retained, {(~mask).sum()} removed")
+    beam_weight_mask = bm_wgts > threshold
+    # Combine masks: keep pixels that pass both altitude and beam weighting
+    sky_mask = sky_alt_mask & beam_weight_mask
+    cal.apply_pixel_mask(sky_mask)
+
+    # --- Apply beam altitude mask ---
+    beam_alt_mask = cal.build_beam_mask_altitude(max_zenith_angle_deg=90.0)
+    cal.apply_beam_mask(beam_alt_mask)
+    print(f"[Calibrate] Sky pixel mask: {sky_mask.sum()} pixels retained, {(~sky_mask).sum()} removed")
 
     # --- Perturbed start ---
     rng2 = np.random.default_rng(99)

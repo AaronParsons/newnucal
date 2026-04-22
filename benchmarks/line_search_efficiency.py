@@ -101,7 +101,10 @@ def setup_problem():
         freqs=freqs, rot_matrices=rot_matrices, data=vis_data, eps=1e-5, method='2d'
     )
 
-    # --- Apply pixel masking ---
+    # --- Remove permanently below-horizon pixels ---
+    cal.apply_horizon_cut()
+
+    # --- Apply beam-weighting-based pixel masking ---
     bm_wgts = cal.get_sky_beam_weighting()
     threshold = bm_wgts.max() / 100
     mask = bm_wgts > threshold

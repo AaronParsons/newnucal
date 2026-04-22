@@ -189,6 +189,7 @@ class AlternatingDirtyFitState:
 
     beam_dirty_pending: bool = False
     stop_reason: str | None = None
+    subtract_static_sky: bool = False  # Whether to subtract cached static sky from data
 
 
 class Calibrator:
@@ -252,6 +253,8 @@ class Calibrator:
         self._npix_full = self.fwd.npix_sky  # Store original full-sky size (before any masking)
         self._active_size = self._npix_full   # cached; updated by apply_pixel_mask
         self._pixel_indices = None            # int32 indices of active pixels; None means all
+        self._cached_static_vis = None        # Cached visibility of static (unmasked) pixels
+        self._static_sky_cached = False       # Whether static sky contribution is cached
 
         self._select_methods()
         self._jit_loss = jax.jit(self._loss)
@@ -262,6 +265,15 @@ class Calibrator:
         self.set_inv_noise_var(inv_noise_var)
         if noise_sigma is not None:
             self.set_noise_sigma(noise_sigma)
+
+        # Warn if there are permanently below-horizon pixels
+        altitude_mask = self.build_sky_mask_altitude(min_altitude_deg=0.0)
+        npix_below_horizon = int((~altitude_mask).sum())
+        if npix_below_horizon > 0:
+            npix_above_horizon = int(altitude_mask.sum())
+            print(f"  WARNING: {npix_below_horizon} sky pixels are never above the horizon. "
+                  f"Call cal.apply_pixel_mask(cal.build_sky_mask_altitude(...)) to remove them before fitting.")
+            print(f"  ({npix_above_horizon} above-horizon pixels retained after cut)")
 
     def _select_methods(self):
         """Bind forward/adjoint callables based on self.method."""
@@ -582,26 +594,116 @@ class Calibrator:
         n_drop = int((~mask).sum())
         print(f'  Pixel mask: {n_keep} pixels retained, {n_drop} removed.')
 
-    def apply_horizon_cut(self, params=None):
-        """Remove sky pixels that are never above the horizon.
 
-        Convenience wrapper around apply_pixel_mask.
-        Always returns number of kept pixels (no longer takes params).
+    def build_sky_mask_altitude(self, min_altitude_deg=0.0):
+        """Build mask for sky pixels above minimum altitude.
+
+        Computes the maximum altitude reached by each sky pixel across all times,
+        and returns a mask of pixels that reach the specified minimum altitude.
+
+        Parameters
+        ----------
+        min_altitude_deg : float, optional
+            Minimum altitude in degrees. Default 0 (horizon).
+            Use 0 to remove permanently below-horizon pixels.
+
+        Returns
+        -------
+        np.ndarray, dtype bool, shape (npix_full,)
+            Boolean mask where True indicates pixels above the altitude threshold.
         """
-        mask = self.fwd.build_ever_visible_mask(self.rot_matrices)
-        mask = np.asarray(mask, dtype=bool)
+        return self.fwd.build_sky_mask_altitude(self.rot_matrices, min_altitude_deg)
 
-        if self.pixel_mask is None or mask.shape[0] == self._npix_full:
-            self.apply_pixel_mask(mask)
-        else:
-            raise RuntimeError('Cannot apply horizon cut after a mask is already applied.')
+    def build_beam_mask_altitude(self, max_zenith_angle_deg=90.0):
+        """Build mask for beam pixels within zenith angle limit.
 
-        if params is not None:
+        Masks beam pixels to only those within the specified angular distance from
+        zenith. The beam is fixed in the topocentric frame.
+
+        Parameters
+        ----------
+        max_zenith_angle_deg : float, optional
+            Maximum zenith angle in degrees. Default 90 (all sky above horizon).
+            Use 90 for all above-horizon pixels, lower values for narrower beams.
+
+        Returns
+        -------
+        np.ndarray, dtype bool, shape (npix_beam_full,)
+            Boolean mask where True indicates pixels within zenith angle threshold.
+        """
+        return self.fwd.build_beam_mask_altitude(self.rot_matrices, max_zenith_angle_deg)
+
+    def build_sky_mask_from_beam_pixels(self, beam_pixel_mask):
+        """Build mask for sky pixels illuminated by selected beam pixels.
+
+        Given a mask of beam pixels, returns a mask of sky pixels whose
+        HEALPix interpolation neighborhood touches at least one of the
+        selected beam pixels. This is the reverse operation of selecting
+        beam pixels that touch a given set of sky pixels.
+
+        Parameters
+        ----------
+        beam_pixel_mask : array_like, shape (npix_beam_full,), dtype bool
+            Boolean mask of beam pixels to consider. Sky pixels are selected if
+            their interpolation stencil touches any beam pixel where mask is True.
+
+        Returns
+        -------
+        sky_mask : np.ndarray, shape (npix_full,), dtype bool
+            True for sky pixels whose interpolation touches selected beam pixels.
+
+        Example
+        -------
+        Select beam pixels at high altitude, then find which sky pixels they illuminate:
+
+            beam_mask = cal.build_beam_mask_altitude(max_zenith_angle_deg=45.0)
+            sky_mask = cal.build_sky_mask_from_beam_pixels(beam_mask)
+            cal.apply_pixel_mask(sky_mask)
+        """
+        return self.fwd.build_sky_mask_from_beam_pixels(beam_pixel_mask)
+
+    def cache_static_sky_coeffs(self, sky_coeffs):
+        """Cache visibility contribution of unmasked (static) sky pixels.
+
+        Uses the currently applied pixel_mask to identify static pixels
+        (those where mask is False). Simulates their contribution and caches it
+        for efficient subtraction during fitting via the subtract_static_sky flag.
+
+        Parameters
+        ----------
+        sky_coeffs : array, shape (npix_full, nmodes_sky)
+            Full-sky coefficients. Pixels where pixel_mask is False are treated
+            as static and their visibilities are cached.
+
+        Raises
+        ------
+        ValueError
+            If no pixel mask has been applied.
+        """
+        if self.pixel_mask is None:
+            raise ValueError("No pixel mask applied. Cannot cache static sky.")
+
+        sky_coeffs = np.asarray(sky_coeffs, dtype=DTYPE_R_NPY)
+        if sky_coeffs.shape[0] != self._npix_full:
             raise ValueError(
-                'apply_horizon_cut no longer takes params. '
-                'Parameters are always returned in full-sky format.'
+                f"sky_coeffs shape {sky_coeffs.shape[0]} != npix_full {self._npix_full}"
             )
-        return int(mask.sum())
+
+        # Extract static pixels (unmasked) in masked coordinate system
+        static_mask_full = ~self.pixel_mask
+        # Create array with shape matching the masked forward model
+        static_sky = np.zeros((len(self._pixel_indices), sky_coeffs.shape[1]), dtype=DTYPE_R_NPY)
+
+        # Find which masked pixels are static pixels
+        for i, full_idx in enumerate(self._pixel_indices):
+            if static_mask_full[full_idx]:
+                static_sky[i] = sky_coeffs[full_idx]
+
+        # Simulate and cache
+        self._cached_static_vis = self._sim_fn(
+            jnp.array(static_sky, dtype=DTYPE_R_JAX), self.rot_matrices
+        )
+        self._static_sky_cached = True
 
     def expand_sky_to_full(self, sky_coeffs_masked):
         """Expand masked sky coefficients back onto the full sky grid."""
@@ -642,26 +744,16 @@ class Calibrator:
         n_drop = int((~mask).sum())
         print(f'  Beam mask: {n_keep} pixels retained, {n_drop} removed.')
 
-    def apply_ever_illuminated_beam_mask(self):
-        """Restrict beam updates to pixels that are ever illuminated by the sky.
-
-        Convenience wrapper around apply_beam_mask.
-        This can substantially speed up beam dirty updates.
-        """
-        if not self.fwd._geom_ready:
-            raise RuntimeError('Call precompute_time_geometry() first.')
-
-        mask = self.fwd.build_ever_illuminated_beam_mask(self.rot_matrices)
-        mask = np.asarray(mask, dtype=bool)
-        self.apply_beam_mask(mask)
-
-    def fit_gains_linear(self, sky_coeffs):
+    def fit_gains_linear(self, sky_coeffs, subtract_static_sky=False):
         """Solve for gains with sky held fixed.
 
         Parameters
         ----------
         sky_coeffs : array, shape (npix,) or (npix, nmodes)
             Sky coefficients. Can be full-sky or active (masked) pixels.
+        subtract_static_sky : bool, optional
+            If True, subtract cached static sky contribution from data before fitting.
+            Requires cache_static_sky_coeffs() to be called first.
 
         Returns
         -------
@@ -670,11 +762,18 @@ class Calibrator:
         loss : float
             Chi-squared loss.
         """
+        if subtract_static_sky:
+            if not self._static_sky_cached:
+                raise RuntimeError("Static sky not cached. Call cache_static_sky_coeffs() first.")
+            data_for_fit = self.data - self._cached_static_vis
+        else:
+            data_for_fit = self.data
+
         sky_active = self._ensure_sky_is_active(sky_coeffs)
         vis_model = self._jit_simulate(sky_active, self.rot_matrices)
 
         den = jnp.abs(vis_model) ** 2
-        g_opt = self.data * jnp.conj(vis_model) / (den + 1e-30)
+        g_opt = data_for_fit * jnp.conj(vis_model) / (den + 1e-30)
         log_g = jnp.log(g_opt + 0j)
 
         w_sum = den.sum(axis=2) + 1e-30
@@ -697,7 +796,16 @@ class Calibrator:
             'phase':   theta[:, :, 0].astype(DTYPE_R_JAX),
             'phi':     theta[:, :, 1:].transpose(0, 2, 1).astype(DTYPE_R_JAX),
         }
-        loss = float(self._jit_loss({'sky_coeffs': sky_active, **gain_params}, self._effective_weights()))
+        # Temporarily adjust data for loss computation if subtracting static sky
+        if subtract_static_sky:
+            orig_data = self.data
+            self.data = data_for_fit
+            try:
+                loss = float(self._jit_loss({'sky_coeffs': sky_active, **gain_params}, self._effective_weights()))
+            finally:
+                self.data = orig_data
+        else:
+            loss = float(self._jit_loss({'sky_coeffs': sky_active, **gain_params}, self._effective_weights()))
         self._fit_gains_linear_cache = (sky_active, gain_params, loss)
         return gain_params, loss
 
@@ -805,6 +913,43 @@ class Calibrator:
 
         return beam_weights_full
 
+    def get_beam_sky_weighting(self):
+        """Return design matrix normal (Gram) diagonal for all beam pixels.
+
+        Computes the sum of squared beam-weighting coefficients across all times,
+        frequencies, and sky positions that illuminate each beam pixel. This is the
+        effective per-pixel weighting in the fixed-point beam update iteration and
+        is independent of data.
+
+        Returns
+        -------
+        beam_weights : np.ndarray, shape (npix_beam_full,)
+            Sum of weighted |beam_spec_h|² per beam pixel across all times, frequencies,
+            and illuminated sky pixels. Higher values indicate beam pixels that are
+            more strongly constrained by the observations.
+        """
+        npix_beam_full = healpy.nside2npix(self.beam_model.nside)
+        beam_weights = np.zeros(npix_beam_full, dtype=DTYPE_R_NPY)
+
+        # For each time, accumulate contributions from sky pixels that illuminate each beam pixel
+        for tind in range(self.ntime):
+            beam_spec_h = np.asarray(self.fwd._beam_spec_horizon_all[tind], dtype=DTYPE_R_NPY)
+            weight_per_sky = (beam_spec_h ** 2).sum(axis=-1)  # (npix_sky, )
+
+            # Get the beam interpolation stencil for this time
+            px = np.asarray(self.fwd._interp_px_all[tind], dtype=np.int32)  # (4, npix_sky)
+            wgt = np.asarray(self.fwd._interp_wgt_all[tind], dtype=DTYPE_R_NPY)  # (4, npix_sky)
+
+            # For each sky pixel, add its weighted contribution to the 4 nearest beam pixels
+            for sky_idx in range(px.shape[1]):
+                w_sky = weight_per_sky[sky_idx]
+                for neighbor_idx in range(4):
+                    beam_pix = px[neighbor_idx, sky_idx]
+                    interp_wgt = wgt[neighbor_idx, sky_idx]
+                    beam_weights[beam_pix] += (interp_wgt ** 2) * w_sky
+
+        return beam_weights
+
     def fit_sky_dirty(
         self,
         sky_coeffs,
@@ -814,6 +959,7 @@ class Calibrator:
         beam_reg: float = 1e-3,
         momentum: float = 0.0,
         verbose: bool = False,
+        subtract_static_sky: bool = False,
     ):
         """Dirty-map sky update with optional momentum.
 
@@ -823,45 +969,60 @@ class Calibrator:
             Sky coefficients (full-sky or active/masked).
         gain_params : dict
             Gain parameters.
+        subtract_static_sky : bool, optional
+            If True, subtract cached static sky contribution from data before fitting.
+            Requires cache_static_sky_coeffs() to be called first.
 
         Returns
         -------
         best_sky : array
             Updated sky coefficients in full-sky format.
         best_loss : float
-            Best loss achieved.
+            Best loss achieved (computed on adjusted data if subtract_static_sky=True).
         """
-        sky_input_full = None
-        sky_active = self._ensure_sky_is_active(sky_coeffs)
-        if sky_coeffs.shape[0] == self._npix_full:
-            sky_input_full = np.asarray(sky_coeffs)
+        if subtract_static_sky:
+            if not self._static_sky_cached:
+                raise RuntimeError("Static sky not cached. Call cache_static_sky_coeffs() first.")
+            orig_data = self.data
+            self.data = self.data - self._cached_static_vis
+        else:
+            orig_data = None
 
-        velocity = jnp.zeros_like(sky_active)
-        best_sky_active = sky_active
-        _w = self._effective_weights()
-        best_loss_jax = self._jit_loss({'sky_coeffs': sky_active, **gain_params}, _w)
+        try:
+            sky_input_full = None
+            sky_active = self._ensure_sky_is_active(sky_coeffs)
+            if sky_coeffs.shape[0] == self._npix_full:
+                sky_input_full = np.asarray(sky_coeffs)
 
-        for i in range(n_iter):
-            resid = self.calibrated_residual({'sky_coeffs': sky_active, **gain_params})
-            delta = self._sky_update_fn(resid, step_size=step_size, beam_reg=beam_reg)
-            velocity = momentum * velocity + delta
-            sky_active = sky_active + velocity
-            loss_jax = self._jit_loss({'sky_coeffs': sky_active, **gain_params}, _w)
+            velocity = jnp.zeros_like(sky_active)
+            best_sky_active = sky_active
+            _w = self._effective_weights()
+            best_loss_jax = self._jit_loss({'sky_coeffs': sky_active, **gain_params}, _w)
 
-            # Use JAX operations to conditionally update (no blocking)
-            improved = loss_jax < best_loss_jax
-            best_loss_jax = jnp.where(improved, loss_jax, best_loss_jax)
-            best_sky_active = jnp.where(improved, sky_active, best_sky_active)
+            for i in range(n_iter):
+                resid = self.calibrated_residual({'sky_coeffs': sky_active, **gain_params})
+                delta = self._sky_update_fn(resid, step_size=step_size, beam_reg=beam_reg)
+                velocity = momentum * velocity + delta
+                sky_active = sky_active + velocity
+                loss_jax = self._jit_loss({'sky_coeffs': sky_active, **gain_params}, _w)
 
-            # Only materialize for verbose output (unavoidable if verbose)
-            if verbose:
-                loss_val = float(loss_jax)
-                print(f'    dirty iter {i:03d}: loss={loss_val:.4e}')
+                # Use JAX operations to conditionally update (no blocking)
+                improved = loss_jax < best_loss_jax
+                best_loss_jax = jnp.where(improved, loss_jax, best_loss_jax)
+                best_sky_active = jnp.where(improved, sky_active, best_sky_active)
 
-        best_sky_full = self._params_to_full_space(
-            {'sky_coeffs': best_sky_active}, {'sky_coeffs': sky_input_full}
-        )['sky_coeffs']
-        return best_sky_full, float(best_loss_jax)
+                # Only materialize for verbose output (unavoidable if verbose)
+                if verbose:
+                    loss_val = float(loss_jax)
+                    print(f'    dirty iter {i:03d}: loss={loss_val:.4e}')
+
+            best_sky_full = self._params_to_full_space(
+                {'sky_coeffs': best_sky_active}, {'sky_coeffs': sky_input_full}
+            )['sky_coeffs']
+            return best_sky_full, float(best_loss_jax)
+        finally:
+            if orig_data is not None:
+                self.data = orig_data
 
     def fit_with_rfi_reweighting(
         self,
@@ -1245,6 +1406,15 @@ class Calibrator:
 
     def run_alternating_dirty_state(self, state: AlternatingDirtyFitState, n_iter: int = 1, verbose: bool = False, _stop_flag=None):
         """Advance a persistent alternating-dirty state by ``n_iter`` steps."""
+        # Handle subtract_static_sky: temporarily adjust data if flag is set
+        if state.subtract_static_sky:
+            if not self._static_sky_cached:
+                raise RuntimeError("Static sky not cached. Call cache_static_sky_coeffs() first.")
+            orig_data = self.data
+            self.data = self.data - self._cached_static_vis
+        else:
+            orig_data = None
+
         if _stop_flag is None:
             stop = _StopFitFlag()
             old_handler = _StopFitFlag.install(stop)
@@ -1262,6 +1432,8 @@ class Calibrator:
                 if state.stop_reason is not None:
                     break
         finally:
+            if orig_data is not None:
+                self.data = orig_data
             if _stop_flag is None:
                 _StopFitFlag.restore(old_handler)
         return state
@@ -1299,6 +1471,7 @@ class Calibrator:
         eff_alpha: float = 0.4,
         target_reduced_chi2: float | None = None,
         reduced_chi2_check_every: int = 1,
+        subtract_static_sky: bool = False,
         verbose: bool = False,
         _stop_flag=None,
     ):
@@ -1310,6 +1483,12 @@ class Calibrator:
         Anderson histories, efficiency estimates, and cadence counters.
 
         Parameters are always returned in full-sky format.
+
+        Parameters
+        ----------
+        subtract_static_sky : bool, optional
+            If True, subtract cached static sky contribution from data before fitting.
+            Requires cache_static_sky_coeffs() to be called first.
         """
         state = self.init_alternating_dirty_state(
             params,
@@ -1332,6 +1511,7 @@ class Calibrator:
             target_reduced_chi2=target_reduced_chi2,
             reduced_chi2_check_every=reduced_chi2_check_every,
         )
+        state.subtract_static_sky = subtract_static_sky
         state = self.run_alternating_dirty_state(state, n_iter=n_iter, verbose=verbose, _stop_flag=_stop_flag)
         params_full = self._params_to_full_space(state.params, state.settings.get('params_input_full'))
         return params_full, float(state.loss)

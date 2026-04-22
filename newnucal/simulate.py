@@ -133,19 +133,40 @@ class ForwardModel:
     # Pixel masking helpers
     # ------------------------------------------------------------------
 
-    def build_ever_visible_mask(self, rot_matrices):
+    def build_sky_mask_altitude(self, rot_matrices, min_altitude_deg=0.0):
         """
-        Return a boolean array of shape (npix_sky_full,) that is True for every
-        sky pixel above the horizon (topo_z > 0) at any of the given times.
+        Return a boolean array for sky pixels with maximum altitude >= min_altitude_deg.
 
-        Call this before :meth:`apply_pixel_mask`.
+        For each sky pixel, computes the maximum altitude (elevation angle) reached
+        across all times, then returns a mask of pixels exceeding the threshold.
+
+        Parameters
+        ----------
+        rot_matrices : array, shape (ntime, 3, 3)
+            Rotation matrices from equatorial to topocentric coordinates.
+        min_altitude_deg : float, optional
+            Minimum altitude in degrees. Default 0 (horizon). Set to 0 to remove
+            permanently below-horizon pixels.
+
+        Returns
+        -------
+        mask : np.ndarray, shape (npix_sky_full,), dtype bool
+            True for pixels with peak altitude >= min_altitude_deg.
         """
         rot_ms = np.asarray(rot_matrices, dtype=DTYPE_R_NPY)
         eq = np.asarray(self._eq_coords_full)   # (3, npix_full)
-        ever_visible = np.zeros(eq.shape[1], dtype=bool)
+
+        min_altitude_rad = np.radians(min_altitude_deg)
+        npix_full = eq.shape[1]
+        max_alt = np.full(npix_full, -np.pi/2, dtype=DTYPE_R_NPY)  # Initialize to -90°
+
         for i in range(rot_ms.shape[0]):
-            ever_visible |= (rot_ms[i] @ eq)[2] > 0
-        return ever_visible
+            topo = rot_ms[i] @ eq  # (3, npix_full)
+            # Altitude is arcsin(z) where z is the zenith component
+            alt = np.arcsin(np.clip(topo[2], -1, 1))  # Clip to avoid NaN
+            max_alt = np.maximum(max_alt, alt)
+
+        return max_alt >= min_altitude_rad
 
     def apply_pixel_mask(self, mask):
         """
@@ -175,28 +196,92 @@ class ForwardModel:
     # Beam masking helpers
     # ------------------------------------------------------------------
 
-    def build_ever_illuminated_beam_mask(self, rot_matrices):
+    def build_beam_mask_altitude(self, rot_matrices, max_zenith_angle_deg=90.0):
         """
-        Return a boolean array of shape (npix_beam_full,) that is True for every
-        beam pixel that is ever illuminated by sky pixels across all times.
+        Return a boolean array for beam pixels within max_zenith_angle from zenith.
 
-        A beam pixel is "illuminated" if any sky pixel falls within its
-        bilinear interpolation neighborhood (nearest 4 HEALPix pixels).
+        The beam is fixed in the topocentric frame. This method computes the zenith
+        angle for each beam pixel (in HEALPix coordinates) and returns a mask of
+        pixels within the specified angular distance from zenith.
 
-        Call this before :meth:`apply_beam_mask`.
+        Parameters
+        ----------
+        rot_matrices : array, shape (ntime, 3, 3)
+            Rotation matrices (unused, kept for API compatibility).
+        max_zenith_angle_deg : float, optional
+            Maximum zenith angle in degrees. Default 90 (all sky above horizon).
+            Set to 90 to include all above-horizon pixels.
+
+        Returns
+        -------
+        mask : np.ndarray, shape (npix_beam_full,), dtype bool
+            True for beam pixels with zenith angle <= max_zenith_angle_deg.
+        """
+        nside = self.beam_model.nside
+        npix_beam_full = healpy.nside2npix(nside)
+
+        max_zenith_rad = np.radians(max_zenith_angle_deg)
+
+        # Get HEALPix coordinates for all beam pixels
+        theta, phi = healpy.pix2ang(nside, np.arange(npix_beam_full))
+
+        # Convert to topocentric unit vectors
+        # In topocentric frame: z points to zenith, x to East, y to North
+        # HEALPix theta is colatitude (angle from North pole), phi is azimuth
+        # Convert HEALPix (theta, phi) to topocentric (alt, az):
+        # alt = pi/2 - theta,  az = phi
+        alt = np.pi / 2 - theta
+        zenith_angle = np.pi / 2 - alt  # zenith_angle = theta in HEALPix coords
+
+        return zenith_angle <= max_zenith_rad
+
+    def build_sky_mask_from_beam_pixels(self, beam_pixel_mask):
+        """
+        Return a boolean array for sky pixels that are illuminated by selected beam pixels.
+
+        Given a mask of beam pixels to keep, returns a mask of sky pixels whose
+        HEALPix interpolation neighborhood touches at least one of the selected
+        beam pixels. This is the inverse of selecting beam pixels that touch
+        a given set of sky pixels.
+
+        Parameters
+        ----------
+        beam_pixel_mask : array_like, shape (npix_beam_full,), dtype bool
+            Boolean mask of beam pixels to consider. Sky pixels are selected if
+            their interpolation stencil touches any beam pixel where mask is True.
+
+        Returns
+        -------
+        mask : np.ndarray, shape (npix_sky_full,), dtype bool
+            True for sky pixels whose interpolation touches selected beam pixels.
+
+        Raises
+        ------
+        RuntimeError
+            If geometry has not been precomputed (call precompute_time_geometry first).
         """
         if not self._geom_ready:
-            raise RuntimeError('Call precompute_time_geometry() first to compute interpolation operators.')
+            raise RuntimeError('Call precompute_time_geometry() first.')
 
-        npix_beam_full = healpy.nside2npix(self.beam_model.nside)
-        ever_illuminated = np.zeros(npix_beam_full, dtype=bool)
+        beam_pixel_mask = np.asarray(beam_pixel_mask, dtype=bool)
+        npix_sky_full = self.npix_sky
+        sky_mask = np.zeros(npix_sky_full, dtype=bool)
 
+        # For each time step, check which sky pixels have interpolation neighbors
+        # in the selected beam pixels
         for tind in range(len(self._interp_px_all)):
-            px = np.asarray(self._interp_px_all[tind])
-            px_flat = px.reshape(-1)
-            ever_illuminated[px_flat] = True
+            px = np.asarray(self._interp_px_all[tind], dtype=np.int32)  # (4, npix_sky)
 
-        return ever_illuminated
+            # For each sky pixel, check if any of its 4 interpolation neighbors
+            # are in the selected beam pixels
+            for sky_idx in range(px.shape[1]):
+                for neighbor_idx in range(4):
+                    beam_pix = px[neighbor_idx, sky_idx]
+                    if beam_pixel_mask[beam_pix]:
+                        sky_mask[sky_idx] = True
+                        break  # No need to check other neighbors for this sky pixel
+
+        return sky_mask
 
     def apply_beam_mask(self, mask):
         """

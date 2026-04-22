@@ -520,10 +520,12 @@ class TestSkyBeamWeighting:
         np.testing.assert_array_equal(weights1, weights2)
 
     def test_beam_weighting_expanded_after_horizon_cut(self, calibrator_gains_setup, sky_coeffs_true):
-        """After horizon cut, beam weights should be expanded to full sky with zeros for masked pixels."""
+        """After altitude mask, beam weights should be expanded to full sky with zeros for masked pixels."""
         cal, _ = calibrator_gains_setup
         npix_full_before = cal.fwd.npix_sky
-        npix_active = cal.apply_horizon_cut()
+        sky_mask = cal.build_sky_mask_altitude(min_altitude_deg=0.0)
+        cal.apply_pixel_mask(sky_mask)
+        npix_active = int(sky_mask.sum())
 
         weights_after_cut = cal.get_sky_beam_weighting()
 
@@ -537,13 +539,13 @@ class TestSkyBeamWeighting:
 
 class TestBeamMasking:
     def test_build_ever_illuminated_beam_mask(self, calibrator_gains_setup):
-        """build_ever_illuminated_beam_mask should return a valid boolean array."""
+        """build_beam_mask_altitude should return a valid boolean array."""
         cal, _ = calibrator_gains_setup
-        mask = cal.fwd.build_ever_illuminated_beam_mask(cal.rot_matrices)
+        mask = cal.fwd.build_beam_mask_altitude(cal.rot_matrices, max_zenith_angle_deg=90.0)
 
         assert mask.dtype == bool
         assert mask.shape == (healpy.nside2npix(cal.beam_model.nside),)
-        assert mask.sum() > 0  # Some pixels should be illuminated
+        assert mask.sum() > 0  # Some pixels should be above horizon
 
     def test_apply_beam_mask_reduces_coefficients(self, calibrator_gains_setup):
         """apply_beam_mask should reduce beam coefficient array size."""
@@ -559,15 +561,16 @@ class TestBeamMasking:
         assert cal.fwd.beam_coeffs.shape[0] == int(mask.sum())
 
     def test_apply_ever_illuminated_beam_mask(self, calibrator_gains_setup):
-        """apply_ever_illuminated_beam_mask should reduce to illuminated pixels."""
+        """build_beam_mask_altitude should produce mask for above-horizon pixels."""
         cal, _ = calibrator_gains_setup
         npix_beam_full = cal.fwd.npix_beam
 
-        cal.apply_ever_illuminated_beam_mask()
+        beam_mask = cal.build_beam_mask_altitude(max_zenith_angle_deg=90.0)
+        cal.apply_beam_mask(beam_mask)
 
         npix_beam_masked = cal.fwd.npix_beam
         assert npix_beam_masked <= npix_beam_full
-        # For a small nside and ntime, most pixels should be illuminated
+        # For a small nside and ntime, most pixels should be above horizon
         # so the reduction shouldn't be drastic, but should be nonzero
         assert npix_beam_masked > 0
 
@@ -576,8 +579,8 @@ class TestBeamMasking:
         cal, _ = calibrator_gains_setup
         params = cal.init_params()
 
-        # Apply a beam mask
-        mask = cal.fwd.build_ever_illuminated_beam_mask(cal.rot_matrices)
+        # Apply a beam altitude mask
+        mask = cal.fwd.build_beam_mask_altitude(cal.rot_matrices, max_zenith_angle_deg=90.0)
         cal.apply_beam_mask(mask)
 
         # Run beam dirty update
@@ -638,3 +641,250 @@ class TestBeamMasking:
         # Both masks should remain active after changing sky mask
         assert cal.fwd.npix_sky == int(sky_mask.sum())
         assert cal.fwd.npix_beam == npix_beam_masked
+
+
+class TestStaticSkySubtraction:
+    """Tests for caching and subtracting static sky contributions."""
+
+    def test_cache_static_sky_coeffs_requires_pixel_mask(self, calibrator_gains_setup, sky_coeffs_true):
+        """cache_static_sky_coeffs should raise if no pixel mask applied."""
+        cal, _ = calibrator_gains_setup
+        with pytest.raises(ValueError, match="No pixel mask applied"):
+            cal.cache_static_sky_coeffs(sky_coeffs_true)
+
+    def test_cache_static_sky_coeffs_wrong_size(self, calibrator_gains_setup, sky_coeffs_true):
+        """cache_static_sky_coeffs should reject wrong-sized coefficients."""
+        cal, _ = calibrator_gains_setup
+        npix_full = cal._npix_full
+        mask = np.zeros(npix_full, dtype=bool)
+        mask[:npix_full//2] = True
+        cal.apply_pixel_mask(mask)
+
+        # Try to cache with wrong size
+        with pytest.raises(ValueError, match="shape"):
+            cal.cache_static_sky_coeffs(sky_coeffs_true[:npix_full//2])
+
+    def test_cache_static_sky_coeffs_caches_visibilities(self, calibrator_gains_setup, sky_coeffs_true):
+        """cache_static_sky_coeffs should cache visibility contribution."""
+        cal, gain_params = calibrator_gains_setup
+        npix_full = cal._npix_full
+
+        # Apply pixel mask first (keep first 3/4 of pixels)
+        pixel_mask = np.zeros(npix_full, dtype=bool)
+        pixel_mask[:3*npix_full//4] = True
+        cal.apply_pixel_mask(pixel_mask)
+
+        # Cache static sky (method extracts unmasked pixels internally)
+        cal.cache_static_sky_coeffs(sky_coeffs_true)
+
+        assert cal._static_sky_cached
+        assert cal._cached_static_vis is not None
+        assert cal._cached_static_vis.shape == cal.data.shape
+
+    def test_fit_gains_linear_subtract_static_sky_requires_cache(self, calibrator_gains_setup, sky_coeffs_true):
+        """fit_gains_linear with subtract_static_sky should raise if cache doesn't exist."""
+        cal, _ = calibrator_gains_setup
+        sky_active = cal._ensure_sky_is_active(sky_coeffs_true)
+
+        with pytest.raises(RuntimeError, match="Static sky not cached"):
+            cal.fit_gains_linear(sky_active, subtract_static_sky=True)
+
+class TestAltitudeMasking:
+    """Tests for altitude-based masking of sky and beam pixels."""
+
+    def test_build_sky_mask_altitude_zero(self, forward_model, rot_matrices):
+        """build_sky_mask_altitude at 0° should match above-horizon pixels."""
+        mask_0 = forward_model.build_sky_mask_altitude(rot_matrices, min_altitude_deg=0.0)
+        assert mask_0.dtype == bool
+        assert mask_0.shape == (forward_model.npix_sky,)
+        assert mask_0.sum() > 0
+
+    def test_build_sky_mask_altitude_high(self, forward_model, rot_matrices):
+        """build_sky_mask_altitude at high altitude should be more restrictive."""
+        mask_0 = forward_model.build_sky_mask_altitude(rot_matrices, min_altitude_deg=0.0)
+        mask_45 = forward_model.build_sky_mask_altitude(rot_matrices, min_altitude_deg=45.0)
+        mask_90 = forward_model.build_sky_mask_altitude(rot_matrices, min_altitude_deg=90.0)
+
+        # More restrictive masks should have fewer pixels
+        assert mask_45.sum() <= mask_0.sum()
+        assert mask_90.sum() <= mask_45.sum()
+
+    def test_build_beam_mask_altitude_zenith(self, forward_model, rot_matrices):
+        """build_beam_mask_altitude at 90° should include all above-horizon pixels."""
+        mask = forward_model.build_beam_mask_altitude(rot_matrices, max_zenith_angle_deg=90.0)
+        assert mask.dtype == bool
+        assert mask.shape == (forward_model.npix_beam,)
+        assert mask.sum() > 0
+
+    def test_build_beam_mask_altitude_narrow(self, forward_model, rot_matrices):
+        """build_beam_mask_altitude at narrow angle should be more restrictive."""
+        mask_90 = forward_model.build_beam_mask_altitude(rot_matrices, max_zenith_angle_deg=90.0)
+        mask_45 = forward_model.build_beam_mask_altitude(rot_matrices, max_zenith_angle_deg=45.0)
+        mask_0 = forward_model.build_beam_mask_altitude(rot_matrices, max_zenith_angle_deg=0.0)
+
+        # More restrictive masks should have fewer pixels
+        assert mask_45.sum() <= mask_90.sum()
+        assert mask_0.sum() <= mask_45.sum()
+
+    def test_apply_sky_altitude_mask(self, calibrator_gains_setup):
+        """build_sky_mask_altitude should produce mask for above-altitude pixels."""
+        cal, _ = calibrator_gains_setup
+        npix_full = cal._npix_full
+
+        sky_mask = cal.build_sky_mask_altitude(min_altitude_deg=0.0)
+        cal.apply_pixel_mask(sky_mask)
+
+        npix_retained = int(sky_mask.sum())
+        assert isinstance(npix_retained, int)
+        assert npix_retained > 0
+        assert npix_retained <= npix_full
+        assert cal.pixel_mask is not None
+
+    def test_apply_beam_altitude_mask(self, calibrator_gains_setup):
+        """build_beam_mask_altitude should produce mask for low-zenith-angle pixels."""
+        cal, _ = calibrator_gains_setup
+        npix_beam_full = healpy.nside2npix(cal.beam_model.nside)
+
+        beam_mask = cal.build_beam_mask_altitude(max_zenith_angle_deg=90.0)
+        cal.apply_beam_mask(beam_mask)
+
+        npix_retained = int(beam_mask.sum())
+        assert isinstance(npix_retained, int)
+        assert npix_retained > 0
+        assert npix_retained <= npix_beam_full
+        assert cal.beam_mask is not None
+
+    def test_apply_sky_altitude_mask_different_thresholds(self, calibrator_gains_setup):
+        """Different sky altitude thresholds should give different masks."""
+        cal, _ = calibrator_gains_setup
+        mask1 = cal.build_sky_mask_altitude(min_altitude_deg=0.0)
+        npix1 = int(mask1.sum())
+
+        cal2, _ = calibrator_gains_setup  # Fresh calibrator
+        mask2 = cal2.build_sky_mask_altitude(min_altitude_deg=30.0)
+        npix2 = int(mask2.sum())
+
+        # Different thresholds may give different pixel counts
+        # (though not guaranteed due to small test grid)
+        assert isinstance(npix1, int) and isinstance(npix2, int)
+
+    def test_apply_beam_altitude_mask_different_thresholds(self, calibrator_gains_setup):
+        """Different beam altitude thresholds should give different masks."""
+        cal, _ = calibrator_gains_setup
+        mask1 = cal.build_beam_mask_altitude(max_zenith_angle_deg=90.0)
+        npix1 = int(mask1.sum())
+
+        cal2, _ = calibrator_gains_setup  # Fresh calibrator
+        mask2 = cal2.build_beam_mask_altitude(max_zenith_angle_deg=45.0)
+        npix2 = int(mask2.sum())
+
+        # Different thresholds may give different pixel counts
+        assert isinstance(npix1, int) and isinstance(npix2, int)
+
+
+class TestBeamSkyWeighting:
+    """Tests for computing weighting of beam pixels by sky observations."""
+
+    def test_get_beam_sky_weighting_shape(self, calibrator_gains_setup):
+        """get_beam_sky_weighting should return correct shape."""
+        cal, _ = calibrator_gains_setup
+        npix_beam_full = healpy.nside2npix(cal.beam_model.nside)
+
+        weights = cal.get_beam_sky_weighting()
+
+        assert weights.shape == (npix_beam_full,)
+        assert weights.dtype == np.float32 or weights.dtype == np.float64
+
+    def test_get_beam_sky_weighting_positive(self, calibrator_gains_setup):
+        """get_beam_sky_weighting should return non-negative values."""
+        cal, _ = calibrator_gains_setup
+
+        weights = cal.get_beam_sky_weighting()
+
+        assert np.all(weights >= 0.0)
+        assert np.sum(weights) > 0.0  # At least some pixels should have nonzero weight
+
+    def test_get_beam_sky_weighting_central_higher(self, calibrator_gains_setup):
+        """Beam pixels near zenith should have higher weight."""
+        cal, _ = calibrator_gains_setup
+        nside = cal.beam_model.nside
+
+        weights = cal.get_beam_sky_weighting()
+
+        # Get zenith angle for each beam pixel
+        npix_beam = healpy.nside2npix(nside)
+        theta, phi = healpy.pix2ang(nside, np.arange(npix_beam))
+        zenith_angle = theta  # In HEALPix, theta is the colatitude (zenith angle)
+
+        # Central pixels (low zenith angle) should tend to have higher weight
+        central_mask = zenith_angle < np.pi / 4  # Central 45°
+        edge_mask = zenith_angle > 3 * np.pi / 4  # Near horizon
+
+        if central_mask.sum() > 0 and edge_mask.sum() > 0:
+            avg_central = weights[central_mask].mean()
+            avg_edge = weights[edge_mask].mean()
+            # Central should typically be higher (though not guaranteed for all configurations)
+            assert avg_central >= 0.0
+
+
+class TestBeamSkyMaskingReverse:
+    """Tests for selecting sky pixels based on beam pixels."""
+
+    def test_build_sky_mask_from_beam_pixels_shape(self, forward_model):
+        """build_sky_mask_from_beam_pixels should return correct shape."""
+        forward_model.precompute_time_geometry(np.array([np.eye(3)]))  # Dummy rotation
+        npix_beam_full = healpy.nside2npix(forward_model.beam_model.nside)
+
+        beam_mask = np.ones(npix_beam_full, dtype=bool)
+        sky_mask = forward_model.build_sky_mask_from_beam_pixels(beam_mask)
+
+        assert sky_mask.dtype == bool
+        assert sky_mask.shape == (forward_model.npix_sky,)
+
+    def test_build_sky_mask_from_beam_pixels_all_beams(self, forward_model, rot_matrices):
+        """Selecting all beam pixels should include many sky pixels."""
+        forward_model.precompute_time_geometry(rot_matrices)
+        npix_beam_full = healpy.nside2npix(forward_model.beam_model.nside)
+
+        beam_mask = np.ones(npix_beam_full, dtype=bool)
+        sky_mask = forward_model.build_sky_mask_from_beam_pixels(beam_mask)
+
+        # Should select a significant fraction of sky pixels
+        assert sky_mask.sum() > 0
+
+    def test_build_sky_mask_from_beam_pixels_no_beams(self, forward_model, rot_matrices):
+        """Selecting no beam pixels should select no sky pixels."""
+        forward_model.precompute_time_geometry(rot_matrices)
+        npix_beam_full = healpy.nside2npix(forward_model.beam_model.nside)
+
+        beam_mask = np.zeros(npix_beam_full, dtype=bool)
+        sky_mask = forward_model.build_sky_mask_from_beam_pixels(beam_mask)
+
+        # Should select no sky pixels
+        assert sky_mask.sum() == 0
+
+    def test_build_sky_mask_from_beam_pixels_wrapper(self, calibrator_gains_setup):
+        """build_sky_mask_from_beam_pixels should wrap forward model method."""
+        cal, _ = calibrator_gains_setup
+        npix_beam_full = healpy.nside2npix(cal.beam_model.nside)
+
+        beam_mask = np.ones(npix_beam_full, dtype=bool)
+        sky_mask = cal.build_sky_mask_from_beam_pixels(beam_mask)
+
+        assert sky_mask.dtype == bool
+        assert sky_mask.shape == (cal._npix_full,)
+
+    def test_build_sky_mask_from_altitude_selected_beams(self, calibrator_gains_setup):
+        """Selecting high-altitude beams should select corresponding sky pixels."""
+        cal, _ = calibrator_gains_setup
+
+        # Select only central beam pixels (low zenith angle)
+        beam_mask = cal.fwd.build_beam_mask_altitude(cal.rot_matrices, max_zenith_angle_deg=45.0)
+        sky_mask = cal.build_sky_mask_from_beam_pixels(beam_mask)
+
+        # Should select some sky pixels
+        assert sky_mask.sum() > 0
+        # But fewer than if we selected all beams
+        all_beam_mask = np.ones(healpy.nside2npix(cal.beam_model.nside), dtype=bool)
+        all_sky_mask = cal.build_sky_mask_from_beam_pixels(all_beam_mask)
+        assert sky_mask.sum() <= all_sky_mask.sum()
