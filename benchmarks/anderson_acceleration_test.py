@@ -120,7 +120,7 @@ def main(args):
     beam_weight_mask = bm_wgts > threshold
     # Combine masks: keep pixels that pass both altitude and beam weighting
     sky_mask = sky_alt_mask & beam_weight_mask
-    cal.apply_pixel_mask(sky_mask)
+    cal.apply_sky_mask(sky_mask)
 
     # --- Apply beam altitude mask ---
     beam_alt_mask = cal.build_beam_mask_altitude(max_zenith_angle_deg=90.0)

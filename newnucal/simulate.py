@@ -168,7 +168,7 @@ class ForwardModel:
 
         return max_alt >= min_altitude_rad
 
-    def apply_pixel_mask(self, mask):
+    def apply_sky_mask(self, mask):
         """
         Permanently restrict the sky model to the pixels selected by *mask*.
 
@@ -282,6 +282,52 @@ class ForwardModel:
                         break  # No need to check other neighbors for this sky pixel
 
         return sky_mask
+
+    def build_beam_mask_from_sky_pixels(self, sky_pixel_mask):
+        """
+        Return a boolean array for beam pixels illuminated by selected sky pixels.
+
+        Given a mask of sky pixels to keep, returns a mask of beam pixels that are
+        touched by at least one of the selected sky pixels' HEALPix interpolation
+        neighborhoods. This is the inverse of selecting sky pixels illuminated by
+        a given set of beam pixels.
+
+        Parameters
+        ----------
+        sky_pixel_mask : array_like, shape (npix_sky_full,), dtype bool
+            Boolean mask of sky pixels to consider. Beam pixels are selected if
+            they appear in the interpolation neighborhood of any sky pixel where
+            mask is True.
+
+        Returns
+        -------
+        mask : np.ndarray, shape (npix_beam_full,), dtype bool
+            True for beam pixels that touch selected sky pixels' neighborhoods.
+
+        Raises
+        ------
+        RuntimeError
+            If geometry has not been precomputed (call precompute_time_geometry first).
+        """
+        if not self._geom_ready:
+            raise RuntimeError('Call precompute_time_geometry() first.')
+
+        sky_pixel_mask = np.asarray(sky_pixel_mask, dtype=bool)
+        npix_beam_full = self.npix_beam
+        beam_mask = np.zeros(npix_beam_full, dtype=bool)
+
+        # For each time step, mark beam pixels that touch selected sky pixels
+        for tind in range(len(self._interp_px_all)):
+            px = np.asarray(self._interp_px_all[tind], dtype=np.int32)  # (4, npix_sky)
+
+            # For each sky pixel in the mask, mark all its interpolation neighbors
+            for sky_idx in range(px.shape[1]):
+                if sky_pixel_mask[sky_idx]:
+                    for neighbor_idx in range(4):
+                        beam_pix = px[neighbor_idx, sky_idx]
+                        beam_mask[beam_pix] = True
+
+        return beam_mask
 
     def apply_beam_mask(self, mask):
         """

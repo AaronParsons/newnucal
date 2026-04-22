@@ -108,7 +108,7 @@ def setup_problem():
     bm_wgts = cal.get_sky_beam_weighting()
     threshold = bm_wgts.max() / 100
     mask = bm_wgts > threshold
-    cal.apply_pixel_mask(mask)
+    cal.apply_sky_mask(mask)
     cal.apply_ever_illuminated_beam_mask()
 
     # --- Perturbed start ---

@@ -2,7 +2,7 @@
 Tests for pixel-cut functionality.
 
 Covers two independent features:
-  1. Static horizon cut  -- build_ever_visible_mask / apply_pixel_mask
+  1. Static horizon cut  -- build_ever_visible_mask / apply_sky_mask
   2. Calibrator helpers  -- apply_horizon_cut
 
 All tests that mutate a ForwardModel use function-scoped fixtures so they
@@ -146,20 +146,20 @@ class TestApplyPixelMask:
         f, _ = fwd
         npix_before = f.npix_sky
         mask = f.build_ever_visible_mask(rot2)
-        f.apply_pixel_mask(mask)
+        f.apply_sky_mask(mask)
         assert f.npix_sky == int(mask.sum())
         assert f.npix_sky < npix_before
 
     def test_eq_coords_compressed(self, fwd, rot2):
         f, _ = fwd
         mask = f.build_ever_visible_mask(rot2)
-        f.apply_pixel_mask(mask)
+        f.apply_sky_mask(mask)
         assert f.eq_coords.shape == (3, int(mask.sum()))
 
     def test_pixel_indices_stored(self, fwd, rot2):
         f, _ = fwd
         mask = f.build_ever_visible_mask(rot2)
-        f.apply_pixel_mask(mask)
+        f.apply_sky_mask(mask)
         assert hasattr(f, '_pixel_indices')
         assert len(f._pixel_indices) == int(mask.sum())
         assert f._pixel_indices[0] == np.where(mask)[0][0]
@@ -169,14 +169,14 @@ class TestApplyPixelMask:
         f.precompute_time_geometry(rot2)
         assert f._geom_ready
         mask = f.build_ever_visible_mask(rot2)
-        f.apply_pixel_mask(mask)
+        f.apply_sky_mask(mask)
         assert not f._geom_ready
 
     def test_simulate_after_mask(self, fwd, rot2):
         """simulate() should return correct shape and finite values after masking."""
         f, A = fwd
         mask = f.build_ever_visible_mask(rot2)
-        f.apply_pixel_mask(mask)
+        f.apply_sky_mask(mask)
         f.precompute_time_geometry(rot2)
         vis = f.simulate(_zero_sky(f, A), rot2)
         assert vis.shape == (2, f.nfreq, f.nbls)
@@ -187,7 +187,7 @@ class TestApplyPixelMask:
         """A pixel above the horizon, retained by the mask, should give nonzero vis."""
         f, A = fwd
         mask = f.build_ever_visible_mask(rot1)
-        f.apply_pixel_mask(mask)
+        f.apply_sky_mask(mask)
         f.precompute_time_geometry(rot1)
         # Pixel 0 in the compressed sky corresponds to the lowest original index
         sky = _zenith_sky(f, A, px=0)
@@ -209,7 +209,7 @@ class TestApplyPixelMask:
         # Masked model: apply horizon cut, find where pixel 0 landed
         mask = f.build_ever_visible_mask(rot1)
         assert mask[0], "pixel 0 must survive horizon mask for this test"
-        f.apply_pixel_mask(mask)
+        f.apply_sky_mask(mask)
         f.precompute_time_geometry(rot1)
 
         px0_compressed = int(np.searchsorted(f._pixel_indices, 0))

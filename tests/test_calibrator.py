@@ -355,8 +355,8 @@ class TestResumableAndChi2Tol:
 
 
 class TestPixelMasking:
-    def test_apply_pixel_mask_custom_mask(self, calibrator_gains_setup):
-        """apply_pixel_mask should accept and apply custom masks."""
+    def test_apply_sky_mask_custom_mask(self, calibrator_gains_setup):
+        """apply_sky_mask should accept and apply custom masks."""
         cal, _ = calibrator_gains_setup
         npix_full = cal.fwd.npix_sky
 
@@ -364,19 +364,19 @@ class TestPixelMasking:
         mask = np.zeros(npix_full, dtype=bool)
         mask[:npix_full//2] = True
 
-        cal.apply_pixel_mask(mask)
+        cal.apply_sky_mask(mask)
 
         assert cal.pixel_mask is not None
         assert np.array_equal(cal.pixel_mask, mask)
         assert cal.fwd.npix_sky == int(mask.sum())
 
-    def test_apply_pixel_mask_invalid_size(self, calibrator_gains_setup):
-        """apply_pixel_mask should reject masks of wrong size."""
+    def test_apply_sky_mask_invalid_size(self, calibrator_gains_setup):
+        """apply_sky_mask should reject masks of wrong size."""
         cal, _ = calibrator_gains_setup
         bad_mask = np.ones(cal.fwd.npix_sky + 10, dtype=bool)
 
         with pytest.raises(ValueError, match="mask size"):
-            cal.apply_pixel_mask(bad_mask)
+            cal.apply_sky_mask(bad_mask)
 
     def test_fit_gains_linear_with_full_sky_input(self, calibrator_gains_setup, sky_coeffs_true):
         """fit_gains_linear should accept full-sky parameters."""
@@ -386,7 +386,7 @@ class TestPixelMasking:
         # Apply mask
         mask = np.zeros(npix_full, dtype=bool)
         mask[:npix_full//2] = True
-        cal.apply_pixel_mask(mask)
+        cal.apply_sky_mask(mask)
 
         # Pass full-sky sky_coeffs
         sky_full = sky_coeffs_true
@@ -405,7 +405,7 @@ class TestPixelMasking:
         # Apply mask
         mask = np.zeros(npix_full, dtype=bool)
         mask[:npix_full//2] = True
-        cal.apply_pixel_mask(mask)
+        cal.apply_sky_mask(mask)
 
         # Pass masked sky_coeffs
         sky_masked = sky_coeffs_true[mask]
@@ -424,7 +424,7 @@ class TestPixelMasking:
         # Apply mask
         mask = np.zeros(npix_full, dtype=bool)
         mask[:npix_full//2] = True
-        cal.apply_pixel_mask(mask)
+        cal.apply_sky_mask(mask)
 
         # Fit
         sky_input = sky_coeffs_true
@@ -442,7 +442,7 @@ class TestPixelMasking:
         # Apply mask (first half only)
         mask = np.zeros(npix_full, dtype=bool)
         mask[:npix_full//2] = True
-        cal.apply_pixel_mask(mask)
+        cal.apply_sky_mask(mask)
 
         # Store original values
         sky_input = np.asarray(sky_coeffs_true)
@@ -463,7 +463,7 @@ class TestPixelMasking:
         # Apply mask
         mask = np.zeros(npix_full, dtype=bool)
         mask[: npix_full//2] = True
-        cal.apply_pixel_mask(mask)
+        cal.apply_sky_mask(mask)
 
         # Fit
         params = cal.init_params()
@@ -472,7 +472,7 @@ class TestPixelMasking:
         # Output should be full-sky
         assert params_out['sky_coeffs'].shape[0] == npix_full
 
-    def test_apply_pixel_mask_twice(self, calibrator_gains_setup):
+    def test_apply_sky_mask_twice(self, calibrator_gains_setup):
         """Applying two different masks sequentially should work correctly."""
         cal, _ = calibrator_gains_setup
         npix_full = cal.fwd.npix_sky
@@ -480,7 +480,7 @@ class TestPixelMasking:
         # First mask: first half of pixels
         mask1 = np.zeros(npix_full, dtype=bool)
         mask1[:npix_full//2] = True
-        cal.apply_pixel_mask(mask1)
+        cal.apply_sky_mask(mask1)
         npix_after_first = cal.fwd.npix_sky
         assert npix_after_first == int(mask1.sum())
 
@@ -488,7 +488,7 @@ class TestPixelMasking:
         mask2 = np.zeros(npix_full, dtype=bool)
         mask2[::2] = True
         mask2 = mask2 & mask1  # Combine masks
-        cal.apply_pixel_mask(mask2)
+        cal.apply_sky_mask(mask2)
         npix_after_second = cal.fwd.npix_sky
         assert npix_after_second == int(mask2.sum())
 
@@ -524,7 +524,7 @@ class TestSkyBeamWeighting:
         cal, _ = calibrator_gains_setup
         npix_full_before = cal.fwd.npix_sky
         sky_mask = cal.build_sky_mask_altitude(min_altitude_deg=0.0)
-        cal.apply_pixel_mask(sky_mask)
+        cal.apply_sky_mask(sky_mask)
         npix_active = int(sky_mask.sum())
 
         weights_after_cut = cal.get_sky_beam_weighting()
@@ -606,7 +606,7 @@ class TestBeamMasking:
         # Then apply sky pixel mask
         sky_mask = np.zeros(npix_sky_full, dtype=bool)
         sky_mask[:npix_sky_full//2] = True
-        cal.apply_pixel_mask(sky_mask)
+        cal.apply_sky_mask(sky_mask)
 
         # Both masks should be active
         assert cal.fwd.npix_sky == int(sky_mask.sum())
@@ -636,7 +636,7 @@ class TestBeamMasking:
         # Should now be able to change the sky pixel mask
         sky_mask = np.zeros(npix_sky_full, dtype=bool)
         sky_mask[:npix_sky_full//2] = True
-        cal.apply_pixel_mask(sky_mask)
+        cal.apply_sky_mask(sky_mask)
 
         # Both masks should remain active after changing sky mask
         assert cal.fwd.npix_sky == int(sky_mask.sum())
@@ -658,7 +658,7 @@ class TestStaticSkySubtraction:
         npix_full = cal._npix_full
         mask = np.zeros(npix_full, dtype=bool)
         mask[:npix_full//2] = True
-        cal.apply_pixel_mask(mask)
+        cal.apply_sky_mask(mask)
 
         # Try to cache with wrong size
         with pytest.raises(ValueError, match="shape"):
@@ -672,7 +672,7 @@ class TestStaticSkySubtraction:
         # Apply pixel mask first (keep first 3/4 of pixels)
         pixel_mask = np.zeros(npix_full, dtype=bool)
         pixel_mask[:3*npix_full//4] = True
-        cal.apply_pixel_mask(pixel_mask)
+        cal.apply_sky_mask(pixel_mask)
 
         # Cache static sky (method extracts unmasked pixels internally)
         cal.cache_static_sky_coeffs(sky_coeffs_true)
@@ -732,7 +732,7 @@ class TestAltitudeMasking:
         npix_full = cal._npix_full
 
         sky_mask = cal.build_sky_mask_altitude(min_altitude_deg=0.0)
-        cal.apply_pixel_mask(sky_mask)
+        cal.apply_sky_mask(sky_mask)
 
         npix_retained = int(sky_mask.sum())
         assert isinstance(npix_retained, int)
@@ -888,3 +888,60 @@ class TestBeamSkyMaskingReverse:
         all_beam_mask = np.ones(healpy.nside2npix(cal.beam_model.nside), dtype=bool)
         all_sky_mask = cal.build_sky_mask_from_beam_pixels(all_beam_mask)
         assert sky_mask.sum() <= all_sky_mask.sum()
+
+    def test_build_beam_mask_from_sky_pixels_shape(self, calibrator_gains_setup):
+        """build_beam_mask_from_sky_pixels should return mask with correct shape."""
+        cal, _ = calibrator_gains_setup
+        npix_sky_full = cal._npix_full
+        npix_beam_full = healpy.nside2npix(cal.beam_model.nside)
+
+        # Create a sky mask with some pixels
+        sky_mask = np.zeros(npix_sky_full, dtype=bool)
+        sky_mask[:npix_sky_full // 2] = True
+
+        beam_mask = cal.build_beam_mask_from_sky_pixels(sky_mask)
+
+        assert beam_mask.shape == (npix_beam_full,)
+        assert beam_mask.dtype == bool
+
+    def test_build_beam_mask_from_sky_pixels_all_sky(self, calibrator_gains_setup):
+        """When all sky pixels selected, beam mask should touch all illuminated beams."""
+        cal, _ = calibrator_gains_setup
+        npix_sky_full = cal._npix_full
+
+        all_sky_mask = np.ones(npix_sky_full, dtype=bool)
+        beam_mask = cal.build_beam_mask_from_sky_pixels(all_sky_mask)
+
+        # Should have selected some beam pixels (non-zero mask)
+        assert beam_mask.sum() > 0
+        assert beam_mask.sum() <= healpy.nside2npix(cal.beam_model.nside)
+
+    def test_build_beam_mask_from_sky_pixels_no_sky(self, calibrator_gains_setup):
+        """When no sky pixels selected, beam mask should be empty."""
+        cal, _ = calibrator_gains_setup
+        npix_sky_full = cal._npix_full
+
+        empty_sky_mask = np.zeros(npix_sky_full, dtype=bool)
+        beam_mask = cal.build_beam_mask_from_sky_pixels(empty_sky_mask)
+
+        assert beam_mask.sum() == 0
+
+    def test_build_beam_mask_from_sky_pixels_reciprocal(self, calibrator_gains_setup):
+        """Beam→sky and sky→beam should be reciprocal operations."""
+        cal, _ = calibrator_gains_setup
+        npix_sky_full = cal._npix_full
+
+        # Start with a subset of sky pixels
+        initial_sky_mask = np.zeros(npix_sky_full, dtype=bool)
+        initial_sky_mask[:npix_sky_full // 4] = True
+
+        # Forward: sky → beam
+        beam_mask = cal.build_beam_mask_from_sky_pixels(initial_sky_mask)
+
+        # Reverse: beam → sky
+        recovered_sky_mask = cal.build_sky_mask_from_beam_pixels(beam_mask)
+
+        # The recovered sky mask should contain all original sky pixels
+        # (and possibly more due to the stencil structure)
+        assert np.all(recovered_sky_mask[initial_sky_mask])
+

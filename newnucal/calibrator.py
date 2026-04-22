@@ -251,7 +251,7 @@ class Calibrator:
         self.pixel_mask = None  # No mask initially
         self.beam_mask = None   # No beam mask initially
         self._npix_full = self.fwd.npix_sky  # Store original full-sky size (before any masking)
-        self._active_size = self._npix_full   # cached; updated by apply_pixel_mask
+        self._active_size = self._npix_full   # cached; updated by apply_sky_mask
         self._pixel_indices = None            # int32 indices of active pixels; None means all
         self._cached_static_vis = None        # Cached visibility of static (unmasked) pixels
         self._static_sky_cached = False       # Whether static sky contribution is cached
@@ -272,7 +272,7 @@ class Calibrator:
         if npix_below_horizon > 0:
             npix_above_horizon = int(altitude_mask.sum())
             print(f"  WARNING: {npix_below_horizon} sky pixels are never above the horizon. "
-                  f"Call cal.apply_pixel_mask(cal.build_sky_mask_altitude(...)) to remove them before fitting.")
+                  f"Call cal.apply_sky_mask(cal.build_sky_mask_altitude(...)) to remove them before fitting.")
             print(f"  ({npix_above_horizon} above-horizon pixels retained after cut)")
 
     def _select_methods(self):
@@ -563,7 +563,7 @@ class Calibrator:
     # Pixel-cut helpers
     # ------------------------------------------------------------------
 
-    def apply_pixel_mask(self, mask):
+    def apply_sky_mask(self, mask):
         """Apply an arbitrary pixel mask controlling which pixels are solved.
 
         Pixels where mask is True will be simulated and solved for.
@@ -586,7 +586,7 @@ class Calibrator:
         self.pixel_mask = mask.copy()
         self._active_size = int(mask.sum())
         self._pixel_indices = np.where(mask)[0].astype(np.int32)
-        self.fwd.apply_pixel_mask(mask)
+        self.fwd.apply_sky_mask(mask)
         self.fwd.precompute_time_geometry(self.rot_matrices)
         self._recompile_jit()
 
@@ -658,9 +658,39 @@ class Calibrator:
 
             beam_mask = cal.build_beam_mask_altitude(max_zenith_angle_deg=45.0)
             sky_mask = cal.build_sky_mask_from_beam_pixels(beam_mask)
-            cal.apply_pixel_mask(sky_mask)
+            cal.apply_sky_mask(sky_mask)
         """
         return self.fwd.build_sky_mask_from_beam_pixels(beam_pixel_mask)
+
+    def build_beam_mask_from_sky_pixels(self, sky_pixel_mask):
+        """Build mask for beam pixels illuminated by selected sky pixels.
+
+        Given a mask of sky pixels, returns a mask of beam pixels that are
+        touched by at least one of the selected sky pixels' HEALPix interpolation
+        neighborhoods. This is the reverse operation of selecting sky pixels
+        illuminated by a given set of beam pixels.
+
+        Parameters
+        ----------
+        sky_pixel_mask : array_like, shape (npix_full,), dtype bool
+            Boolean mask of sky pixels to consider. Beam pixels are selected if
+            they appear in the interpolation neighborhood of any sky pixel where
+            mask is True.
+
+        Returns
+        -------
+        beam_mask : np.ndarray, shape (npix_beam_full,), dtype bool
+            True for beam pixels that touch selected sky pixels' neighborhoods.
+
+        Example
+        -------
+        Select high-altitude sky pixels, then find which beam pixels illuminate them:
+
+            sky_mask = cal.build_sky_mask_altitude(min_altitude_deg=30.0)
+            beam_mask = cal.build_beam_mask_from_sky_pixels(sky_mask)
+            cal.apply_beam_mask(beam_mask)
+        """
+        return self.fwd.build_beam_mask_from_sky_pixels(sky_pixel_mask)
 
     def cache_static_sky_coeffs(self, sky_coeffs):
         """Cache visibility contribution of unmasked (static) sky pixels.

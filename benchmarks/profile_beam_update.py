@@ -78,7 +78,7 @@ def setup_calibrator():
     bm_wgts = cal.get_sky_beam_weighting()
     threshold = bm_wgts.max() / 1000
     mask = bm_wgts > threshold
-    cal.apply_pixel_mask(mask)
+    cal.apply_sky_mask(mask)
 
     npix_active = int(mask.sum())
     print(f"Sky masking: {npix_active}/{npix_sky} pixels active")
