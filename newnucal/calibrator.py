@@ -73,7 +73,7 @@ class AndersonAccelerator:
         history: int,
         start: int = 2,
         damping: float = 0.5,
-        ridge: float = 1e-8,
+        ridge: float = 1e-4,
         max_weight: float = 10.0,
     ):
         self.history    = history
@@ -136,16 +136,9 @@ class AndersonAccelerator:
     def _solve_coeffs(F: np.ndarray, ridge: float = 1e-8) -> np.ndarray:
         """Constrained least-squares mixing coefficients.
 
-        Solves ``min ||F_norm^T beta||`` subject to ``sum(beta) = 1`` with
-        Tikhonov regularisation ``ridge * I`` added to the cosine-similarity
-        Gram matrix ``G = F_norm F_norm^T``, where ``F_norm`` has unit-norm rows.
-
-        Row-normalising F before forming the Gram matrix makes the solve
-        scale-invariant: the mixing weights depend only on the *directions* of
-        past residuals, not their magnitudes.  This prevents large beta
-        oscillations when history residuals are nearly collinear (as occurs
-        with eigenbasis sky parameterisations whose mode amplitudes span many
-        orders of magnitude).
+        Solves ``min ||F^T beta||`` subject to ``sum(beta) = 1`` with
+        Tikhonov regularisation ``ridge * trace(G) * I`` added to the
+        Gram matrix ``G = F F^T``.
 
         Parameters
         ----------
@@ -157,12 +150,9 @@ class AndersonAccelerator:
         beta : np.ndarray, shape (m,)
         """
         n = F.shape[0]
-        # Normalise rows to unit length so the Gram matrix is a cosine-similarity
-        # matrix with diagonal 1 regardless of residual magnitude.
-        row_norms = np.linalg.norm(F, axis=1, keepdims=True)
-        F_norm = F / np.maximum(row_norms, 1e-30)
-        gram = F_norm @ F_norm.T
-        gram = gram + ridge * np.eye(n, dtype=gram.dtype)
+        gram = F @ F.T
+        scale = float(np.trace(gram) / max(n, 1)) if n > 0 else 1.0
+        gram = gram + ridge * max(scale, 1.0) * np.eye(n, dtype=gram.dtype)
         kkt = np.block([
             [gram, np.ones((n, 1), dtype=gram.dtype)],
             [np.ones((1, n), dtype=gram.dtype), np.zeros((1, 1), dtype=gram.dtype)],
@@ -946,20 +936,20 @@ class Calibrator:
         self,
         params,
         *,
-        sky_step_size: float = 0.5,
         sky_beam_reg: float = 1e-3,
         sky_anderson_history: int = 0,
         sky_aa_start: int = 2,
         sky_aa_damping: float = 0.5,
         sky_aa_ridge: float = 1e-8,
         sky_aa_max_weight: float = 10.0,
-        beam_step_size: float = 0.5,
+        sky_line_search_steps: list | None = None,
         beam_sky_reg: float = 1e-3,
         beam_anderson_history: int | None = None,
         beam_aa_start: int = 1,
         beam_aa_damping: float = 0.5,
         beam_aa_ridge: float = 1e-8,
         beam_aa_max_weight: float = 10.0,
+        beam_line_search_steps: list | None = None,
         solve_every: dict | None = None,
         eff_alpha: float = 0.4,
         target_reduced_chi2: float | None = None,
@@ -974,6 +964,10 @@ class Calibrator:
             solve_every = {}
         if beam_anderson_history is None:
             beam_anderson_history = sky_anderson_history
+        if sky_line_search_steps is None:
+            sky_line_search_steps = [0.5, 1.0, 1.5, 2.0]
+        if beam_line_search_steps is None:
+            beam_line_search_steps = [0.5, 1.0, 1.5, 2.0]
 
         params_active = self._params_to_active_space(params)
 
@@ -986,10 +980,10 @@ class Calibrator:
                 'phi': params_active['phi'],
             },
             settings=dict(
-                sky_step_size=sky_step_size,
                 sky_beam_reg=sky_beam_reg,
-                beam_step_size=beam_step_size,
+                sky_line_search_steps=sky_line_search_steps,
                 beam_sky_reg=beam_sky_reg,
+                beam_line_search_steps=beam_line_search_steps,
                 solve_every=dict(solve_every),
                 eff_alpha=eff_alpha,
                 target_reduced_chi2=target_reduced_chi2,
@@ -1048,30 +1042,54 @@ class Calibrator:
 
         def _sky_plain_step(sky, gains, current_loss):
             resid = self.calibrated_residual({'sky_coeffs': sky, **gains})
-            delta = self._sky_update_fn(
-                resid, step_size=s['sky_step_size'], beam_reg=s['sky_beam_reg']
+            # Get base update with step_size=1.0 to enable efficient line search
+            delta_base = self._sky_update_fn(
+                resid, step_size=1.0, beam_reg=s['sky_beam_reg']
             )
-            sky_trial = (sky + delta).astype(DTYPE_R_JAX)
-            loss_trial = float(self._jit_loss({'sky_coeffs': sky_trial, **gains}, self._effective_weights()))
-            if loss_trial < current_loss:
-                return sky_trial, loss_trial
-            return sky, current_loss
+
+            # Line search over multiple step sizes
+            step_sizes = s.get('sky_line_search_steps', [0.5, 1.0, 1.5, 2.0])
+            best_sky = sky
+            best_loss = current_loss
+            best_step_size = 0.0
+
+            for step_sz in step_sizes:
+                sky_trial = (sky + step_sz * delta_base).astype(DTYPE_R_JAX)
+                loss_trial = float(self._jit_loss({'sky_coeffs': sky_trial, **gains}, self._effective_weights()))
+                if loss_trial < best_loss:
+                    best_sky = sky_trial
+                    best_loss = loss_trial
+                    best_step_size = step_sz
+
+            return best_sky, best_loss, best_step_size
 
         def _beam_plain_step(sky, beam, gains, current_loss):
             resid = self.calibrated_residual_variable_beam(
                 {'sky_coeffs': sky, 'beam_coeffs': beam, **gains}
             )
-            delta_bc = self._beam_update_fn(
-                sky, resid, step_size=s['beam_step_size'], sky_reg=s['beam_sky_reg']
+            # Get base update with step_size=1.0 to enable efficient line search
+            delta_bc_base = self._beam_update_fn(
+                sky, resid, step_size=1.0, sky_reg=s['beam_sky_reg']
             )
-            beam_trial = (beam + delta_bc).astype(DTYPE_R_JAX)
-            loss_trial = float(self._jit_loss_variable_beam(
-                {'sky_coeffs': sky, 'beam_coeffs': beam_trial, **gains},
-                self._effective_weights(),
-            ))
-            if loss_trial < current_loss:
-                return beam_trial, loss_trial
-            return beam, current_loss
+
+            # Line search over multiple step sizes
+            step_sizes = s.get('beam_line_search_steps', [0.5, 1.0, 1.5, 2.0])
+            best_beam = beam
+            best_loss = current_loss
+            best_step_size = 0.0
+
+            for step_sz in step_sizes:
+                beam_trial = (beam + step_sz * delta_bc_base).astype(DTYPE_R_JAX)
+                loss_trial = float(self._jit_loss_variable_beam(
+                    {'sky_coeffs': sky, 'beam_coeffs': beam_trial, **gains},
+                    self._effective_weights(),
+                ))
+                if loss_trial < best_loss:
+                    best_beam = beam_trial
+                    best_loss = loss_trial
+                    best_step_size = step_sz
+
+            return best_beam, best_loss, best_step_size
 
         overdue = {}
         if sky_max_every > 0 and state.n_since_sky >= sky_max_every:
@@ -1126,7 +1144,7 @@ class Calibrator:
             if state.beam_dirty_pending:
                 self._sync_beam_cache_from_state(state)
             sky_coeffs = state.params['sky_coeffs']
-            sky_plain, loss_plain = _sky_plain_step(sky_coeffs, gain_params, loss)
+            sky_plain, loss_plain, step_size_used = _sky_plain_step(sky_coeffs, gain_params, loss)
             sky_next = sky_plain
             gain_next = gain_params
             loss_next = loss_plain
@@ -1166,7 +1184,7 @@ class Calibrator:
                     line += "  [AA filtered: beta>max_weight or non-finite]"
                 print(line)
         elif step_type == 'beam':
-            beam_plain, loss_plain = _beam_plain_step(sky_coeffs, beam_coeffs, gain_params, loss)
+            beam_plain, loss_plain, step_size_used = _beam_plain_step(sky_coeffs, beam_coeffs, gain_params, loss)
             beam_next = beam_plain
             loss_next = loss_plain
             used_aa = False
@@ -1263,20 +1281,20 @@ class Calibrator:
         self,
         params,
         n_iter: int = 30,
-        sky_step_size: float = 0.5,
         sky_beam_reg: float = 1e-3,
         sky_anderson_history: int = 0,
         sky_aa_start: int = 2,
         sky_aa_damping: float = 0.5,
         sky_aa_ridge: float = 1e-8,
         sky_aa_max_weight: float = 10.0,
-        beam_step_size: float = 0.5,
+        sky_line_search_steps: list | None = None,
         beam_sky_reg: float = 1e-3,
         beam_anderson_history: int | None = None,
         beam_aa_start: int = 1,
         beam_aa_damping: float = 0.5,
         beam_aa_ridge: float = 1e-8,
         beam_aa_max_weight: float = 10.0,
+        beam_line_search_steps: list | None = None,
         solve_every: dict | None = None,
         eff_alpha: float = 0.4,
         target_reduced_chi2: float | None = None,
@@ -1295,20 +1313,20 @@ class Calibrator:
         """
         state = self.init_alternating_dirty_state(
             params,
-            sky_step_size=sky_step_size,
             sky_beam_reg=sky_beam_reg,
             sky_anderson_history=sky_anderson_history,
             sky_aa_start=sky_aa_start,
             sky_aa_damping=sky_aa_damping,
             sky_aa_ridge=sky_aa_ridge,
             sky_aa_max_weight=sky_aa_max_weight,
-            beam_step_size=beam_step_size,
+            sky_line_search_steps=sky_line_search_steps,
             beam_sky_reg=beam_sky_reg,
             beam_anderson_history=beam_anderson_history,
             beam_aa_start=beam_aa_start,
             beam_aa_damping=beam_aa_damping,
             beam_aa_ridge=beam_aa_ridge,
             beam_aa_max_weight=beam_aa_max_weight,
+            beam_line_search_steps=beam_line_search_steps,
             solve_every=solve_every,
             eff_alpha=eff_alpha,
             target_reduced_chi2=target_reduced_chi2,

@@ -288,7 +288,7 @@ class TestResumableAndChi2Tol:
             return _fake_perf_counter
 
         fit_kwargs = dict(
-            sky_step_size=0.2,
+            sky_line_search_steps=[0.2],  # Single step size replaces old sky_step_size
             sky_anderson_history=2,
             sky_aa_start=1,
             sky_aa_damping=0.5,
@@ -338,8 +338,8 @@ class TestResumableAndChi2Tol:
 
         state = cal.init_alternating_dirty_state(
             params0,
-            sky_step_size=0.05,
-            beam_step_size=0.05,
+            sky_line_search_steps=[0.05],
+            beam_line_search_steps=[0.05],
             sky_anderson_history=0,
             beam_anderson_history=0,
             solve_every={'gains': 0, 'beam': 0},
