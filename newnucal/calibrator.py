@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import jax
 import jax.numpy as jnp
+import healpy
 
 from .array import HERAArray
 from .beam import BeamModel
@@ -233,6 +234,7 @@ class Calibrator:
 
         self.A_sky = np.asarray(sky_model.A, dtype=DTYPE_R_NPY)  # (nfreq, nmodes)
         sky_nside  = sky_model.nside
+        self.beam_model = beam_model
 
         self.fwd = ForwardModel(
             array,
@@ -246,6 +248,7 @@ class Calibrator:
         self.fwd.precompute_time_geometry(self.rot_matrices)
 
         self.pixel_mask = None  # No mask initially
+        self.beam_mask = None   # No beam mask initially
         self._npix_full = self.fwd.npix_sky  # Store original full-sky size (before any masking)
         self._active_size = self._npix_full   # cached; updated by apply_pixel_mask
         self._pixel_indices = None            # int32 indices of active pixels; None means all
@@ -609,6 +612,49 @@ class Calibrator:
         full[self._pixel_indices] = sky
         return full
 
+    def apply_beam_mask(self, mask):
+        """Apply an arbitrary beam pixel mask controlling which pixels are updated.
+
+        Beam pixels where mask is True will be updated during dirty beam steps.
+        Beam pixels where mask is False are left at their original values.
+
+        Note: Beam masks are permanent and cannot be removed; create a new Calibrator
+        if you need to work with different masks.
+
+        Parameters
+        ----------
+        mask : array_like, shape (npix_beam_full,)
+            Boolean mask of beam pixels to update.
+        """
+        mask = np.asarray(mask, dtype=bool)
+        npix_beam_full = len(mask)
+        if npix_beam_full != healpy.nside2npix(self.beam_model.nside):
+            raise ValueError(
+                f"mask size {npix_beam_full} != beam npix_full {healpy.nside2npix(self.beam_model.nside)}"
+            )
+
+        self.beam_mask = mask.copy()
+        self.fwd.apply_beam_mask(mask)
+        self.fwd.precompute_time_geometry(self.rot_matrices)
+        self._recompile_jit()
+
+        n_keep = int(mask.sum())
+        n_drop = int((~mask).sum())
+        print(f'  Beam mask: {n_keep} pixels retained, {n_drop} removed.')
+
+    def apply_ever_illuminated_beam_mask(self):
+        """Restrict beam updates to pixels that are ever illuminated by the sky.
+
+        Convenience wrapper around apply_beam_mask.
+        This can substantially speed up beam dirty updates.
+        """
+        if not self.fwd._geom_ready:
+            raise RuntimeError('Call precompute_time_geometry() first.')
+
+        mask = self.fwd.build_ever_illuminated_beam_mask(self.rot_matrices)
+        mask = np.asarray(mask, dtype=bool)
+        self.apply_beam_mask(mask)
+
     def fit_gains_linear(self, sky_coeffs):
         """Solve for gains with sky held fixed.
 
@@ -690,9 +736,9 @@ class Calibrator:
 
         best_bc = beam_coeffs
         _w = self._effective_weights()
-        best_loss = float(self._jit_loss_variable_beam(
+        best_loss_jax = self._jit_loss_variable_beam(
             {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params}, _w
-        ))
+        )
         current_bc = beam_coeffs
 
         for i in range(n_iter):
@@ -703,19 +749,20 @@ class Calibrator:
                 sky_coeffs, resid, step_size=step_size, sky_reg=sky_reg,
             )
             trial_bc = current_bc + delta_bc
-            loss = float(self._jit_loss_variable_beam(
+            loss_jax = self._jit_loss_variable_beam(
                 {'sky_coeffs': sky_coeffs, 'beam_coeffs': trial_bc, **gain_params}, _w
-            ))
-            if loss < best_loss:
-                best_loss = loss
-                best_bc = trial_bc
-                current_bc = trial_bc
-            else:
-                if verbose:
-                    print('    WARNING: beam dirty loss increased, reverting')
-                break
+            )
+
+            # Use JAX operations to conditionally update (no blocking)
+            improved = loss_jax < best_loss_jax
+            best_loss_jax = jnp.where(improved, loss_jax, best_loss_jax)
+            best_bc = jnp.where(improved, trial_bc, best_bc)
+            current_bc = jnp.where(improved, trial_bc, current_bc)
+
+            # Only materialize for verbose output (unavoidable if verbose)
             if verbose:
-                print(f'    dirty beam iter {i:03d}: loss={loss:.4e}')
+                loss_val = float(loss_jax)
+                print(f'    dirty beam iter {i:03d}: loss={loss_val:.4e}')
 
         # Synchronize cached beam once at the end.
         self.fwd.update_beam_cache(best_bc)
@@ -723,7 +770,7 @@ class Calibrator:
 
         params_out = {'sky_coeffs': sky_coeffs, 'beam_coeffs': best_bc, **gain_params}
         params_out_full = self._params_to_full_space(params_out, params_input)
-        return params_out_full, best_loss
+        return params_out_full, float(best_loss_jax)
 
     def get_sky_beam_weighting(self):
         """Return design matrix normal (Gram) diagonal for all sky pixels.
@@ -792,26 +839,29 @@ class Calibrator:
         velocity = jnp.zeros_like(sky_active)
         best_sky_active = sky_active
         _w = self._effective_weights()
-        best_loss = float(self._jit_loss({'sky_coeffs': sky_active, **gain_params}, _w))
+        best_loss_jax = self._jit_loss({'sky_coeffs': sky_active, **gain_params}, _w)
+
         for i in range(n_iter):
             resid = self.calibrated_residual({'sky_coeffs': sky_active, **gain_params})
             delta = self._sky_update_fn(resid, step_size=step_size, beam_reg=beam_reg)
             velocity = momentum * velocity + delta
             sky_active = sky_active + velocity
-            loss = float(self._jit_loss({'sky_coeffs': sky_active, **gain_params}, _w))
-            if loss < best_loss:
-                best_loss = loss
-                best_sky_active = sky_active
-            else:
-                if verbose:
-                    print('    WARNING: loss increased')
+            loss_jax = self._jit_loss({'sky_coeffs': sky_active, **gain_params}, _w)
+
+            # Use JAX operations to conditionally update (no blocking)
+            improved = loss_jax < best_loss_jax
+            best_loss_jax = jnp.where(improved, loss_jax, best_loss_jax)
+            best_sky_active = jnp.where(improved, sky_active, best_sky_active)
+
+            # Only materialize for verbose output (unavoidable if verbose)
             if verbose:
-                print(f'    dirty iter {i:03d}: loss={loss:.4e}')
+                loss_val = float(loss_jax)
+                print(f'    dirty iter {i:03d}: loss={loss_val:.4e}')
 
         best_sky_full = self._params_to_full_space(
             {'sky_coeffs': best_sky_active}, {'sky_coeffs': sky_input_full}
         )['sky_coeffs']
-        return best_sky_full, best_loss
+        return best_sky_full, float(best_loss_jax)
 
     def fit_with_rfi_reweighting(
         self,

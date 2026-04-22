@@ -60,7 +60,8 @@ class ForwardModel:
         self.freqs = jnp.array(freqs_np, dtype=DTYPE_R_JAX)
 
         self.A_beam = jnp.array(beam_model.A, dtype=DTYPE_R_JAX)
-        self.beam_coeffs = jnp.array(beam_model.coeffs, dtype=DTYPE_R_JAX)
+        self._beam_coeffs_full = jnp.array(beam_model.coeffs, dtype=DTYPE_R_JAX)
+        self.beam_coeffs = self._beam_coeffs_full
 
         self.A_sky = jnp.array(sky_model.A, dtype=DTYPE_R_JAX)
 
@@ -170,6 +171,60 @@ class ForwardModel:
             setattr(self, attr, None)
         return self
 
+    # ------------------------------------------------------------------
+    # Beam masking helpers
+    # ------------------------------------------------------------------
+
+    def build_ever_illuminated_beam_mask(self, rot_matrices):
+        """
+        Return a boolean array of shape (npix_beam_full,) that is True for every
+        beam pixel that is ever illuminated by sky pixels across all times.
+
+        A beam pixel is "illuminated" if any sky pixel falls within its
+        bilinear interpolation neighborhood (nearest 4 HEALPix pixels).
+
+        Call this before :meth:`apply_beam_mask`.
+        """
+        if not self._geom_ready:
+            raise RuntimeError('Call precompute_time_geometry() first to compute interpolation operators.')
+
+        npix_beam_full = healpy.nside2npix(self.beam_model.nside)
+        ever_illuminated = np.zeros(npix_beam_full, dtype=bool)
+
+        for tind in range(len(self._interp_px_all)):
+            px = np.asarray(self._interp_px_all[tind])
+            px_flat = px.reshape(-1)
+            ever_illuminated[px_flat] = True
+
+        return ever_illuminated
+
+    def apply_beam_mask(self, mask):
+        """
+        Permanently restrict the beam model to the pixels selected by *mask*.
+
+        After this call the beam coefficients array has shape (npix_beam, nmodes_beam)
+        where npix_beam = mask.sum(). The precomputed geometry is invalidated;
+        call :meth:`precompute_time_geometry` again.
+
+        Parameters
+        ----------
+        mask : array_like of bool, shape (npix_beam_full,)
+        """
+        mask = np.asarray(mask, dtype=bool)
+        self._beam_mask = mask
+        self._beam_indices = np.where(mask)[0].astype(np.int32)
+
+        # Reduce beam coefficients (always from original unmasked version)
+        beam_coeffs_full = np.asarray(self._beam_coeffs_full)
+        self.beam_coeffs = jnp.array(beam_coeffs_full[mask], dtype=DTYPE_R_JAX)
+
+        # Invalidate geometry
+        self._geom_ready = False
+        for attr in ('_topo_all', '_horizon_all', '_beam_spec_horizon_all',
+                     '_src_x_all', '_src_y_all', '_src_z_all', '_xi_all'):
+            setattr(self, attr, None)
+        return self
+
     def precompute_time_geometry(self, rot_matrices):
         """Precompute time-only geometry and interpolation operators.
 
@@ -195,6 +250,14 @@ class ForwardModel:
 
         # Extract beam arrays once outside the loop for efficiency
         bc_np = np.asarray(self.beam_coeffs)   # (npix_beam, nmodes_beam)
+
+        # If a beam mask is active, expand to full size for interpolation
+        if hasattr(self, '_beam_mask') and self._beam_mask is not None:
+            npix_beam_full = len(self._beam_mask)
+            bc_full = np.zeros((npix_beam_full, bc_np.shape[1]), dtype=bc_np.dtype)
+            bc_full[self._beam_indices] = bc_np
+            bc_np = bc_full
+
         ab_np = np.asarray(self.A_beam)         # (nfreq, nmodes_beam)
         eta_np = np.asarray(self._eta, dtype=DTYPE_R_NPY)
         lat_mat_np = np.asarray(self._lat_mat_2d, dtype=DTYPE_R_NPY)  # (2,2) metres
@@ -382,8 +445,14 @@ class ForwardModel:
         sky_weight = (sky_spec.real ** 2 + sky_spec.imag ** 2).astype(DTYPE_R_NPY)
         sky_pow = sky_weight.sum(axis=1)
 
-        num = np.zeros((self.npix_beam, self.nmodes_beam), dtype=DTYPE_R_NPY)
-        den = np.zeros(self.npix_beam, dtype=DTYPE_R_NPY)
+        npix_beam_accum = self.npix_beam
+        has_beam_mask = hasattr(self, '_beam_mask') and self._beam_mask is not None
+        if has_beam_mask:
+            npix_beam_accum = int(self._beam_mask.sum())
+            npix_beam_full = len(self._beam_mask)
+
+        num = np.zeros((npix_beam_accum, self.nmodes_beam), dtype=DTYPE_R_NPY)
+        den = np.zeros(npix_beam_accum, dtype=DTYPE_R_NPY)
 
         ntime = int(residual_vis.shape[0])
         for tind in range(ntime):
@@ -403,11 +472,27 @@ class ForwardModel:
                 * np.repeat(delta_bi[None, :, :], 4, axis=0).reshape(-1, self.nmodes_beam)
             )
 
-            np.add.at(num, px_flat, contrib)
-            np.add.at(den, px_flat, w_flat)
+            if has_beam_mask:
+                # Only accumulate to masked beam pixels
+                mask_flat = self._beam_mask[px_flat]
+                px_masked = np.searchsorted(self._beam_indices, px_flat[mask_flat])
+                np.add.at(num, px_masked, contrib[mask_flat])
+                np.add.at(den, px_masked, w_flat[mask_flat])
+            else:
+                np.add.at(num, px_flat, contrib)
+                np.add.at(den, px_flat, w_flat)
 
-        delta_bc = num / (den[:, None] + self.eps)
-        delta_bc /= ntime
+        delta_bc_masked = num / (den[:, None] + self.eps)
+        delta_bc_masked /= ntime
+
+        # Expand back to full beam if mask was applied
+        if has_beam_mask:
+            delta_bc_full = np.zeros((npix_beam_full, self.nmodes_beam), dtype=DTYPE_R_NPY)
+            delta_bc_full[self._beam_indices] = np.asarray(delta_bc_masked)
+            delta_bc = delta_bc_full
+        else:
+            delta_bc = delta_bc_masked
+
         return jnp.array(delta_bc, dtype=DTYPE_R_JAX)
 
     def accumulate_beam_update(
@@ -481,7 +566,13 @@ class ForwardModel:
         self._beam_spec_horizon_all = jnp.array(
             np.stack(beam_spec_horizon_all), dtype=DTYPE_R_JAX
         )
-        self.beam_coeffs = jnp.array(bc_np, dtype=DTYPE_R_JAX)
+        # Update both the full version and the masked version (if mask is active)
+        self._beam_coeffs_full = jnp.array(bc_np, dtype=DTYPE_R_JAX)
+        if hasattr(self, '_beam_mask') and self._beam_mask is not None:
+            # Re-apply mask to the updated full coefficients
+            self.beam_coeffs = jnp.array(bc_np[self._beam_indices], dtype=DTYPE_R_JAX)
+        else:
+            self.beam_coeffs = jnp.array(bc_np, dtype=DTYPE_R_JAX)
         self.beam_model.coeffs = bc_np
         # Invalidate compiled simulations so the new precomputed beam is used.
         self._jit_one = jax.jit(self._simulate_one_precomputed)

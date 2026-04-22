@@ -8,6 +8,7 @@ fit_gains_linear recovers gains to near-machine precision.
 import numpy as np
 import jax.numpy as jnp
 import pytest
+import healpy
 
 from newnucal.basis import basis_project
 from newnucal.gains import apply_gains, init_gain_params
@@ -532,3 +533,108 @@ class TestSkyBeamWeighting:
         assert np.all(weights_after_cut[~cal.pixel_mask] == 0.0)
         # Active pixels have nonzero weight (from the reduced set)
         assert np.sum(weights_after_cut[cal.pixel_mask]) > 0.0
+
+
+class TestBeamMasking:
+    def test_build_ever_illuminated_beam_mask(self, calibrator_gains_setup):
+        """build_ever_illuminated_beam_mask should return a valid boolean array."""
+        cal, _ = calibrator_gains_setup
+        mask = cal.fwd.build_ever_illuminated_beam_mask(cal.rot_matrices)
+
+        assert mask.dtype == bool
+        assert mask.shape == (healpy.nside2npix(cal.beam_model.nside),)
+        assert mask.sum() > 0  # Some pixels should be illuminated
+
+    def test_apply_beam_mask_reduces_coefficients(self, calibrator_gains_setup):
+        """apply_beam_mask should reduce beam coefficient array size."""
+        cal, _ = calibrator_gains_setup
+        npix_beam_full = cal.fwd.npix_beam
+
+        # Apply a simple mask: first half of pixels
+        mask = np.zeros(npix_beam_full, dtype=bool)
+        mask[:npix_beam_full//2] = True
+        cal.apply_beam_mask(mask)
+
+        assert cal.fwd.npix_beam == int(mask.sum())
+        assert cal.fwd.beam_coeffs.shape[0] == int(mask.sum())
+
+    def test_apply_ever_illuminated_beam_mask(self, calibrator_gains_setup):
+        """apply_ever_illuminated_beam_mask should reduce to illuminated pixels."""
+        cal, _ = calibrator_gains_setup
+        npix_beam_full = cal.fwd.npix_beam
+
+        cal.apply_ever_illuminated_beam_mask()
+
+        npix_beam_masked = cal.fwd.npix_beam
+        assert npix_beam_masked <= npix_beam_full
+        # For a small nside and ntime, most pixels should be illuminated
+        # so the reduction shouldn't be drastic, but should be nonzero
+        assert npix_beam_masked > 0
+
+    def test_fit_beam_dirty_with_mask(self, calibrator_gains_setup):
+        """Beam dirty updates should work with a beam mask applied."""
+        cal, _ = calibrator_gains_setup
+        params = cal.init_params()
+
+        # Apply a beam mask
+        mask = cal.fwd.build_ever_illuminated_beam_mask(cal.rot_matrices)
+        cal.apply_beam_mask(mask)
+
+        # Run beam dirty update
+        params_out, loss = cal.fit_beam_dirty(params, n_iter=1, verbose=False)
+
+        # Output beam coefficients should be full-size (expanded back)
+        npix_beam_full = healpy.nside2npix(cal.beam_model.nside)
+        assert params_out['beam_coeffs'].shape[0] == npix_beam_full
+
+    def test_pixel_mask_after_beam_mask(self, calibrator_gains_setup):
+        """Applying sky pixel mask after beam mask should work correctly."""
+        cal, _ = calibrator_gains_setup
+        npix_sky_full = cal.fwd.npix_sky
+        npix_beam_full = cal.fwd.npix_beam
+
+        # First apply a beam mask (even if it doesn't reduce size with small nside)
+        beam_mask = np.ones(npix_beam_full, dtype=bool)
+        beam_mask[::2] = False  # Keep only half
+        cal.apply_beam_mask(beam_mask)
+        npix_beam_masked = cal.fwd.npix_beam
+        assert npix_beam_masked == int(beam_mask.sum())
+
+        # Then apply sky pixel mask
+        sky_mask = np.zeros(npix_sky_full, dtype=bool)
+        sky_mask[:npix_sky_full//2] = True
+        cal.apply_pixel_mask(sky_mask)
+
+        # Both masks should be active
+        assert cal.fwd.npix_sky == int(sky_mask.sum())
+        assert cal.fwd.npix_beam == npix_beam_masked  # Beam mask should persist
+
+    def test_pixel_mask_after_alternating_dirty_with_beam_mask(self, calibrator_gains_setup):
+        """Pixel mask after fit_alternating_dirty should work with beam mask active."""
+        cal, _ = calibrator_gains_setup
+        params = cal.init_params()
+        npix_sky_full = cal.fwd.npix_sky
+        npix_beam_full = cal.fwd.npix_beam
+
+        # Apply beam mask before fit
+        beam_mask = np.ones(npix_beam_full, dtype=bool)
+        beam_mask[::2] = False
+        cal.apply_beam_mask(beam_mask)
+        npix_beam_masked = cal.fwd.npix_beam
+
+        # Run alternating dirty fit (which updates the beam cache)
+        state = cal.init_alternating_dirty_state(params)
+        state = cal.run_alternating_dirty_state(state, n_iter=2, verbose=False)
+
+        # After fit, beam mask should still be active
+        assert cal.fwd.npix_beam == npix_beam_masked
+        assert cal.fwd.beam_coeffs.shape[0] == npix_beam_masked
+
+        # Should now be able to change the sky pixel mask
+        sky_mask = np.zeros(npix_sky_full, dtype=bool)
+        sky_mask[:npix_sky_full//2] = True
+        cal.apply_pixel_mask(sky_mask)
+
+        # Both masks should remain active after changing sky mask
+        assert cal.fwd.npix_sky == int(sky_mask.sum())
+        assert cal.fwd.npix_beam == npix_beam_masked
