@@ -355,6 +355,90 @@ def test_sky_update_2d_direction_matches_3d(forward_model, A_sky, rot_matrices):
     )
 
 
+def test_combined_sky_and_beam_update_equivalence(forward_model, A_sky, A_beam, rot_matrices):
+    """Verify combined update gives same results as separate sky+beam updates."""
+    import numpy as np
+
+    # Precompute time geometry
+    forward_model.precompute_time_geometry(rot_matrices)
+
+    rng = np.random.default_rng(42)
+    npix_sky = forward_model.npix_sky
+    nmodes_sky = A_sky.shape[1]
+    nmodes_beam = A_beam.shape[1]
+
+    # Generate test residuals
+    resid = jnp.array(
+        (rng.standard_normal((rot_matrices.shape[0], forward_model.nfreq, forward_model.nbls))
+         + 1j * rng.standard_normal((rot_matrices.shape[0], forward_model.nfreq, forward_model.nbls))
+        ).astype(np.complex64)
+    )
+
+    # Generate random sky coefficients
+    sky_coeffs = jnp.array(
+        rng.standard_normal((npix_sky, nmodes_sky)).astype(np.float32)
+    )
+
+    # Get separate updates
+    sky_delta_sep, beam_delta_sep = (
+        forward_model.accumulate_equatorial_sky_update(resid, step_size=0.5, beam_reg=1e-3),
+        forward_model.accumulate_beam_update(sky_coeffs, resid, step_size=0.5, sky_reg=1e-3),
+    )
+
+    # Get combined updates
+    sky_delta_comb, beam_delta_comb = forward_model.accumulate_sky_and_beam_update(
+        sky_coeffs, resid, sky_step_size=0.5, beam_step_size=0.5, beam_reg=1e-3, sky_reg=1e-3
+    )
+
+    # Check that results are close (within float32 tolerance)
+    np.testing.assert_allclose(sky_delta_sep, sky_delta_comb, rtol=1e-4, atol=1e-6,
+                               err_msg="Sky update differs between combined and separate paths")
+    np.testing.assert_allclose(beam_delta_sep, beam_delta_comb, rtol=1e-4, atol=1e-6,
+                               err_msg="Beam update differs between combined and separate paths")
+
+
+def test_combined_sky_and_beam_update_2d_equivalence(forward_model, A_sky, A_beam, rot_matrices):
+    """Verify 2D combined update gives same results as separate 2D sky+beam updates."""
+    import numpy as np
+
+    # Precompute time geometry
+    forward_model.precompute_time_geometry(rot_matrices)
+
+    rng = np.random.default_rng(43)
+    npix_sky = forward_model.npix_sky
+    nmodes_sky = A_sky.shape[1]
+    nmodes_beam = A_beam.shape[1]
+
+    # Generate test residuals
+    resid = jnp.array(
+        (rng.standard_normal((rot_matrices.shape[0], forward_model.nfreq, forward_model.nbls))
+         + 1j * rng.standard_normal((rot_matrices.shape[0], forward_model.nfreq, forward_model.nbls))
+        ).astype(np.complex64)
+    )
+
+    # Generate random sky coefficients
+    sky_coeffs = jnp.array(
+        rng.standard_normal((npix_sky, nmodes_sky)).astype(np.float32)
+    )
+
+    # Get separate updates (2D path)
+    sky_delta_sep, beam_delta_sep = (
+        forward_model.accumulate_equatorial_sky_update_2d(resid, step_size=0.5, beam_reg=1e-3),
+        forward_model.accumulate_beam_update_2d(sky_coeffs, resid, step_size=0.5, sky_reg=1e-3),
+    )
+
+    # Get combined updates (2D path)
+    sky_delta_comb, beam_delta_comb = forward_model.accumulate_sky_and_beam_update_2d(
+        sky_coeffs, resid, sky_step_size=0.5, beam_step_size=0.5, beam_reg=1e-3, sky_reg=1e-3
+    )
+
+    # Check that results are close (within float32 tolerance)
+    np.testing.assert_allclose(sky_delta_sep, sky_delta_comb, rtol=1e-4, atol=1e-6,
+                               err_msg="2D Sky update differs between combined and separate paths")
+    np.testing.assert_allclose(beam_delta_sep, beam_delta_comb, rtol=1e-4, atol=1e-6,
+                               err_msg="2D Beam update differs between combined and separate paths")
+
+
 def test_calibrator_method_2d(forward_model, A_sky, rot_matrices):
     """Calibrator with method='2d' initialises without error and has non-zero loss."""
     from newnucal.calibrator import Calibrator

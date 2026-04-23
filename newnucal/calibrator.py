@@ -151,8 +151,10 @@ class AndersonAccelerator:
         """
         n = F.shape[0]
         gram = F @ F.T
+        print(f'Gram RAW: {gram.shape}, {np.linalg.svd(gram)[1]}')
         scale = float(np.trace(gram) / max(n, 1)) if n > 0 else 1.0
         gram = gram + ridge * max(scale, 1.0) * np.eye(n, dtype=gram.dtype)
+        print(f'Gram REG: {gram.shape}, {np.linalg.svd(gram)[1]}')
         kkt = np.block([
             [gram, np.ones((n, 1), dtype=gram.dtype)],
             [np.ones((1, n), dtype=gram.dtype), np.zeros((1, 1), dtype=gram.dtype)],
@@ -278,15 +280,17 @@ class Calibrator:
     def _select_methods(self):
         """Bind forward/adjoint callables based on self.method."""
         if self.method == '2d':
-            self._sim_fn          = self.fwd.simulate_2d
-            self._var_beam_sim_fn = self.fwd.simulate_variable_beam_2d
-            self._sky_update_fn   = self.fwd.accumulate_equatorial_sky_update_2d
-            self._beam_update_fn  = self.fwd.accumulate_beam_update_2d
+            self._sim_fn            = self.fwd.simulate_2d
+            self._var_beam_sim_fn   = self.fwd.simulate_variable_beam_2d
+            self._sky_update_fn     = self.fwd.accumulate_equatorial_sky_update_2d
+            self._beam_update_fn    = self.fwd.accumulate_beam_update_2d
+            self._combined_update_fn = self.fwd.accumulate_sky_and_beam_update_2d
         else:
-            self._sim_fn          = self.fwd.simulate
-            self._var_beam_sim_fn = self.fwd.simulate_variable_beam
-            self._sky_update_fn   = self.fwd.accumulate_equatorial_sky_update
-            self._beam_update_fn  = self.fwd.accumulate_beam_update
+            self._sim_fn            = self.fwd.simulate
+            self._var_beam_sim_fn   = self.fwd.simulate_variable_beam
+            self._sky_update_fn     = self.fwd.accumulate_equatorial_sky_update
+            self._beam_update_fn    = self.fwd.accumulate_beam_update
+            self._combined_update_fn = self.fwd.accumulate_sky_and_beam_update
 
     def _get_active_size(self):
         """Return number of active pixels after masking."""
@@ -910,6 +914,97 @@ class Calibrator:
         self._recompile_jit()
 
         params_out = {'sky_coeffs': sky_coeffs, 'beam_coeffs': best_bc, **gain_params}
+        params_out_full = self._params_to_full_space(params_out, params_input)
+        return params_out_full, float(best_loss_jax)
+
+    def fit_sky_and_beam_dirty(
+        self,
+        params,
+        n_iter: int = 3,
+        sky_step_size: float = 0.5,
+        beam_step_size: float = 0.5,
+        beam_reg: float = 1e-3,
+        sky_reg: float = 1e-3,
+        verbose: bool = False,
+    ):
+        """Dirty-map sky and beam update from shared adjoint.
+
+        Simultaneously updates sky coefficients and beam coefficients by computing
+        the dirty apparent sky map once per iteration and deriving both corrections
+        from it. More efficient than calling :meth:`fit_sky_dirty` and
+        :meth:`fit_beam_dirty` separately when both are needed.
+
+        Parameters
+        ----------
+        params : dict
+            Parameter dict with 'sky_coeffs' and 'beam_coeffs'.
+        n_iter : int
+        sky_step_size : float
+        beam_step_size : float
+        beam_reg : float
+            Beam regularisation
+        sky_reg : float
+            Sky regularisation
+        verbose : bool
+
+        Returns
+        -------
+        params_out : dict
+            Updated parameters in full-sky format.
+        best_loss : float
+            Best loss achieved.
+        """
+        params_input = params
+        params = self._params_to_active_space(params)
+
+        sky_coeffs = params['sky_coeffs']
+        gain_params = {k: params[k] for k in self._GAIN_PARAM_KEYS}
+        beam_coeffs = params['beam_coeffs']
+
+        best_sky = sky_coeffs
+        best_bc = beam_coeffs
+        _w = self._effective_weights()
+        best_loss_jax = self._jit_loss_variable_beam(
+            {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params}, _w
+        )
+        current_sky = sky_coeffs
+        current_bc = beam_coeffs
+
+        for i in range(n_iter):
+            resid = self.calibrated_residual_variable_beam(
+                {'sky_coeffs': current_sky, 'beam_coeffs': current_bc, **gain_params}
+            )
+            delta_sky, delta_bc = self._combined_update_fn(
+                current_sky, resid,
+                sky_step_size=sky_step_size,
+                beam_step_size=beam_step_size,
+                beam_reg=beam_reg,
+                sky_reg=sky_reg,
+            )
+            trial_sky = current_sky + delta_sky
+            trial_bc = current_bc + delta_bc
+            loss_jax = self._jit_loss_variable_beam(
+                {'sky_coeffs': trial_sky, 'beam_coeffs': trial_bc, **gain_params}, _w
+            )
+
+            # Use JAX operations to conditionally update (no blocking)
+            improved = loss_jax < best_loss_jax
+            best_loss_jax = jnp.where(improved, loss_jax, best_loss_jax)
+            best_sky = jnp.where(improved, trial_sky, best_sky)
+            best_bc = jnp.where(improved, trial_bc, best_bc)
+            current_sky = jnp.where(improved, trial_sky, current_sky)
+            current_bc = jnp.where(improved, trial_bc, current_bc)
+
+            # Only materialize for verbose output (unavoidable if verbose)
+            if verbose:
+                loss_val = float(loss_jax)
+                print(f'    dirty sky+beam iter {i:03d}: loss={loss_val:.4e}')
+
+        # Synchronize cached beam once at the end.
+        self.fwd.update_beam_cache(best_bc)
+        self._recompile_jit()
+
+        params_out = {'sky_coeffs': best_sky, 'beam_coeffs': best_bc, **gain_params}
         params_out_full = self._params_to_full_space(params_out, params_input)
         return params_out_full, float(best_loss_jax)
 

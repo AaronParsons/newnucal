@@ -540,6 +540,31 @@ class ForwardModel:
         dirty_pf = jnp.fft.ifft(tmp, axis=1)
         return dirty_pf
 
+    def _sky_update_from_dirty(self, dirty_pf, tind, step_size=1.0, beam_reg=1e-3):
+        """Form sky correction from pre-computed dirty apparent sky map.
+
+        Parameters
+        ----------
+        dirty_pf : jnp.ndarray, shape (npix_sky, nfreq), complex
+            Frequency-domain dirty apparent sky map
+        tind : int
+            Time index
+        step_size : float
+        beam_reg : float
+            Regularisation for division by beam weight
+
+        Returns
+        -------
+        delta_app : jnp.ndarray, shape (npix_sky, nfreq), complex
+            Sky correction term
+        weight : jnp.ndarray, shape (npix_sky, nfreq), real
+            Beam power weight (|beam_spec_h|^2)
+        """
+        beam_spec_h = self._beam_spec_horizon_all[tind]   # (npix_sky, nfreq), already * horizon
+        weight = jnp.abs(beam_spec_h) ** 2
+        delta_app = step_size * jnp.conj(beam_spec_h.astype(DTYPE_C_JAX)) * dirty_pf / (weight.astype(DTYPE_C_JAX) + beam_reg)
+        return delta_app, weight
+
     def apparent_sky_update_one_time(
         self,
         residual_fb,
@@ -549,10 +574,7 @@ class ForwardModel:
     ):
         """Form a beam-weighted apparent-sky correction for one time."""
         dirty_pf = self.dirty_apparent_sky_one_time(residual_fb, tind)
-        beam_spec_h = self._beam_spec_horizon_all[tind]   # (npix_sky, nfreq), already * horizon
-        weight = jnp.abs(beam_spec_h) ** 2
-        delta_app = step_size * jnp.conj(beam_spec_h.astype(DTYPE_C_JAX)) * dirty_pf / (weight.astype(DTYPE_C_JAX) + beam_reg)
-        return delta_app, weight
+        return self._sky_update_from_dirty(dirty_pf, tind, step_size, beam_reg)
 
     def _accumulate_equatorial_sky_update_impl(self, residual_vis, sky_update_fn, step_size, beam_reg):
         inds = jnp.arange(int(residual_vis.shape[0]), dtype=jnp.int32)
@@ -578,6 +600,34 @@ class ForwardModel:
             residual_vis, self.apparent_sky_update_one_time, step_size, beam_reg
         )
 
+    def _form_beam_update_one_time(self, sky_spec, sky_weight, dirty_pf, tind, step_size, sky_reg):
+        """Form per-pixel beam update delta from pre-computed dirty apparent sky.
+
+        Parameters
+        ----------
+        sky_spec : np.ndarray, shape (npix_sky, nfreq), complex
+            Sky spectrum (sky_coeffs @ A_sky.T)
+        sky_weight : np.ndarray, shape (npix_sky, nfreq), real
+            Sky power (|sky_spec|^2)
+        dirty_pf : np.ndarray, shape (npix_sky, nfreq), complex
+            Frequency-domain dirty apparent sky
+        tind : int
+            Time index
+        step_size : float
+        sky_reg : float
+            Regularisation for division by sky weight
+
+        Returns
+        -------
+        delta_bi : np.ndarray, shape (npix_sky, nmodes_beam), real
+            Per-pixel beam basis coefficient update
+        """
+        ab_np = np.asarray(self.A_beam, dtype=DTYPE_R_NPY)
+        horizon = np.asarray(self._horizon_all[tind])
+        delta_bsf = step_size * np.conj(sky_spec) * dirty_pf / (sky_weight + sky_reg)
+        delta_bi = (np.real(delta_bsf) * horizon[:, None]) @ ab_np
+        return delta_bi
+
     def _accumulate_beam_update_impl(self, sky_coeffs, residual_vis, dirty_fn, step_size, sky_reg):
         ab_np = np.asarray(self.A_beam, dtype=DTYPE_R_NPY)
 
@@ -597,10 +647,7 @@ class ForwardModel:
         ntime = int(residual_vis.shape[0])
         for tind in range(ntime):
             dirty_pf = np.asarray(dirty_fn(residual_vis[tind], tind))
-            horizon = np.asarray(self._horizon_all[tind])
-
-            delta_bsf = step_size * np.conj(sky_spec) * dirty_pf / (sky_weight + sky_reg)
-            delta_bi = (np.real(delta_bsf) * horizon[:, None]) @ ab_np
+            delta_bi = self._form_beam_update_one_time(sky_spec, sky_weight, dirty_pf, tind, step_size, sky_reg)
 
             px  = self._interp_px_all[tind]
             wgt = self._interp_wgt_all[tind]
@@ -652,6 +699,118 @@ class ForwardModel:
         return self._accumulate_beam_update_impl(
             sky_coeffs, residual_vis, self.dirty_apparent_sky_one_time, step_size, sky_reg
         )
+
+    def accumulate_sky_and_beam_update(
+        self,
+        sky_coeffs,
+        residual_vis,
+        sky_step_size: float = 1.0,
+        beam_step_size: float = 1.0,
+        beam_reg: float = 1e-3,
+        sky_reg: float = 1e-3,
+    ):
+        """Accumulate sky and beam updates from shared adjoint (3D path).
+
+        Computes the dirty apparent sky map once per time step and derives both
+        sky and beam corrections from it. This is more efficient than calling
+        :meth:`accumulate_equatorial_sky_update` and :meth:`accumulate_beam_update`
+        separately on the same residuals, as it halves the number of NUFFT
+        adjoint calls.
+
+        Parameters
+        ----------
+        sky_coeffs : jnp.ndarray, shape (npix_sky, nmodes_sky)
+        residual_vis : jnp.ndarray, shape (ntime, nfreq, nbls), complex
+        sky_step_size : float
+        beam_step_size : float
+        beam_reg : float
+            Beam regularisation parameter
+        sky_reg : float
+            Sky regularisation parameter
+
+        Returns
+        -------
+        sky_update : jnp.ndarray, shape (npix_sky, nmodes_sky)
+        beam_update : jnp.ndarray, shape (npix_beam, nmodes_beam)
+        """
+        if not self._geom_ready:
+            raise RuntimeError('Call precompute_time_geometry() first.')
+
+        # Precompute sky-related quantities
+        sky_spec = np.asarray((jnp.array(sky_coeffs) @ self.A_sky.T).astype(DTYPE_C_JAX))
+        sky_weight = (sky_spec.real ** 2 + sky_spec.imag ** 2).astype(DTYPE_R_NPY)
+        sky_pow = sky_weight.sum(axis=1)
+
+        # Beam accumulation setup
+        npix_beam_accum = self.npix_beam
+        has_beam_mask = hasattr(self, '_beam_mask') and self._beam_mask is not None
+        if has_beam_mask:
+            npix_beam_accum = int(self._beam_mask.sum())
+            npix_beam_full = len(self._beam_mask)
+
+        beam_num = np.zeros((npix_beam_accum, self.nmodes_beam), dtype=DTYPE_R_NPY)
+        beam_den = np.zeros(npix_beam_accum, dtype=DTYPE_R_NPY)
+
+        # Sky accumulation setup
+        sky_num = jnp.zeros((self.npix_sky, self.nfreq), dtype=DTYPE_C_JAX)
+        sky_den = jnp.zeros((self.npix_sky, self.nfreq), dtype=DTYPE_R_JAX)
+
+        ntime = int(residual_vis.shape[0])
+        for tind in range(ntime):
+            # Single dirty map computation per time step
+            dirty_pf = self.dirty_apparent_sky_one_time(residual_vis[tind], tind)
+            dirty_pf_np = np.asarray(dirty_pf)
+
+            # Sky update from dirty map
+            delta_app, weight_sky = self._sky_update_from_dirty(
+                dirty_pf, tind, step_size=sky_step_size, beam_reg=beam_reg
+            )
+            sky_num = sky_num + jnp.array(weight_sky).astype(DTYPE_C_JAX) * jnp.array(delta_app).astype(DTYPE_C_JAX)
+            sky_den = sky_den + jnp.array(weight_sky).astype(DTYPE_R_JAX)
+
+            # Beam update from dirty map
+            delta_bi = self._form_beam_update_one_time(
+                sky_spec, sky_weight, dirty_pf_np, tind, beam_step_size, sky_reg
+            )
+
+            # Scatter beam contributions via interpolation stencil
+            px = self._interp_px_all[tind]
+            wgt = self._interp_wgt_all[tind]
+            px_flat = px.reshape(-1)
+            w_flat = (wgt * sky_pow[None, :]).reshape(-1)
+            contrib = (
+                w_flat[:, None]
+                * np.repeat(delta_bi[None, :, :], 4, axis=0).reshape(-1, self.nmodes_beam)
+            )
+
+            if has_beam_mask:
+                mask_flat = self._beam_mask[px_flat]
+                px_masked = np.searchsorted(self._beam_indices, px_flat[mask_flat])
+                np.add.at(beam_num, px_masked, contrib[mask_flat])
+                np.add.at(beam_den, px_masked, w_flat[mask_flat])
+            else:
+                np.add.at(beam_num, px_flat, contrib)
+                np.add.at(beam_den, px_flat, w_flat)
+
+        # Finalise sky update
+        sky_num_np = np.asarray(sky_num)
+        sky_den_np = np.asarray(sky_den)
+        delta_eq_pf = sky_num_np / (sky_den_np[:, :, None].squeeze() + self.eps)
+        delta_eq_pf = delta_eq_pf / ntime
+        sky_update = (np.real(delta_eq_pf) @ np.asarray(self.A_sky)).astype(DTYPE_R_JAX)
+
+        # Finalise beam update
+        beam_delta_masked = beam_num / (beam_den[:, None] + self.eps)
+        beam_delta_masked /= ntime
+
+        if has_beam_mask:
+            beam_delta_full = np.zeros((npix_beam_full, self.nmodes_beam), dtype=DTYPE_R_NPY)
+            beam_delta_full[self._beam_indices] = beam_delta_masked
+            beam_update = jnp.array(beam_delta_full, dtype=DTYPE_R_JAX)
+        else:
+            beam_update = jnp.array(beam_delta_masked, dtype=DTYPE_R_JAX)
+
+        return sky_update, beam_update
 
     # ------------------------------------------------------------------
     # Beam update helpers
@@ -912,15 +1071,7 @@ class ForwardModel:
     ):
         """Beam-weighted apparent-sky correction for one time (2D path)."""
         dirty_pf = self.dirty_apparent_sky_one_time_2d(residual_fb, tind)
-        beam_spec_h = self._beam_spec_horizon_all[tind]   # (npix_sky, nfreq)
-        weight = jnp.abs(beam_spec_h) ** 2
-        delta_app = (
-            step_size
-            * jnp.conj(beam_spec_h.astype(DTYPE_C_JAX))
-            * dirty_pf
-            / (weight.astype(DTYPE_C_JAX) + beam_reg)
-        )
-        return delta_app, weight
+        return self._sky_update_from_dirty(dirty_pf, tind, step_size, beam_reg)
 
     def accumulate_equatorial_sky_update_2d(
         self,
@@ -950,6 +1101,117 @@ class ForwardModel:
         return self._accumulate_beam_update_impl(
             sky_coeffs, residual_vis, self.dirty_apparent_sky_one_time_2d, step_size, sky_reg
         )
+
+    def accumulate_sky_and_beam_update_2d(
+        self,
+        sky_coeffs,
+        residual_vis,
+        sky_step_size: float = 1.0,
+        beam_step_size: float = 1.0,
+        beam_reg: float = 1e-3,
+        sky_reg: float = 1e-3,
+    ):
+        """Accumulate sky and beam updates from shared adjoint (2D path).
+
+        Identical to :meth:`accumulate_sky_and_beam_update` but uses the 2D
+        NUFFT adjoint pathway instead of the 3D adjoint. Computes the dirty
+        apparent sky map once per time step and derives both sky and beam
+        corrections from it.
+
+        Parameters
+        ----------
+        sky_coeffs : jnp.ndarray, shape (npix_sky, nmodes_sky)
+        residual_vis : jnp.ndarray, shape (ntime, nfreq, nbls), complex
+        sky_step_size : float
+        beam_step_size : float
+        beam_reg : float
+            Beam regularisation parameter
+        sky_reg : float
+            Sky regularisation parameter
+
+        Returns
+        -------
+        sky_update : jnp.ndarray, shape (npix_sky, nmodes_sky)
+        beam_update : jnp.ndarray, shape (npix_beam, nmodes_beam)
+        """
+        if not self._geom_ready:
+            raise RuntimeError('Call precompute_time_geometry() first.')
+
+        # Precompute sky-related quantities
+        sky_spec = np.asarray((jnp.array(sky_coeffs) @ self.A_sky.T).astype(DTYPE_C_JAX))
+        sky_weight = (sky_spec.real ** 2 + sky_spec.imag ** 2).astype(DTYPE_R_NPY)
+        sky_pow = sky_weight.sum(axis=1)
+
+        # Beam accumulation setup
+        npix_beam_accum = self.npix_beam
+        has_beam_mask = hasattr(self, '_beam_mask') and self._beam_mask is not None
+        if has_beam_mask:
+            npix_beam_accum = int(self._beam_mask.sum())
+            npix_beam_full = len(self._beam_mask)
+
+        beam_num = np.zeros((npix_beam_accum, self.nmodes_beam), dtype=DTYPE_R_NPY)
+        beam_den = np.zeros(npix_beam_accum, dtype=DTYPE_R_NPY)
+
+        # Sky accumulation setup
+        sky_num = jnp.zeros((self.npix_sky, self.nfreq), dtype=DTYPE_C_JAX)
+        sky_den = jnp.zeros((self.npix_sky, self.nfreq), dtype=DTYPE_R_JAX)
+
+        ntime = int(residual_vis.shape[0])
+        for tind in range(ntime):
+            # Single dirty map computation per time step (2D adjoint)
+            dirty_pf = self.dirty_apparent_sky_one_time_2d(residual_vis[tind], tind)
+            dirty_pf_np = np.asarray(dirty_pf)
+
+            # Sky update from dirty map
+            delta_app, weight_sky = self._sky_update_from_dirty(
+                dirty_pf, tind, step_size=sky_step_size, beam_reg=beam_reg
+            )
+            sky_num = sky_num + jnp.array(weight_sky).astype(DTYPE_C_JAX) * jnp.array(delta_app).astype(DTYPE_C_JAX)
+            sky_den = sky_den + jnp.array(weight_sky).astype(DTYPE_R_JAX)
+
+            # Beam update from dirty map
+            delta_bi = self._form_beam_update_one_time(
+                sky_spec, sky_weight, dirty_pf_np, tind, beam_step_size, sky_reg
+            )
+
+            # Scatter beam contributions via interpolation stencil
+            px = self._interp_px_all[tind]
+            wgt = self._interp_wgt_all[tind]
+            px_flat = px.reshape(-1)
+            w_flat = (wgt * sky_pow[None, :]).reshape(-1)
+            contrib = (
+                w_flat[:, None]
+                * np.repeat(delta_bi[None, :, :], 4, axis=0).reshape(-1, self.nmodes_beam)
+            )
+
+            if has_beam_mask:
+                mask_flat = self._beam_mask[px_flat]
+                px_masked = np.searchsorted(self._beam_indices, px_flat[mask_flat])
+                np.add.at(beam_num, px_masked, contrib[mask_flat])
+                np.add.at(beam_den, px_masked, w_flat[mask_flat])
+            else:
+                np.add.at(beam_num, px_flat, contrib)
+                np.add.at(beam_den, px_flat, w_flat)
+
+        # Finalise sky update
+        sky_num_np = np.asarray(sky_num)
+        sky_den_np = np.asarray(sky_den)
+        delta_eq_pf = sky_num_np / (sky_den_np + self.eps)
+        delta_eq_pf = delta_eq_pf / ntime
+        sky_update = (np.real(delta_eq_pf) @ np.asarray(self.A_sky)).astype(DTYPE_R_JAX)
+
+        # Finalise beam update
+        beam_delta_masked = beam_num / (beam_den[:, None] + self.eps)
+        beam_delta_masked /= ntime
+
+        if has_beam_mask:
+            beam_delta_full = np.zeros((npix_beam_full, self.nmodes_beam), dtype=DTYPE_R_NPY)
+            beam_delta_full[self._beam_indices] = beam_delta_masked
+            beam_update = jnp.array(beam_delta_full, dtype=DTYPE_R_JAX)
+        else:
+            beam_update = jnp.array(beam_delta_masked, dtype=DTYPE_R_JAX)
+
+        return sky_update, beam_update
 
     # ------------------------------------------------------------------
     # Properties
