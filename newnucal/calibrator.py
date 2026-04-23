@@ -672,10 +672,13 @@ class Calibrator:
 
         Parameters
         ----------
-        sky_pixel_mask : array_like, shape (npix_full,), dtype bool
-            Boolean mask of sky pixels to consider. Beam pixels are selected if
-            they appear in the interpolation neighborhood of any sky pixel where
-            mask is True.
+        sky_pixel_mask : array_like, dtype bool
+            Boolean mask of sky pixels to consider. The shape depends on whether
+            a sky mask has been applied:
+            - If no sky mask applied: shape (npix_full,)
+            - If sky mask applied: shape (npix_masked,)
+            Beam pixels are selected if they appear in the interpolation
+            neighborhood of any sky pixel where mask is True.
 
         Returns
         -------

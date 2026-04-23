@@ -945,3 +945,27 @@ class TestBeamSkyMaskingReverse:
         # (and possibly more due to the stencil structure)
         assert np.all(recovered_sky_mask[initial_sky_mask])
 
+    def test_build_beam_mask_from_sky_pixels_with_applied_sky_mask(self, calibrator_gains_setup):
+        """Should work when a sky mask has been applied but full-size mask is passed in."""
+        cal, _ = calibrator_gains_setup
+        npix_sky_full = cal._npix_full
+        npix_beam_full = healpy.nside2npix(cal.beam_model.nside)
+
+        # Create a weight-based sky mask (simulating the user's scenario)
+        bm_wgts = cal.get_sky_beam_weighting()
+        threshold = bm_wgts.max() / 100
+        sky_mask_full = bm_wgts > threshold  # Full-size mask with some pixels selected
+
+        # Apply the sky mask to the calibrator
+        cal.apply_sky_mask(sky_mask_full)
+
+        # Now call build_beam_mask_from_sky_pixels with the same full-size mask
+        # This should still work (function should auto-detect and convert to masked space)
+        beam_mask = cal.build_beam_mask_from_sky_pixels(sky_mask_full)
+
+        # Verify output shape
+        assert beam_mask.shape == (npix_beam_full,), f"Expected shape {(npix_beam_full,)}, got {beam_mask.shape}"
+        assert beam_mask.dtype == bool
+        # Should have selected some beam pixels (the weighted ones)
+        assert beam_mask.sum() > 0, "Expected non-empty beam mask"
+
