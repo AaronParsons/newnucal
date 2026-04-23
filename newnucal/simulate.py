@@ -192,6 +192,28 @@ class ForwardModel:
             setattr(self, attr, None)
         return self
 
+    def _to_active_sky_mask(self, mask):
+        """Convert a full-sky or active-sky boolean mask to active-pixel space.
+
+        Accepts either a full-sky mask of length ``npix_sky_full`` or an
+        already-active mask of length ``npix_sky``. Returns a boolean array
+        of length ``npix_sky`` (the active pixel count).
+
+        Parameters
+        ----------
+        mask : array_like, dtype bool
+            Shape ``(npix_sky_full,)`` or ``(npix_sky,)``.
+
+        Returns
+        -------
+        mask_active : np.ndarray, shape (npix_sky,), dtype bool
+        """
+        mask = np.asarray(mask, dtype=bool)
+        has_sky_mask = hasattr(self, '_pixel_indices') and self._pixel_indices is not None
+        if has_sky_mask and len(mask) == self.npix_sky_full:
+            return mask[self._pixel_indices]
+        return mask
+
     # ------------------------------------------------------------------
     # Beam masking helpers
     # ------------------------------------------------------------------
@@ -264,22 +286,11 @@ class ForwardModel:
             raise RuntimeError('Call precompute_time_geometry() first.')
 
         beam_pixel_mask = np.asarray(beam_pixel_mask, dtype=bool)
-        npix_sky_full = self.npix_sky
-        sky_mask = np.zeros(npix_sky_full, dtype=bool)
+        sky_mask = np.zeros(self.npix_sky, dtype=bool)
 
-        # For each time step, check which sky pixels have interpolation neighbors
-        # in the selected beam pixels
         for tind in range(len(self._interp_px_all)):
             px = np.asarray(self._interp_px_all[tind], dtype=np.int32)  # (4, npix_sky)
-
-            # For each sky pixel, check if any of its 4 interpolation neighbors
-            # are in the selected beam pixels
-            for sky_idx in range(px.shape[1]):
-                for neighbor_idx in range(4):
-                    beam_pix = px[neighbor_idx, sky_idx]
-                    if beam_pixel_mask[beam_pix]:
-                        sky_mask[sky_idx] = True
-                        break  # No need to check other neighbors for this sky pixel
+            sky_mask |= np.any(beam_pixel_mask[px], axis=0)
 
         return sky_mask
 
@@ -319,23 +330,11 @@ class ForwardModel:
         npix_beam_full = healpy.nside2npix(self.beam_model.nside)
         beam_mask = np.zeros(npix_beam_full, dtype=bool)
 
-        npix_sky_active = self.npix_sky
-        npix_sky_full = int(self._eq_coords_full.shape[1])
-        has_active_mask = npix_sky_active < npix_sky_full
-        is_full_sky_input = len(sky_pixel_mask) == npix_sky_full
-
-        if has_active_mask and is_full_sky_input:
-            mask_active = sky_pixel_mask[self._pixel_indices]
-        else:
-            mask_active = sky_pixel_mask
+        mask_active = self._to_active_sky_mask(sky_pixel_mask)
 
         for tind in range(len(self._interp_px_all)):
-            px = np.asarray(self._interp_px_all[tind], dtype=np.int32)
-            for sky_idx in range(px.shape[1]):
-                if mask_active[sky_idx]:
-                    for neighbor_idx in range(4):
-                        beam_pix = px[neighbor_idx, sky_idx]
-                        beam_mask[beam_pix] = True
+            px = np.asarray(self._interp_px_all[tind], dtype=np.int32)  # (4, npix_sky)
+            beam_mask[px[:, mask_active].ravel()] = True
 
         return beam_mask
 
@@ -960,6 +959,11 @@ class ForwardModel:
     def npix_sky(self) -> int:
         # eq_coords has shape (3, npix_active); reflects any applied pixel mask
         return int(self.eq_coords.shape[1])
+
+    @property
+    def npix_sky_full(self) -> int:
+        # Full-sky pixel count, unaffected by any applied pixel mask
+        return int(self._eq_coords_full.shape[1])
 
     @property
     def npix_beam(self) -> int:

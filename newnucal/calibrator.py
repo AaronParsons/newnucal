@@ -970,16 +970,10 @@ class Calibrator:
             weight_per_sky = (beam_spec_h ** 2).sum(axis=-1)  # (npix_sky, )
 
             # Get the beam interpolation stencil for this time
-            px = np.asarray(self.fwd._interp_px_all[tind], dtype=np.int32)  # (4, npix_sky)
+            px = np.asarray(self.fwd._interp_px_all[tind], dtype=np.int32)   # (4, npix_sky)
             wgt = np.asarray(self.fwd._interp_wgt_all[tind], dtype=DTYPE_R_NPY)  # (4, npix_sky)
 
-            # For each sky pixel, add its weighted contribution to the 4 nearest beam pixels
-            for sky_idx in range(px.shape[1]):
-                w_sky = weight_per_sky[sky_idx]
-                for neighbor_idx in range(4):
-                    beam_pix = px[neighbor_idx, sky_idx]
-                    interp_wgt = wgt[neighbor_idx, sky_idx]
-                    beam_weights[beam_pix] += (interp_wgt ** 2) * w_sky
+            np.add.at(beam_weights, px.ravel(), (wgt ** 2 * weight_per_sky[None, :]).ravel())
 
         return beam_weights
 
