@@ -1158,10 +1158,11 @@ class Calibrator:
             solve_every = {}
         if beam_anderson_history is None:
             beam_anderson_history = sky_anderson_history
+        _default_line_search_steps = [1.0, 3.0]
         if sky_line_search_steps is None:
-            sky_line_search_steps = [0.5, 1.0, 1.5, 2.0]
+            sky_line_search_steps = _default_line_search_steps
         if beam_line_search_steps is None:
-            beam_line_search_steps = [0.5, 1.0, 1.5, 2.0]
+            beam_line_search_steps = _default_line_search_steps
 
         params_active = self._params_to_active_space(params)
 
@@ -1242,7 +1243,7 @@ class Calibrator:
             )
 
             # Line search over multiple step sizes
-            step_sizes = s.get('sky_line_search_steps', [0.5, 1.0, 1.5, 2.0])
+            step_sizes = s.get('sky_line_search_steps', [1.0, 3.0])
             best_sky = sky
             best_loss = current_loss
             best_step_size = 0.0
@@ -1267,7 +1268,7 @@ class Calibrator:
             )
 
             # Line search over multiple step sizes
-            step_sizes = s.get('beam_line_search_steps', [0.5, 1.0, 1.5, 2.0])
+            step_sizes = s.get('beam_line_search_steps', [1.0, 3.0])
             best_beam = beam
             best_loss = current_loss
             best_step_size = 0.0

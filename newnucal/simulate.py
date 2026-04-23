@@ -319,25 +319,20 @@ class ForwardModel:
         npix_beam_full = healpy.nside2npix(self.beam_model.nside)
         beam_mask = np.zeros(npix_beam_full, dtype=bool)
 
-        # Determine if the input mask is full-sky or masked-size
         npix_sky_active = self.npix_sky
         npix_sky_full = int(self._eq_coords_full.shape[1])
+        has_active_mask = npix_sky_active < npix_sky_full
+        is_full_sky_input = len(sky_pixel_mask) == npix_sky_full
 
-        if len(sky_pixel_mask) == npix_sky_full and npix_sky_active < npix_sky_full:
-            # Input is full-sky sized but a mask has been applied
-            # Convert to masked space using pixel indices
+        if has_active_mask and is_full_sky_input:
             mask_active = sky_pixel_mask[self._pixel_indices]
         else:
-            # Input is already in masked space or no mask has been applied
             mask_active = sky_pixel_mask
 
-        # For each time step, mark beam pixels that touch selected sky pixels
         for tind in range(len(self._interp_px_all)):
-            px = np.asarray(self._interp_px_all[tind], dtype=np.int32)  # (4, npix_sky_active)
-
-            # For each active sky pixel, mark all its interpolation neighbors
+            px = np.asarray(self._interp_px_all[tind], dtype=np.int32)
             for sky_idx in range(px.shape[1]):
-                if sky_idx < len(mask_active) and mask_active[sky_idx]:
+                if mask_active[sky_idx]:
                     for neighbor_idx in range(4):
                         beam_pix = px[neighbor_idx, sky_idx]
                         beam_mask[beam_pix] = True
