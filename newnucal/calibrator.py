@@ -238,6 +238,30 @@ class AlternatingDirtyFitState:
     subtract_static_sky: bool = False  # Whether to subtract cached static sky from data
 
 
+@dataclass
+class JointSkyBeamDirtyFitState:
+    """Persistent state for resumable fit_joint_sky_beam_dirty runs."""
+    params: dict
+    settings: dict = field(default_factory=dict)
+    loss: float | None = None
+    reduced_chi2: float | None = None
+    step: int = 0
+
+    joint_acc: AndersonAccelerator | None = None
+
+    eff_joint: float | None = None
+    eff_gains: float | None = None
+
+    n_joint: int = 0
+    n_gains: int = 0
+
+    n_since_joint: int = 0
+    n_since_gains: int = 0
+
+    stop_reason: str | None = None
+    subtract_static_sky: bool = False
+
+
 class Calibrator:
     _GAIN_PARAM_KEYS = ('log_amp', 'phase', 'phi')
 
@@ -1523,6 +1547,71 @@ class Calibrator:
         self._recompile_jit()
         state.beam_dirty_pending = False
 
+    def init_joint_sky_beam_dirty_state(
+        self,
+        params,
+        *,
+        sky_beam_reg: float = 1e-3,
+        joint_anderson_history: int = 0,
+        joint_aa_start: int = 2,
+        joint_aa_damping: float = 0.5,
+        joint_aa_ridge: float = 1e-8,
+        joint_aa_max_weight: float = 10.0,
+        joint_initial_step: float | list = 1.0,
+        joint_step_gain_factor: float = 2.0,
+        solve_every: dict | None = None,
+        eff_alpha: float = 0.4,
+        target_reduced_chi2: float | None = None,
+        reduced_chi2_check_every: int = 1,
+    ):
+        """Create a persistent state for resumable joint sky/beam dirty fits.
+
+        Input params can be in full-sky or active (masked) format.
+        Internal state uses active format; output params are always full-sky.
+        """
+        if solve_every is None:
+            solve_every = {}
+
+        params_active = self._params_to_active_space(params)
+
+        state = JointSkyBeamDirtyFitState(
+            params={
+                'sky_coeffs': params_active['sky_coeffs'],
+                'beam_coeffs': params_active.get('beam_coeffs', self.fwd.beam_coeffs),
+                'log_amp': params_active['log_amp'],
+                'phase': params_active['phase'],
+                'phi': params_active['phi'],
+            },
+            settings=dict(
+                sky_beam_reg=sky_beam_reg,
+                joint_initial_step=joint_initial_step,
+                solve_every=dict(solve_every),
+                eff_alpha=eff_alpha,
+                target_reduced_chi2=target_reduced_chi2,
+                reduced_chi2_check_every=max(int(reduced_chi2_check_every), 1),
+            ),
+            joint_acc=AndersonAccelerator(
+                joint_anderson_history, joint_aa_start, joint_aa_damping,
+                joint_aa_ridge, joint_aa_max_weight,
+                step_gain_factor=joint_step_gain_factor
+            ),
+        )
+
+        # Store full input params for later expansion to full-sky
+        state.settings['params_input_full'] = params
+
+        # Only update beam cache and recompile JIT when the beam actually changed.
+        new_bc = state.params['beam_coeffs']
+        if not np.array_equal(np.asarray(new_bc), np.asarray(self.fwd.beam_coeffs)):
+            self.fwd.update_beam_cache(new_bc)
+            self._recompile_jit()
+        state.loss = float(self._jit_loss_variable_beam(state.params, self._effective_weights()))
+        if target_reduced_chi2 is not None:
+            state.reduced_chi2 = self.calc_reduced_chi2(
+                state.params, explicit_beam=True, subtract_params=0
+            )
+        return state
+
     def _dirty_step_from_state(self, state: AlternatingDirtyFitState, verbose: bool = False):
         """Advance a persistent alternating-dirty state by one step."""
         if state.stop_reason is not None:
@@ -1798,6 +1887,201 @@ class Calibrator:
 
         return state
 
+    def _joint_sky_beam_dirty_step_from_state(self, state: JointSkyBeamDirtyFitState, verbose: bool = False):
+        """Advance a persistent joint sky+beam dirty state by one step."""
+        if state.stop_reason is not None:
+            return state
+
+        s = state.settings
+        gains_max_every = s['solve_every'].get('gains', 1)
+        gains_enabled = (gains_max_every != 0)
+
+        sky_coeffs = state.params['sky_coeffs']
+        beam_coeffs = state.params['beam_coeffs']
+        gain_params = {k: state.params[k] for k in self._GAIN_PARAM_KEYS}
+        loss = float(state.loss)
+        step = state.step
+
+        t_step = _time.perf_counter()
+        loss_pre = loss
+
+        # Determine step type: gains or joint sky+beam
+        overdue = {}
+        if gains_enabled and gains_max_every > 0 and state.n_since_gains >= gains_max_every:
+            overdue['gains'] = state.n_since_gains / gains_max_every
+
+        if overdue or (state.eff_gains is None and gains_enabled):
+            do_gains = True
+        else:
+            do_gains = False
+
+        if do_gains:
+            # Solve gains with sky and beam held fixed
+            sky_coeffs_for_gains = state.params['sky_coeffs']
+            gain_params, loss = self.fit_gains_linear(sky_coeffs_for_gains)
+            dt = max(_time.perf_counter() - t_step, 1e-3)
+            dloss = max(0.0, loss_pre - loss)
+            eff = dloss / (max(loss_pre, 1e-30) * dt)
+            if state.eff_gains is None:
+                state.eff_gains = eff
+            else:
+                ema = s['eff_alpha'] * eff + (1.0 - s['eff_alpha']) * state.eff_gains
+                state.eff_gains = min(ema, eff)
+            state.n_gains += 1
+            state.n_since_gains = 0
+            state.n_since_joint += 1
+            if verbose:
+                print(f"    [gains {state.n_gains - 1:03d}]: loss={loss:.4e}  eff={eff:.2e} frac_Δloss/s")
+        else:
+            # Joint sky+beam step with Anderson acceleration
+            resid = self.calibrated_residual_variable_beam(
+                {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params}
+            )
+            updates = self.compute_adjoint_updates(
+                sky_coeffs, resid, update_mode='both',
+                sky_step_size=1.0, beam_step_size=1.0,
+                beam_reg=s['sky_beam_reg'], sky_reg=s['sky_beam_reg']
+            )
+            delta_sky_base = updates['sky']
+            delta_beam_base = updates['beam']
+
+            joint_sky_trial = sky_coeffs
+            joint_beam_trial = beam_coeffs
+            joint_loss_trial = loss
+            eff_gain = 0.0
+            initial_step = s.get('joint_initial_step', 1.0)
+
+            # If initial_step is a list, do one-time line search to pick the best
+            if isinstance(initial_step, (list, tuple)) and len(state.joint_acc._hist_f) == 0 and state.joint_acc.step_gain == 1.0:
+                selected_step = 1.0
+                for candidate_step in initial_step:
+                    joint_sky_step = (sky_coeffs + candidate_step * delta_sky_base).astype(DTYPE_R_JAX)
+                    joint_beam_step = (beam_coeffs + candidate_step * delta_beam_base).astype(DTYPE_R_JAX)
+                    joint_loss_step = float(self._jit_loss_variable_beam(
+                        {'sky_coeffs': joint_sky_step, 'beam_coeffs': joint_beam_step, **gain_params},
+                        self._effective_weights()
+                    ))
+                    if joint_loss_step < joint_loss_trial:
+                        joint_sky_trial = joint_sky_step
+                        joint_beam_trial = joint_beam_step
+                        joint_loss_trial = joint_loss_step
+                        selected_step = candidate_step
+                # Save the best step as a scalar for future use
+                if joint_loss_trial < loss:
+                    s['joint_initial_step'] = selected_step
+                    if verbose:
+                        print(f"      [initial line search: selected joint_initial_step={selected_step:.2f}]")
+                eff_gain = 1.0  # Return 1.0 so report_step_gain keeps step_gain=1.0
+            else:
+                # Normal retry loop: try current step_gain, then halve if unsuccessful
+                gain_to_try = state.joint_acc.step_gain
+                while gain_to_try >= state.joint_acc._min_step_gain:
+                    joint_sky_step = (sky_coeffs + gain_to_try * initial_step * delta_sky_base).astype(DTYPE_R_JAX)
+                    joint_beam_step = (beam_coeffs + gain_to_try * initial_step * delta_beam_base).astype(DTYPE_R_JAX)
+                    joint_loss_step = float(self._jit_loss_variable_beam(
+                        {'sky_coeffs': joint_sky_step, 'beam_coeffs': joint_beam_step, **gain_params},
+                        self._effective_weights()
+                    ))
+                    if joint_loss_step < joint_loss_trial:
+                        joint_sky_trial = joint_sky_step
+                        joint_beam_trial = joint_beam_step
+                        joint_loss_trial = joint_loss_step
+                        eff_gain = gain_to_try
+                    if joint_loss_trial < loss:
+                        break
+                    gain_to_try *= 0.5
+
+            state.joint_acc.report_step_gain(eff_gain)
+            joint_sky_plain = joint_sky_trial
+            joint_beam_plain = joint_beam_trial
+            joint_loss_plain = joint_loss_trial
+
+            joint_sky_next = joint_sky_plain
+            joint_beam_next = joint_beam_plain
+            joint_loss_next = joint_loss_plain
+            used_aa = False
+
+            # Apply Anderson acceleration to joint (sky, beam) pair
+            if state.joint_acc is not None and state.joint_acc.history > 0:
+                current_flat = np.concatenate([
+                    np.asarray(sky_coeffs, dtype=np.float64).ravel(),
+                    np.asarray(beam_coeffs, dtype=np.float64).ravel(),
+                ])
+                plain_flat = np.concatenate([
+                    np.asarray(joint_sky_plain, dtype=np.float64).ravel(),
+                    np.asarray(joint_beam_plain, dtype=np.float64).ravel(),
+                ])
+
+                aa_candidate_flat = state.joint_acc.push(current_flat, plain_flat)
+                if aa_candidate_flat is not None:
+                    sky_shape = sky_coeffs.shape
+                    beam_shape = beam_coeffs.shape
+                    sky_size = int(np.prod(sky_shape))
+                    joint_sky_cand = jnp.array(
+                        aa_candidate_flat[:sky_size].reshape(sky_shape),
+                        dtype=DTYPE_R_JAX
+                    )
+                    joint_beam_cand = jnp.array(
+                        aa_candidate_flat[sky_size:].reshape(beam_shape),
+                        dtype=DTYPE_R_JAX
+                    )
+                    joint_loss_cand = float(self._jit_loss_variable_beam(
+                        {'sky_coeffs': joint_sky_cand, 'beam_coeffs': joint_beam_cand, **gain_params},
+                        self._effective_weights()
+                    ))
+                    if joint_loss_cand < joint_loss_plain:
+                        joint_sky_next = joint_sky_cand
+                        joint_beam_next = joint_beam_cand
+                        joint_loss_next = joint_loss_cand
+                        used_aa = True
+
+            sky_coeffs = joint_sky_next
+            beam_coeffs = joint_beam_next
+            loss = joint_loss_next
+
+            dt = max(_time.perf_counter() - t_step, 1e-3)
+            dloss = max(0.0, loss_pre - loss)
+            eff = dloss / (max(loss_pre, 1e-30) * dt)
+            state.eff_joint = eff if state.eff_joint is None else s['eff_alpha'] * eff + (1.0 - s['eff_alpha']) * state.eff_joint
+            state.n_joint += 1
+            state.n_since_joint = 0
+            state.n_since_gains += 1
+            if verbose:
+                tag = 'AA' if used_aa else '  '
+                line = f"    [joint {tag} {state.n_joint - 1:03d}]: loss={loss:.4e}  eff={eff:.2e} frac_Δloss/s  step_gain={state.joint_acc.step_gain:.2f}"
+                if used_aa and joint_loss_cand is not None and joint_loss_plain is not None:
+                    line += f"  [AA improved: cand={joint_loss_cand:.4e} vs plain={joint_loss_plain:.4e}]"
+                print(line)
+
+        state.params = {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params}
+        state.loss = float(loss)
+        state.step += 1
+
+        check_every = s['reduced_chi2_check_every']
+        target = s['target_reduced_chi2']
+        if target is not None and (state.step % check_every == 0):
+            state.reduced_chi2 = self.calc_reduced_chi2(
+                state.params, explicit_beam=True, subtract_params=0
+            )
+            if state.reduced_chi2 <= target:
+                state.stop_reason = 'target_reduced_chi2'
+        elif target is None:
+            state.reduced_chi2 = None
+
+        if verbose:
+            elapsed = _time.perf_counter() - state.settings.setdefault('_t0', _time.perf_counter())
+            eff_j = f'{state.eff_joint:.2e}' if state.eff_joint is not None else ' N/A  '
+            eff_g = f'{state.eff_gains:.2e}' if state.eff_gains is not None else ' N/A  '
+            step_type = 'gains' if do_gains else 'joint'
+            msg = (f"  step {state.step - 1:04d} [{step_type:<11}]: chi2={state.loss:.4e}"
+                   f"  eff[joint={eff_j} gains={eff_g}]"
+                   f"  t={elapsed:.1f}s")
+            if state.reduced_chi2 is not None:
+                msg += f"  red_chi2={state.reduced_chi2:.4f}"
+            print(msg)
+
+        return state
+
     def run_alternating_dirty_state(self, state: AlternatingDirtyFitState, n_iter: int = 1, verbose: bool = False, _stop_flag=None):
         """Advance a persistent alternating-dirty state by ``n_iter`` steps."""
         # Handle subtract_static_sky: temporarily adjust data if flag is set
@@ -1842,6 +2126,135 @@ class Calibrator:
             if state.stop_reason is not None:
                 break
 
+
+    def run_joint_sky_beam_dirty_state(self, state: JointSkyBeamDirtyFitState, n_iter: int = 1, verbose: bool = False, _stop_flag=None):
+        """Advance a persistent joint sky+beam dirty state by ``n_iter`` steps."""
+        if state.subtract_static_sky:
+            if not self._static_sky_cached:
+                raise RuntimeError("Static sky not cached. Call cache_static_sky_coeffs() first.")
+            orig_data = self.data
+            self.data = self.data - self._cached_static_vis
+        else:
+            orig_data = None
+
+        if _stop_flag is None:
+            stop = _StopFitFlag()
+            old_handler = _StopFitFlag.install(stop)
+        else:
+            stop = _stop_flag
+            old_handler = None
+        try:
+            for _ in range(n_iter):
+                if stop.stop:
+                    state.stop_reason = 'user_stop'
+                    break
+                if state.stop_reason is not None:
+                    break
+                self._joint_sky_beam_dirty_step_from_state(state, verbose=verbose)
+                if state.stop_reason is not None:
+                    break
+        finally:
+            if orig_data is not None:
+                self.data = orig_data
+            if _stop_flag is None:
+                _StopFitFlag.restore(old_handler)
+        return state
+
+    def iter_joint_sky_beam_dirty(self, state: JointSkyBeamDirtyFitState, n_iter: int, yield_every: int = 1, verbose: bool = False, _stop_flag=None):
+        """Yield a persistent state while advancing the fit."""
+        state = self.run_joint_sky_beam_dirty_state(state, 0, verbose=False, _stop_flag=_stop_flag)
+        for i in range(n_iter):
+            state = self.run_joint_sky_beam_dirty_state(state, 1, verbose=verbose, _stop_flag=_stop_flag)
+            if ((i + 1) % max(int(yield_every), 1) == 0) or state.stop_reason is not None:
+                yield state
+            if state.stop_reason is not None:
+                break
+
+    def fit_joint_sky_beam_dirty(
+        self,
+        params,
+        n_iter: int = 30,
+        sky_beam_reg: float = 1e-3,
+        joint_anderson_history: int = 0,
+        joint_aa_start: int = 2,
+        joint_aa_damping: float = 0.5,
+        joint_aa_ridge: float = 1e-8,
+        joint_aa_max_weight: float = 10.0,
+        joint_initial_step: float | list = 1.0,
+        joint_step_gain_factor: float = 2.0,
+        solve_every: dict | None = None,
+        eff_alpha: float = 0.4,
+        target_reduced_chi2: float | None = None,
+        reduced_chi2_check_every: int = 1,
+        subtract_static_sky: bool = False,
+        verbose: bool = False,
+        _stop_flag=None,
+    ):
+        """Joint sky+beam dirty-map minimisation with optional gain updates.
+
+        Simultaneously updates sky and beam coefficients from a shared adjoint,
+        with optional periodic gain solves via the ``solve_every`` dict.
+        Provides the same resumable state-machine interface as
+        :meth:`fit_alternating_dirty`.
+
+        Parameters are always returned in full-sky format.
+
+        Parameters
+        ----------
+        params : dict
+            Parameter dict with 'sky_coeffs' and 'beam_coeffs' (full-sky or masked).
+        n_iter : int
+        sky_beam_reg : float, default 1e-3
+            Regularisation for sky and beam divisions.
+        anderson_history : int, default 0
+            Number of past iterates for Anderson acceleration on joint (sky, beam) vector.
+            0 disables AA.
+        joint_aa_start : int, default 2
+            Number of plain steps before AA activation.
+        joint_aa_damping : float, default 0.5
+            AA mixing weight.
+        joint_aa_ridge : float, default 1e-8
+            AA Tikhonov regularisation.
+        joint_aa_max_weight : float, default 10.0
+            AA max mixing coefficient.
+        joint_initial_step : float or list, default 1.0
+            Step size for plain joint step. If a list, performs one-time line search
+            on first iteration to select the best value.
+        joint_step_gain_factor : float, default 2.0
+            Factor for adaptive step scaling; step_gain is multiplied by this when
+            iterations stall or boosted when they succeed.
+        solve_every : dict, optional
+            Cadence control: ``{'gains': n}`` solves gains every n steps.
+            Default is ``{'gains': 1}`` (solve gains every step).
+        eff_alpha : float, default 0.4
+            EMA factor for efficiency tracking.
+        target_reduced_chi2 : float, optional
+            Stop when reduced chi-squared reaches this threshold.
+        reduced_chi2_check_every : int, default 1
+            Check reduced chi-squared every this many steps.
+        subtract_static_sky : bool, default False
+            Subtract cached static sky contribution from data before fitting.
+        verbose : bool
+        """
+        state = self.init_joint_sky_beam_dirty_state(
+            params,
+            sky_beam_reg=sky_beam_reg,
+            joint_anderson_history=joint_anderson_history,
+            joint_aa_start=joint_aa_start,
+            joint_aa_damping=joint_aa_damping,
+            joint_aa_ridge=joint_aa_ridge,
+            joint_aa_max_weight=joint_aa_max_weight,
+            joint_initial_step=joint_initial_step,
+            joint_step_gain_factor=joint_step_gain_factor,
+            solve_every=solve_every,
+            eff_alpha=eff_alpha,
+            target_reduced_chi2=target_reduced_chi2,
+            reduced_chi2_check_every=reduced_chi2_check_every,
+        )
+        state.subtract_static_sky = subtract_static_sky
+        state = self.run_joint_sky_beam_dirty_state(state, n_iter=n_iter, verbose=verbose, _stop_flag=_stop_flag)
+        params_full = self._params_to_full_space(state.params, state.settings.get('params_input_full'))
+        return params_full, float(state.loss)
 
     def fit_alternating_dirty(
         self,

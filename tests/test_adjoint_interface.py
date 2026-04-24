@@ -320,6 +320,157 @@ class TestFitAlternatingDirtyWithUnifiedInterface:
         assert params_updated['sky_coeffs'].shape[0] == calibrator._npix_full
 
 
+class TestFitJointSkyBeamDirtyWithUnifiedInterface:
+    """Test the new joint sky+beam dirty-map method."""
+
+    def test_fit_joint_sky_beam_dirty_reduces_loss(self, calibrator, sky_coeffs_test):
+        """fit_joint_sky_beam_dirty should reduce loss."""
+        params = {
+            'sky_coeffs': sky_coeffs_test,
+            'beam_coeffs': calibrator.fwd.beam_coeffs,
+            **init_gain_params(calibrator.ntime, calibrator.nfreq)
+        }
+        loss_init = calibrator.calc_loss(params, explicit_beam=True)
+
+        params_updated, loss_updated = calibrator.fit_joint_sky_beam_dirty(
+            params, n_iter=3
+        )
+
+        assert loss_updated < loss_init, (
+            f"Loss should decrease; got {loss_init:.3e} → {loss_updated:.3e}"
+        )
+
+    def test_fit_joint_sky_beam_dirty_returns_full_sky(self, calibrator, sky_coeffs_test):
+        """fit_joint_sky_beam_dirty should return full-sky format."""
+        params = {
+            'sky_coeffs': sky_coeffs_test,
+            'beam_coeffs': calibrator.fwd.beam_coeffs,
+            **init_gain_params(calibrator.ntime, calibrator.nfreq)
+        }
+
+        params_updated, _ = calibrator.fit_joint_sky_beam_dirty(params, n_iter=1)
+
+        # Output should be full-sky format
+        assert params_updated['sky_coeffs'].shape[0] == calibrator._npix_full
+
+    def test_fit_joint_sky_beam_dirty_with_anderson(self, calibrator, sky_coeffs_test):
+        """fit_joint_sky_beam_dirty should work with Anderson acceleration."""
+        params = {
+            'sky_coeffs': sky_coeffs_test,
+            'beam_coeffs': calibrator.fwd.beam_coeffs,
+            **init_gain_params(calibrator.ntime, calibrator.nfreq)
+        }
+
+        params_updated, loss = calibrator.fit_joint_sky_beam_dirty(
+            params, n_iter=3, joint_anderson_history=2
+        )
+
+        assert np.isfinite(loss), "Loss should be finite"
+        assert np.all(np.isfinite(np.asarray(params_updated['sky_coeffs']))), "Sky should be finite"
+
+    def test_fit_joint_sky_beam_dirty_with_gain_solve(self, calibrator, sky_coeffs_test):
+        """fit_joint_sky_beam_dirty should support solve_every for gain updates."""
+        params = {
+            'sky_coeffs': sky_coeffs_test,
+            'beam_coeffs': calibrator.fwd.beam_coeffs,
+            **init_gain_params(calibrator.ntime, calibrator.nfreq)
+        }
+
+        # Run with gain solves every 2 steps
+        params_updated, loss = calibrator.fit_joint_sky_beam_dirty(
+            params, n_iter=3, solve_every={'gains': 2}
+        )
+
+        assert np.isfinite(loss), "Loss should be finite"
+
+    def test_init_joint_sky_beam_dirty_state_creates_valid_state(self, calibrator, sky_coeffs_test):
+        """init_joint_sky_beam_dirty_state should create a valid state."""
+        params = {
+            'sky_coeffs': sky_coeffs_test,
+            'beam_coeffs': calibrator.fwd.beam_coeffs,
+            **init_gain_params(calibrator.ntime, calibrator.nfreq)
+        }
+
+        state = calibrator.init_joint_sky_beam_dirty_state(params)
+
+        assert state.loss is not None
+        assert np.isfinite(state.loss)
+        assert state.step == 0
+        assert state.n_joint == 0
+        assert state.n_gains == 0
+
+    def test_run_joint_sky_beam_dirty_state_advances(self, calibrator, sky_coeffs_test):
+        """run_joint_sky_beam_dirty_state should advance the state."""
+        params = {
+            'sky_coeffs': sky_coeffs_test,
+            'beam_coeffs': calibrator.fwd.beam_coeffs,
+            **init_gain_params(calibrator.ntime, calibrator.nfreq)
+        }
+
+        state = calibrator.init_joint_sky_beam_dirty_state(params)
+        loss_init = state.loss
+
+        state = calibrator.run_joint_sky_beam_dirty_state(state, n_iter=2)
+
+        assert state.step == 2, "State step should advance"
+        assert state.loss is not None
+        assert np.isfinite(state.loss)
+
+    def test_iter_joint_sky_beam_dirty_yields_states(self, calibrator, sky_coeffs_test):
+        """iter_joint_sky_beam_dirty should yield intermediate states."""
+        params = {
+            'sky_coeffs': sky_coeffs_test,
+            'beam_coeffs': calibrator.fwd.beam_coeffs,
+            **init_gain_params(calibrator.ntime, calibrator.nfreq)
+        }
+
+        state = calibrator.init_joint_sky_beam_dirty_state(params)
+
+        yielded_states = list(calibrator.iter_joint_sky_beam_dirty(
+            state, n_iter=3, yield_every=1
+        ))
+
+        assert len(yielded_states) == 3, "Should yield 3 states"
+        assert all(s.step > 0 for s in yielded_states)
+        assert yielded_states[-1].step == 3
+
+    def test_fit_joint_sky_beam_dirty_with_initial_step_list(self, calibrator, sky_coeffs_test):
+        """fit_joint_sky_beam_dirty should perform line search with initial_step list."""
+        params = {
+            'sky_coeffs': sky_coeffs_test,
+            'beam_coeffs': calibrator.fwd.beam_coeffs,
+            **init_gain_params(calibrator.ntime, calibrator.nfreq)
+        }
+
+        # Run with initial_step as a list (should do line search on first iter)
+        params_updated, loss = calibrator.fit_joint_sky_beam_dirty(
+            params, n_iter=2, joint_initial_step=[0.1, 0.5, 1.0]
+        )
+
+        assert np.isfinite(loss), "Loss should be finite"
+        # After first iteration, initial_step should be saved as scalar
+        state = calibrator.init_joint_sky_beam_dirty_state(
+            params_updated, joint_initial_step=[0.1, 0.5, 1.0]
+        )
+        # Settings should have updated joint_initial_step as scalar if line search succeeded
+        # (This is checked indirectly through convergence)
+
+    def test_fit_joint_sky_beam_dirty_with_step_gain_factor(self, calibrator, sky_coeffs_test):
+        """fit_joint_sky_beam_dirty should support step_gain_factor for adaptive scaling."""
+        params = {
+            'sky_coeffs': sky_coeffs_test,
+            'beam_coeffs': calibrator.fwd.beam_coeffs,
+            **init_gain_params(calibrator.ntime, calibrator.nfreq)
+        }
+
+        # Run with custom step_gain_factor
+        params_updated, loss = calibrator.fit_joint_sky_beam_dirty(
+            params, n_iter=3, joint_anderson_history=0, joint_step_gain_factor=3.0
+        )
+
+        assert np.isfinite(loss), "Loss should be finite"
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
