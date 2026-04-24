@@ -64,8 +64,6 @@ class AndersonAccelerator:
     ridge : float
         Tikhonov regularisation coefficient for the least-squares solve,
         applied relative to the Gram-matrix trace.
-    max_weight : float
-        Reject proposals where any |beta_i| exceeds this value.
     """
 
     def __init__(
@@ -74,7 +72,6 @@ class AndersonAccelerator:
         start: int = 2,
         damping: float = 0.5,
         ridge: float = 1e-4,
-        max_weight: float = 10.0,
         step_gain_max: float = 20.0,
         min_step_gain: float = 0.1,
         step_gain_factor: float = 2.0,
@@ -83,7 +80,6 @@ class AndersonAccelerator:
         self.start      = start
         self.damping    = damping
         self.ridge      = ridge
-        self.max_weight = max_weight
         self._step_gain_max = step_gain_max
         self._min_step_gain = min_step_gain
         self._step_gain_factor = step_gain_factor
@@ -109,7 +105,7 @@ class AndersonAccelerator:
         np.ndarray or None
             Damped AA proposal ``(1-damping)*g_flat + damping*g_aa``, or
             ``None`` when AA is disabled, not yet active, or the mixing
-            coefficients fail validity checks (non-finite or |beta| > max_weight).
+            coefficients fail validity checks (non-finite beta values).
         """
         if self.history == 0:
             return None
@@ -129,11 +125,11 @@ class AndersonAccelerator:
                 # Gram ill-conditioned: boost step_gain for next iteration
                 self.step_gain = min(self.step_gain * self._step_gain_factor, self._step_gain_max)
                 self.clear(reset_step_gain=False)  # preserve boosted step_gain, clear history
-            elif np.all(np.isfinite(beta)) and float(np.max(np.abs(beta))) <= self.max_weight:
+            elif np.all(np.isfinite(beta)):
                 g_aa = np.tensordot(beta, np.stack(self._hist_g, axis=0), axes=1)
                 candidate = (1.0 - self.damping) * g_flat + self.damping * g_aa
             else:
-                # AA filtered: non-finite or oversized coefficients, boost step_gain
+                # AA rejected: non-finite coefficients, boost step_gain
                 self.step_gain = min(self.step_gain * self._step_gain_factor, self._step_gain_max)
                 self.clear(reset_step_gain=False)  # clear history but keep boosted step_gain
 
@@ -1090,7 +1086,6 @@ class Calibrator:
         anderson_history: int = 0,
         anderson_damping: float = 0.5,
         anderson_ridge: float = 1e-8,
-        anderson_max_weight: float = 10.0,
         verbose: bool = False,
         subtract_static_sky: bool = False,
     ):
@@ -1122,8 +1117,6 @@ class Calibrator:
             Mixing weight for AA proposal: ``(1-damping)*plain + damping*aa``.
         anderson_ridge : float, default 1e-8
             Tikhonov regularisation for AA least-squares.
-        anderson_max_weight : float, default 10.0
-            Reject AA proposals where any mixing coefficient exceeds this.
         verbose : bool
         subtract_static_sky : bool, optional
             If True, subtract cached static sky contribution from data before fitting.
@@ -1155,7 +1148,7 @@ class Calibrator:
             # Initialize joint Anderson accelerator for (sky, beam) pair
             aa = AndersonAccelerator(
                 anderson_history, start=2, damping=anderson_damping,
-                ridge=anderson_ridge, max_weight=anderson_max_weight
+                ridge=anderson_ridge
             ) if anderson_history > 0 else None
 
             best_sky = sky_coeffs
@@ -1469,13 +1462,11 @@ class Calibrator:
         sky_aa_start: int = 2,
         sky_aa_damping: float = 0.5,
         sky_aa_ridge: float = 1e-8,
-        sky_aa_max_weight: float = 10.0,
         beam_sky_reg: float = 1e-3,
         beam_anderson_history: int | None = None,
         beam_aa_start: int = 1,
         beam_aa_damping: float = 0.5,
         beam_aa_ridge: float = 1e-8,
-        beam_aa_max_weight: float = 10.0,
         sky_initial_step: float | list = 1.0,
         beam_initial_step: float | list = 1.0,
         sky_step_gain_factor: float = 2.0,
@@ -1517,12 +1508,12 @@ class Calibrator:
             ),
             sky_acc=AndersonAccelerator(
                 sky_anderson_history, sky_aa_start, sky_aa_damping,
-                sky_aa_ridge, sky_aa_max_weight,
+                sky_aa_ridge,
                 step_gain_factor=sky_step_gain_factor
             ),
             beam_acc=AndersonAccelerator(
                 beam_anderson_history, beam_aa_start, beam_aa_damping,
-                beam_aa_ridge, beam_aa_max_weight,
+                beam_aa_ridge,
                 step_gain_factor=beam_step_gain_factor
             ),
         )
@@ -1556,7 +1547,6 @@ class Calibrator:
         joint_aa_start: int = 2,
         joint_aa_damping: float = 0.5,
         joint_aa_ridge: float = 1e-8,
-        joint_aa_max_weight: float = 10.0,
         joint_initial_step: float | list = 1.0,
         joint_step_gain_factor: float = 2.0,
         solve_every: dict | None = None,
@@ -1592,7 +1582,7 @@ class Calibrator:
             ),
             joint_acc=AndersonAccelerator(
                 joint_anderson_history, joint_aa_start, joint_aa_damping,
-                joint_aa_ridge, joint_aa_max_weight,
+                joint_aa_ridge,
                 step_gain_factor=joint_step_gain_factor
             ),
         )
@@ -1824,7 +1814,7 @@ class Calibrator:
                 if aa_proposed and not used_aa:
                     line += f"  [AA rejected: cand={loss_cand:.4e} vs plain={loss_plain:.4e}]"
                 elif not aa_proposed and cand_flat is None and state.sky_acc.history > 0 and state.sky_acc._step > state.sky_acc.start and len(state.sky_acc._hist_f) >= 2:
-                    line += "  [AA filtered: beta>max_weight or non-finite]"
+                    line += "  [AA rejected: non-finite coefficients]"
                 print(line)
         elif step_type == 'beam':
             beam_plain, loss_plain, eff_gain = _beam_plain_step(sky_coeffs, beam_coeffs, gain_params, loss, state.beam_acc.step_gain)
@@ -2179,7 +2169,6 @@ class Calibrator:
         joint_aa_start: int = 2,
         joint_aa_damping: float = 0.5,
         joint_aa_ridge: float = 1e-8,
-        joint_aa_max_weight: float = 10.0,
         joint_initial_step: float | list = 1.0,
         joint_step_gain_factor: float = 2.0,
         solve_every: dict | None = None,
@@ -2215,8 +2204,6 @@ class Calibrator:
             AA mixing weight.
         joint_aa_ridge : float, default 1e-8
             AA Tikhonov regularisation.
-        joint_aa_max_weight : float, default 10.0
-            AA max mixing coefficient.
         joint_initial_step : float or list, default 1.0
             Step size for plain joint step. If a list, performs one-time line search
             on first iteration to select the best value.
@@ -2243,7 +2230,6 @@ class Calibrator:
             joint_aa_start=joint_aa_start,
             joint_aa_damping=joint_aa_damping,
             joint_aa_ridge=joint_aa_ridge,
-            joint_aa_max_weight=joint_aa_max_weight,
             joint_initial_step=joint_initial_step,
             joint_step_gain_factor=joint_step_gain_factor,
             solve_every=solve_every,
@@ -2265,13 +2251,11 @@ class Calibrator:
         sky_aa_start: int = 2,
         sky_aa_damping: float = 0.5,
         sky_aa_ridge: float = 1e-8,
-        sky_aa_max_weight: float = 10.0,
         beam_sky_reg: float = 1e-3,
         beam_anderson_history: int | None = None,
         beam_aa_start: int = 1,
         beam_aa_damping: float = 0.5,
         beam_aa_ridge: float = 1e-8,
-        beam_aa_max_weight: float = 10.0,
         sky_initial_step: float | list = 1.0,
         beam_initial_step: float | list = 1.0,
         sky_step_gain_factor: float = 2.0,
@@ -2306,14 +2290,12 @@ class Calibrator:
             sky_aa_start=sky_aa_start,
             sky_aa_damping=sky_aa_damping,
             sky_aa_ridge=sky_aa_ridge,
-            sky_aa_max_weight=sky_aa_max_weight,
             sky_initial_step=sky_initial_step,
             beam_sky_reg=beam_sky_reg,
             beam_anderson_history=beam_anderson_history,
             beam_aa_start=beam_aa_start,
             beam_aa_damping=beam_aa_damping,
             beam_aa_ridge=beam_aa_ridge,
-            beam_aa_max_weight=beam_aa_max_weight,
             beam_initial_step=beam_initial_step,
             solve_every=solve_every,
             eff_alpha=eff_alpha,
