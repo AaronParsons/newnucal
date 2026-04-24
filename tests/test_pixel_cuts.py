@@ -93,25 +93,25 @@ class TestEverVisibleMask:
 
     def test_shape_and_dtype(self, fwd, rot2):
         f, _ = fwd
-        mask = f.build_ever_visible_mask(rot2)
+        mask = f.build_sky_mask_altitude(rot2, min_altitude_deg=0.0)
         assert mask.shape == (healpy.nside2npix(NSIDE_SKY),)
         assert mask.dtype == bool
 
     def test_some_visible(self, fwd, rot2):
         f, _ = fwd
-        mask = f.build_ever_visible_mask(rot2)
+        mask = f.build_sky_mask_altitude(rot2, min_altitude_deg=0.0)
         assert mask.sum() > 0
 
     def test_not_all_visible(self, fwd, rot2):
         """Southern hemisphere pixels should never rise above horizon."""
         f, _ = fwd
-        mask = f.build_ever_visible_mask(rot2)
+        mask = f.build_sky_mask_altitude(rot2, min_altitude_deg=0.0)
         assert mask.sum() < healpy.nside2npix(NSIDE_SKY)
 
     def test_consistent_with_topo_z(self, fwd, rot2):
         """Each True pixel must be above the horizon in at least one frame."""
         f, _ = fwd
-        mask = f.build_ever_visible_mask(rot2)
+        mask = f.build_sky_mask_altitude(rot2, min_altitude_deg=0.0)
         eq = np.asarray(f.eq_coords)   # (3, npix)
         for px in np.where(mask)[0][:20]:   # spot-check
             any_above = any(
@@ -123,7 +123,7 @@ class TestEverVisibleMask:
     def test_false_pixels_always_below(self, fwd, rot2):
         """Each False pixel must be below the horizon at every time step."""
         f, _ = fwd
-        mask = f.build_ever_visible_mask(rot2)
+        mask = f.build_sky_mask_altitude(rot2, min_altitude_deg=0.0)
         eq = np.asarray(f.eq_coords)
         never_visible = np.where(~mask)[0]
         for px in never_visible[:20]:
@@ -136,7 +136,7 @@ class TestEverVisibleMask:
     def test_pixel_0_visible_for_identity(self, fwd, rot1):
         """Pixel 0 (north pole) should always be above the horizon for identity rotation."""
         f, _ = fwd
-        mask = f.build_ever_visible_mask(rot1)
+        mask = f.build_sky_mask_altitude(rot1, min_altitude_deg=0.0)
         assert mask[0], "Pixel 0 (zenith) should be visible under identity rotation"
 
 
@@ -145,20 +145,20 @@ class TestApplyPixelMask:
     def test_npix_reduced(self, fwd, rot2):
         f, _ = fwd
         npix_before = f.npix_sky
-        mask = f.build_ever_visible_mask(rot2)
+        mask = f.build_sky_mask_altitude(rot2, min_altitude_deg=0.0)
         f.apply_sky_mask(mask)
         assert f.npix_sky == int(mask.sum())
         assert f.npix_sky < npix_before
 
     def test_eq_coords_compressed(self, fwd, rot2):
         f, _ = fwd
-        mask = f.build_ever_visible_mask(rot2)
+        mask = f.build_sky_mask_altitude(rot2, min_altitude_deg=0.0)
         f.apply_sky_mask(mask)
         assert f.eq_coords.shape == (3, int(mask.sum()))
 
     def test_pixel_indices_stored(self, fwd, rot2):
         f, _ = fwd
-        mask = f.build_ever_visible_mask(rot2)
+        mask = f.build_sky_mask_altitude(rot2, min_altitude_deg=0.0)
         f.apply_sky_mask(mask)
         assert hasattr(f, '_pixel_indices')
         assert len(f._pixel_indices) == int(mask.sum())
@@ -168,14 +168,14 @@ class TestApplyPixelMask:
         f, _ = fwd
         f.precompute_time_geometry(rot2)
         assert f._geom_ready
-        mask = f.build_ever_visible_mask(rot2)
+        mask = f.build_sky_mask_altitude(rot2, min_altitude_deg=0.0)
         f.apply_sky_mask(mask)
         assert not f._geom_ready
 
     def test_simulate_after_mask(self, fwd, rot2):
         """simulate() should return correct shape and finite values after masking."""
         f, A = fwd
-        mask = f.build_ever_visible_mask(rot2)
+        mask = f.build_sky_mask_altitude(rot2, min_altitude_deg=0.0)
         f.apply_sky_mask(mask)
         f.precompute_time_geometry(rot2)
         vis = f.simulate(_zero_sky(f, A), rot2)
@@ -186,7 +186,7 @@ class TestApplyPixelMask:
     def test_zenith_source_nonzero_after_mask(self, fwd, rot1):
         """A pixel above the horizon, retained by the mask, should give nonzero vis."""
         f, A = fwd
-        mask = f.build_ever_visible_mask(rot1)
+        mask = f.build_sky_mask_altitude(rot1, min_altitude_deg=0.0)
         f.apply_sky_mask(mask)
         f.precompute_time_geometry(rot1)
         # Pixel 0 in the compressed sky corresponds to the lowest original index
@@ -207,7 +207,7 @@ class TestApplyPixelMask:
         vis_full = f.simulate(sky_full, rot1)
 
         # Masked model: apply horizon cut, find where pixel 0 landed
-        mask = f.build_ever_visible_mask(rot1)
+        mask = f.build_sky_mask_altitude(rot1, min_altitude_deg=0.0)
         assert mask[0], "pixel 0 must survive horizon mask for this test"
         f.apply_sky_mask(mask)
         f.precompute_time_geometry(rot1)
@@ -233,17 +233,20 @@ class TestCalibratorPixelCuts:
 
     def test_apply_horizon_cut_reduces_npix(self, calibrator):
         npix_before = calibrator.fwd.npix_sky
-        n_keep = calibrator.apply_horizon_cut()
+        mask = calibrator.build_sky_mask_altitude(min_altitude_deg=0.0)
+        calibrator.apply_sky_mask(mask)
         assert calibrator.fwd.npix_sky < npix_before
-        assert calibrator.fwd.npix_sky == n_keep
+        assert calibrator.fwd.npix_sky == int(mask.sum())
 
     def test_apply_horizon_cut_recomputes_geometry(self, calibrator):
-        calibrator.apply_horizon_cut()
+        mask = calibrator.build_sky_mask_altitude(min_altitude_deg=0.0)
+        calibrator.apply_sky_mask(mask)
         assert calibrator.fwd._geom_ready
 
     def test_loss_finite_after_horizon_cut(self, calibrator):
         params = calibrator.init_params()
-        calibrator.apply_horizon_cut()
+        mask = calibrator.build_sky_mask_altitude(min_altitude_deg=0.0)
+        calibrator.apply_sky_mask(mask)
         # Rebuild sky_coeffs for new npix
         params['sky_coeffs'] = jnp.zeros(
             (calibrator.fwd.npix_sky, calibrator.fwd.A_sky.shape[1])
@@ -273,11 +276,12 @@ class TestAndersonAccelerator:
         assert abs(beta.sum() - 1.0) < 1e-6, f"beta sums to {beta.sum():.6f}, not 1"
 
     def test_solve_coeffs_trivial_case(self):
-        """With n=1 the only solution is beta=[1]."""
+        """With n=2 and orthogonal rows, sum to 1."""
         from newnucal.calibrator import AndersonAccelerator
-        F = np.array([[1.0, 2.0, 3.0]])
+        F = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
         beta = AndersonAccelerator._solve_coeffs(F)
-        assert abs(beta[0] - 1.0) < 1e-6
+        assert beta is not None
+        assert abs(beta.sum() - 1.0) < 1e-6
 
     def test_solve_coeffs_finite_values(self):
         from newnucal.calibrator import AndersonAccelerator
