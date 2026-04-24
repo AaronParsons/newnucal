@@ -4,6 +4,7 @@ Calibrator — ties together ForwardModel, gain parameters, and optimisation.
 
 import signal as _signal
 import time as _time
+from collections import deque
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -84,8 +85,8 @@ class AndersonAccelerator:
         self._min_step_gain = min_step_gain
         self._step_gain_factor = step_gain_factor
         self.step_gain = 1.0
-        self._hist_g: list[np.ndarray] = []
-        self._hist_f: list[np.ndarray] = []
+        self._hist_g: deque[np.ndarray] = deque(maxlen=history)
+        self._hist_f: deque[np.ndarray] = deque(maxlen=history)
         self._step = 0
 
     def push(
@@ -113,25 +114,18 @@ class AndersonAccelerator:
         f_flat = g_flat - x_flat
         self._hist_g.append(g_flat.copy())
         self._hist_f.append(f_flat.copy())
-        if len(self._hist_g) > self.history:
-            self._hist_g.pop(0)
-            self._hist_f.pop(0)
 
         candidate = None
         if self._step >= self.start and len(self._hist_f) >= 2:
             F    = np.stack(self._hist_f, axis=0)
             beta = self._solve_coeffs(F, self.ridge)
-            if beta is None:
-                # Gram ill-conditioned: boost step_gain for next iteration
-                self.step_gain = min(self.step_gain * self._step_gain_factor, self._step_gain_max)
-                self.clear(reset_step_gain=False)  # preserve boosted step_gain, clear history
-            elif np.all(np.isfinite(beta)):
+            if beta is not None and np.all(np.isfinite(beta)):
                 g_aa = np.tensordot(beta, np.stack(self._hist_g, axis=0), axes=1)
                 candidate = (1.0 - self.damping) * g_flat + self.damping * g_aa
             else:
-                # AA rejected: non-finite coefficients, boost step_gain
+                # Gram ill-conditioned or non-finite beta: boost step_gain and clear history
                 self.step_gain = min(self.step_gain * self._step_gain_factor, self._step_gain_max)
-                self.clear(reset_step_gain=False)  # clear history but keep boosted step_gain
+                self.clear(reset_step_gain=False)
 
         self._step += 1
         return candidate
