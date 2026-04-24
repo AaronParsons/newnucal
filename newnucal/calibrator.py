@@ -899,6 +899,98 @@ class Calibrator:
         self._jit_loss_variable_beam = jax.jit(self._loss_variable_beam)
         self._jit_simulate = jax.jit(self._sim_fn)
 
+    def compute_adjoint_updates(self, sky_coeffs, residual_vis, update_mode='both', **kwargs):
+        """Unified interface for sky/beam adjoint updates.
+
+        Computes corrections to sky and/or beam coefficients from calibrated
+        residuals via dirty-map adjoints. The mode controls whether sky, beam,
+        or both are updated; when both are updated, a single shared adjoint
+        computation is used for efficiency.
+
+        Parameters
+        ----------
+        sky_coeffs : array, shape (npix_sky, nmodes_sky)
+            Sky coefficients (full-sky or active/masked). Required for mode='beam'
+            and mode='both'; can be None for mode='sky'.
+        residual_vis : array, shape (ntime, nfreq, nbls), complex
+            Gain-calibrated residuals.
+        update_mode : {'sky', 'beam', 'both'}
+            Which parameters to update:
+            - 'sky': sky coefficients only (uses beam_reg param)
+            - 'beam': beam coefficients only (uses sky_reg param)
+            - 'both': both parameters from shared adjoint (uses sky_step_size,
+              beam_step_size, beam_reg, sky_reg params)
+        **kwargs : dict
+            Mode-specific keyword arguments. See Notes for details.
+
+        Returns
+        -------
+        updates : dict
+            Keys present depend on update_mode:
+            - 'sky': always returned for modes 'sky' and 'both'
+            - 'beam': always returned for modes 'beam' and 'both'
+            Each value is the corresponding coefficient correction.
+
+        Notes
+        -----
+        Keyword arguments by update_mode:
+
+        For update_mode='sky':
+            step_size : float, default 1.0
+            beam_reg : float, default 1e-3
+                Beam regularisation for division.
+
+        For update_mode='beam':
+            step_size : float, default 1.0
+            sky_reg : float, default 1e-3
+                Sky regularisation for division.
+
+        For update_mode='both':
+            sky_step_size : float, default 1.0
+            beam_step_size : float, default 1.0
+            beam_reg : float, default 1e-3
+            sky_reg : float, default 1e-3
+
+        The 'both' mode computes a single dirty-map adjoint and applies
+        step-weighted sky and beam corrections in sequence (Jacobi coupling
+        rather than Gauss-Seidel). This is more efficient than calling sky
+        and beam updates separately, but the sequence reflects the shared
+        residual linearisation. For tight control, use mode='sky' and
+        mode='beam' separately with re-solved gains between.
+        """
+        if update_mode == 'sky':
+            step_size = kwargs.get('step_size', 1.0)
+            beam_reg = kwargs.get('beam_reg', 1e-3)
+            sky_upd = self._sky_update_fn(residual_vis, step_size=step_size, beam_reg=beam_reg)
+            return {'sky': sky_upd}
+
+        elif update_mode == 'beam':
+            if sky_coeffs is None:
+                raise ValueError("sky_coeffs is required for update_mode='beam'")
+            step_size = kwargs.get('step_size', 1.0)
+            sky_reg = kwargs.get('sky_reg', 1e-3)
+            beam_upd = self._beam_update_fn(sky_coeffs, residual_vis, step_size=step_size, sky_reg=sky_reg)
+            return {'beam': beam_upd}
+
+        elif update_mode == 'both':
+            if sky_coeffs is None:
+                raise ValueError("sky_coeffs is required for update_mode='both'")
+            sky_step_size = kwargs.get('sky_step_size', 1.0)
+            beam_step_size = kwargs.get('beam_step_size', 1.0)
+            beam_reg = kwargs.get('beam_reg', 1e-3)
+            sky_reg = kwargs.get('sky_reg', 1e-3)
+            sky_upd, beam_upd = self._combined_update_fn(
+                sky_coeffs, residual_vis,
+                sky_step_size=sky_step_size,
+                beam_step_size=beam_step_size,
+                beam_reg=beam_reg,
+                sky_reg=sky_reg,
+            )
+            return {'sky': sky_upd, 'beam': beam_upd}
+
+        else:
+            raise ValueError(f"update_mode must be 'sky', 'beam', or 'both', got {update_mode!r}")
+
     def fit_beam_dirty(
         self,
         params,
@@ -934,9 +1026,11 @@ class Calibrator:
             resid = self.calibrated_residual_variable_beam(
                 {'sky_coeffs': sky_coeffs, 'beam_coeffs': current_bc, **gain_params}
             )
-            delta_bc = self._beam_update_fn(
-                sky_coeffs, resid, step_size=step_size, sky_reg=sky_reg,
+            updates = self.compute_adjoint_updates(
+                sky_coeffs, resid, update_mode='beam',
+                step_size=step_size, sky_reg=sky_reg
             )
+            delta_bc = updates['beam']
             trial_bc = current_bc + delta_bc
             loss_jax = self._jit_loss_variable_beam(
                 {'sky_coeffs': sky_coeffs, 'beam_coeffs': trial_bc, **gain_params}, _w
@@ -970,6 +1064,7 @@ class Calibrator:
         beam_reg: float = 1e-3,
         sky_reg: float = 1e-3,
         verbose: bool = False,
+        subtract_static_sky: bool = False,
     ):
         """Dirty-map sky and beam update from shared adjoint.
 
@@ -990,6 +1085,9 @@ class Calibrator:
         sky_reg : float
             Sky regularisation
         verbose : bool
+        subtract_static_sky : bool, optional
+            If True, subtract cached static sky contribution from data before fitting.
+            Requires cache_static_sky_coeffs() to be called first.
 
         Returns
         -------
@@ -998,59 +1096,73 @@ class Calibrator:
         best_loss : float
             Best loss achieved.
         """
-        params_input = params
-        params = self._params_to_active_space(params)
+        if subtract_static_sky:
+            if not self._static_sky_cached:
+                raise RuntimeError("Static sky not cached. Call cache_static_sky_coeffs() first.")
+            orig_data = self.data
+            self.data = self.data - self._cached_static_vis
+        else:
+            orig_data = None
 
-        sky_coeffs = params['sky_coeffs']
-        gain_params = {k: params[k] for k in self._GAIN_PARAM_KEYS}
-        beam_coeffs = params['beam_coeffs']
+        try:
+            params_input = params
+            params = self._params_to_active_space(params)
 
-        best_sky = sky_coeffs
-        best_bc = beam_coeffs
-        _w = self._effective_weights()
-        best_loss_jax = self._jit_loss_variable_beam(
-            {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params}, _w
-        )
-        current_sky = sky_coeffs
-        current_bc = beam_coeffs
+            sky_coeffs = params['sky_coeffs']
+            gain_params = {k: params[k] for k in self._GAIN_PARAM_KEYS}
+            beam_coeffs = params['beam_coeffs']
 
-        for i in range(n_iter):
-            resid = self.calibrated_residual_variable_beam(
-                {'sky_coeffs': current_sky, 'beam_coeffs': current_bc, **gain_params}
+            best_sky = sky_coeffs
+            best_bc = beam_coeffs
+            _w = self._effective_weights()
+            best_loss_jax = self._jit_loss_variable_beam(
+                {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params}, _w
             )
-            delta_sky, delta_bc = self._combined_update_fn(
-                current_sky, resid,
-                sky_step_size=sky_step_size,
-                beam_step_size=beam_step_size,
-                beam_reg=beam_reg,
-                sky_reg=sky_reg,
-            )
-            trial_sky = current_sky + delta_sky
-            trial_bc = current_bc + delta_bc
-            loss_jax = self._jit_loss_variable_beam(
-                {'sky_coeffs': trial_sky, 'beam_coeffs': trial_bc, **gain_params}, _w
-            )
+            current_sky = sky_coeffs
+            current_bc = beam_coeffs
 
-            # Use JAX operations to conditionally update (no blocking)
-            improved = loss_jax < best_loss_jax
-            best_loss_jax = jnp.where(improved, loss_jax, best_loss_jax)
-            best_sky = jnp.where(improved, trial_sky, best_sky)
-            best_bc = jnp.where(improved, trial_bc, best_bc)
-            current_sky = jnp.where(improved, trial_sky, current_sky)
-            current_bc = jnp.where(improved, trial_bc, current_bc)
+            for i in range(n_iter):
+                resid = self.calibrated_residual_variable_beam(
+                    {'sky_coeffs': current_sky, 'beam_coeffs': current_bc, **gain_params}
+                )
+                updates = self.compute_adjoint_updates(
+                    current_sky, resid, update_mode='both',
+                    sky_step_size=sky_step_size,
+                    beam_step_size=beam_step_size,
+                    beam_reg=beam_reg,
+                    sky_reg=sky_reg,
+                )
+                delta_sky = updates['sky']
+                delta_bc = updates['beam']
+                trial_sky = current_sky + delta_sky
+                trial_bc = current_bc + delta_bc
+                loss_jax = self._jit_loss_variable_beam(
+                    {'sky_coeffs': trial_sky, 'beam_coeffs': trial_bc, **gain_params}, _w
+                )
 
-            # Only materialize for verbose output (unavoidable if verbose)
-            if verbose:
-                loss_val = float(loss_jax)
-                print(f'    dirty sky+beam iter {i:03d}: loss={loss_val:.4e}')
+                # Use JAX operations to conditionally update (no blocking)
+                improved = loss_jax < best_loss_jax
+                best_loss_jax = jnp.where(improved, loss_jax, best_loss_jax)
+                best_sky = jnp.where(improved, trial_sky, best_sky)
+                best_bc = jnp.where(improved, trial_bc, best_bc)
+                current_sky = jnp.where(improved, trial_sky, current_sky)
+                current_bc = jnp.where(improved, trial_bc, current_bc)
 
-        # Synchronize cached beam once at the end.
-        self.fwd.update_beam_cache(best_bc)
-        self._recompile_jit()
+                # Only materialize for verbose output (unavoidable if verbose)
+                if verbose:
+                    loss_val = float(loss_jax)
+                    print(f'    dirty sky+beam iter {i:03d}: loss={loss_val:.4e}')
 
-        params_out = {'sky_coeffs': best_sky, 'beam_coeffs': best_bc, **gain_params}
-        params_out_full = self._params_to_full_space(params_out, params_input)
-        return params_out_full, float(best_loss_jax)
+            # Synchronize cached beam once at the end.
+            self.fwd.update_beam_cache(best_bc)
+            self._recompile_jit()
+
+            params_out = {'sky_coeffs': best_sky, 'beam_coeffs': best_bc, **gain_params}
+            params_out_full = self._params_to_full_space(params_out, params_input)
+            return params_out_full, float(best_loss_jax)
+        finally:
+            if orig_data is not None:
+                self.data = orig_data
 
     def get_sky_beam_weighting(self):
         """Return design matrix normal (Gram) diagonal for all sky pixels.
@@ -1167,7 +1279,11 @@ class Calibrator:
 
             for i in range(n_iter):
                 resid = self.calibrated_residual({'sky_coeffs': sky_active, **gain_params})
-                delta = self._sky_update_fn(resid, step_size=step_size, beam_reg=beam_reg)
+                updates = self.compute_adjoint_updates(
+                    sky_active, resid, update_mode='sky',
+                    step_size=step_size, beam_reg=beam_reg
+                )
+                delta = updates['sky']
                 velocity = momentum * velocity + delta
                 sky_active = sky_active + velocity
                 loss_jax = self._jit_loss({'sky_coeffs': sky_active, **gain_params}, _w)
@@ -1370,9 +1486,11 @@ class Calibrator:
         def _sky_plain_step(sky, gains, current_loss, step_gain=1.0):
             resid = self.calibrated_residual({'sky_coeffs': sky, **gains})
             # Get base update with step_size=1.0 to enable efficient scaling
-            delta_base = self._sky_update_fn(
-                resid, step_size=1.0, beam_reg=s['sky_beam_reg']
+            updates = self.compute_adjoint_updates(
+                sky, resid, update_mode='sky',
+                step_size=1.0, beam_reg=s['sky_beam_reg']
             )
+            delta_base = updates['sky']
 
             best_sky = sky
             best_loss = current_loss
@@ -1416,9 +1534,11 @@ class Calibrator:
                 {'sky_coeffs': sky, 'beam_coeffs': beam, **gains}
             )
             # Get base update with step_size=1.0 to enable efficient scaling
-            delta_bc_base = self._beam_update_fn(
-                sky, resid, step_size=1.0, sky_reg=s['beam_sky_reg']
+            updates = self.compute_adjoint_updates(
+                sky, resid, update_mode='beam',
+                step_size=1.0, sky_reg=s['beam_sky_reg']
             )
+            delta_bc_base = updates['beam']
 
             best_beam = beam
             best_loss = current_loss
