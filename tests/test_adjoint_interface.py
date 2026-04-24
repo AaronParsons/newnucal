@@ -266,6 +266,25 @@ class TestFitSkyAndBeamDirtyWithUnifiedInterface:
         assert np.all(np.isfinite(np.asarray(params_updated['sky_coeffs']))), "Sky should be finite"
         assert np.all(np.isfinite(np.asarray(params_updated['beam_coeffs']))), "Beam should be finite"
 
+    def test_fit_sky_and_beam_dirty_with_anderson_acceleration(self, calibrator, sky_coeffs_test):
+        """fit_sky_and_beam_dirty should work with Anderson acceleration enabled."""
+        params = {
+            'sky_coeffs': sky_coeffs_test,
+            'beam_coeffs': calibrator.fwd.beam_coeffs,
+            **init_gain_params(calibrator.ntime, calibrator.nfreq)
+        }
+
+        # Run with AA enabled (need at least 2 iterations for AA to activate)
+        params_updated, loss = calibrator.fit_sky_and_beam_dirty(
+            params, n_iter=3, sky_step_size=0.5, beam_step_size=0.5,
+            anderson_history=2
+        )
+
+        # Verify outputs are valid
+        assert np.isfinite(loss), "Loss should be finite"
+        assert np.all(np.isfinite(np.asarray(params_updated['sky_coeffs']))), "Sky should be finite"
+        assert np.all(np.isfinite(np.asarray(params_updated['beam_coeffs']))), "Beam should be finite"
+
 
 class TestFitAlternatingDirtyWithUnifiedInterface:
     """Test that fit_alternating_dirty works with unified interface."""

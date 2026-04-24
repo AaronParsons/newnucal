@@ -1063,6 +1063,10 @@ class Calibrator:
         beam_step_size: float = 0.5,
         beam_reg: float = 1e-3,
         sky_reg: float = 1e-3,
+        anderson_history: int = 0,
+        anderson_damping: float = 0.5,
+        anderson_ridge: float = 1e-8,
+        anderson_max_weight: float = 10.0,
         verbose: bool = False,
         subtract_static_sky: bool = False,
     ):
@@ -1072,6 +1076,10 @@ class Calibrator:
         the dirty apparent sky map once per iteration and deriving both corrections
         from it. More efficient than calling :meth:`fit_sky_dirty` and
         :meth:`fit_beam_dirty` separately when both are needed.
+
+        Anderson acceleration can be applied to the joint (sky, beam) parameter
+        vector to accelerate convergence. This respects the coupling between
+        sky and beam updates inherent in the shared adjoint.
 
         Parameters
         ----------
@@ -1084,6 +1092,14 @@ class Calibrator:
             Beam regularisation
         sky_reg : float
             Sky regularisation
+        anderson_history : int, default 0
+            Number of past iterates to keep for Anderson acceleration. 0 disables AA.
+        anderson_damping : float, default 0.5
+            Mixing weight for AA proposal: ``(1-damping)*plain + damping*aa``.
+        anderson_ridge : float, default 1e-8
+            Tikhonov regularisation for AA least-squares.
+        anderson_max_weight : float, default 10.0
+            Reject AA proposals where any mixing coefficient exceeds this.
         verbose : bool
         subtract_static_sky : bool, optional
             If True, subtract cached static sky contribution from data before fitting.
@@ -1112,6 +1128,12 @@ class Calibrator:
             gain_params = {k: params[k] for k in self._GAIN_PARAM_KEYS}
             beam_coeffs = params['beam_coeffs']
 
+            # Initialize joint Anderson accelerator for (sky, beam) pair
+            aa = AndersonAccelerator(
+                anderson_history, start=2, damping=anderson_damping,
+                ridge=anderson_ridge, max_weight=anderson_max_weight
+            ) if anderson_history > 0 else None
+
             best_sky = sky_coeffs
             best_bc = beam_coeffs
             _w = self._effective_weights()
@@ -1136,6 +1158,45 @@ class Calibrator:
                 delta_bc = updates['beam']
                 trial_sky = current_sky + delta_sky
                 trial_bc = current_bc + delta_bc
+
+                # Apply Anderson acceleration to joint (sky, beam) pair if enabled
+                if aa is not None:
+                    # Flatten both sky and beam to 1D arrays for AA
+                    current_flat = np.concatenate([
+                        np.asarray(current_sky, dtype=np.float64).ravel(),
+                        np.asarray(current_bc, dtype=np.float64).ravel(),
+                    ])
+                    trial_flat = np.concatenate([
+                        np.asarray(trial_sky, dtype=np.float64).ravel(),
+                        np.asarray(trial_bc, dtype=np.float64).ravel(),
+                    ])
+
+                    # Try AA proposal
+                    aa_candidate_flat = aa.push(current_flat, trial_flat)
+                    if aa_candidate_flat is not None:
+                        # Unflatten the candidate
+                        sky_shape = current_sky.shape
+                        bc_shape = current_bc.shape
+                        sky_size = int(np.prod(sky_shape))
+                        sky_cand = jnp.array(
+                            aa_candidate_flat[:sky_size].reshape(sky_shape),
+                            dtype=DTYPE_R_JAX
+                        )
+                        bc_cand = jnp.array(
+                            aa_candidate_flat[sky_size:].reshape(bc_shape),
+                            dtype=DTYPE_R_JAX
+                        )
+                        loss_cand = self._jit_loss_variable_beam(
+                            {'sky_coeffs': sky_cand, 'beam_coeffs': bc_cand, **gain_params}, _w
+                        )
+                        # Use AA candidate if better than plain step
+                        improved_aa = loss_cand < self._jit_loss_variable_beam(
+                            {'sky_coeffs': trial_sky, 'beam_coeffs': trial_bc, **gain_params}, _w
+                        )
+                        if improved_aa:
+                            trial_sky = sky_cand
+                            trial_bc = bc_cand
+
                 loss_jax = self._jit_loss_variable_beam(
                     {'sky_coeffs': trial_sky, 'beam_coeffs': trial_bc, **gain_params}, _w
                 )
