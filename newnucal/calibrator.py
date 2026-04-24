@@ -75,12 +75,19 @@ class AndersonAccelerator:
         damping: float = 0.5,
         ridge: float = 1e-4,
         max_weight: float = 10.0,
+        step_gain_max: float = 20.0,
+        min_step_gain: float = 0.1,
+        step_gain_factor: float = 2.0,
     ):
         self.history    = history
         self.start      = start
         self.damping    = damping
         self.ridge      = ridge
         self.max_weight = max_weight
+        self._step_gain_max = step_gain_max
+        self._min_step_gain = min_step_gain
+        self._step_gain_factor = step_gain_factor
+        self.step_gain = 1.0
         self._hist_g: list[np.ndarray] = []
         self._hist_f: list[np.ndarray] = []
         self._step = 0
@@ -118,27 +125,59 @@ class AndersonAccelerator:
         if self._step >= self.start and len(self._hist_f) >= 2:
             F    = np.stack(self._hist_f, axis=0)
             beta = self._solve_coeffs(F, self.ridge)
-            if (np.all(np.isfinite(beta))
-                    and float(np.max(np.abs(beta))) <= self.max_weight):
+            if beta is None:
+                # Gram ill-conditioned: boost step_gain for next iteration
+                self.step_gain = min(self.step_gain * self._step_gain_factor, self._step_gain_max)
+                self.clear(reset_step_gain=False)  # preserve boosted step_gain, clear history
+            elif np.all(np.isfinite(beta)) and float(np.max(np.abs(beta))) <= self.max_weight:
                 g_aa = np.tensordot(beta, np.stack(self._hist_g, axis=0), axes=1)
                 candidate = (1.0 - self.damping) * g_flat + self.damping * g_aa
+            else:
+                # AA filtered: non-finite or oversized coefficients, boost step_gain
+                self.step_gain = min(self.step_gain * self._step_gain_factor, self._step_gain_max)
+                self.clear(reset_step_gain=False)  # clear history but keep boosted step_gain
 
         self._step += 1
         return candidate
 
-    def clear(self):
-        """Reset history and step counter."""
+    def clear(self, reset_step_gain: bool = True):
+        """Reset history and step counter.
+
+        Parameters
+        ----------
+        reset_step_gain : bool
+            If True (default), also reset step_gain to 1.0. Set to False when
+            clearing history as part of step_gain adjustment.
+        """
         self._hist_g.clear()
         self._hist_f.clear()
         self._step = 0
+        if reset_step_gain:
+            self.step_gain = 1.0
+
+    def report_step_gain(self, eff_gain: float):
+        """Persist the effective step gain used by the caller.
+
+        Parameters
+        ----------
+        eff_gain : float
+            Step gain multiplier that was successfully used (or 0 if no improvement).
+        """
+        if eff_gain > 0:
+            self.step_gain = eff_gain
+        else:
+            self.step_gain = max(self.step_gain / self._step_gain_factor, self._min_step_gain)
 
     @staticmethod
-    def _solve_coeffs(F: np.ndarray, ridge: float = 1e-8) -> np.ndarray:
+    def _solve_coeffs(F: np.ndarray, ridge: float = 1e-8) -> np.ndarray | None:
         """Constrained least-squares mixing coefficients.
 
         Solves ``min ||F^T beta||`` subject to ``sum(beta) = 1`` with
         Tikhonov regularisation ``ridge * trace(G) * I`` added to the
         Gram matrix ``G = F F^T``.
+
+        Returns None if Gram matrix is ill-conditioned (eigenvalue ratio > 1/ridge),
+        signalling that larger plain steps should be tried.
 
         Parameters
         ----------
@@ -147,12 +186,19 @@ class AndersonAccelerator:
 
         Returns
         -------
-        beta : np.ndarray, shape (m,)
+        beta : np.ndarray, shape (m,) or None
         """
         n = F.shape[0]
+        assert n >= 2  # only call when len(hist_f) >= 2
         gram = F @ F.T
-        scale = float(np.trace(gram) / max(n, 1)) if n > 0 else 1.0
-        gram = gram + ridge * max(scale, 1.0) * np.eye(n, dtype=gram.dtype)
+        eigs = np.linalg.eigvalsh(gram)  # ascending order: eigs[-1] is largest
+        eig_max = eigs[-1]
+        # Check conditioning: if largest eigenvalue >> second-largest, skip AA
+        eig_second = eigs[-2]
+        if eig_max * ridge > eig_second:
+            return None  # ill-conditioned: signal that larger steps are needed
+
+        gram = gram + ridge * eig_max * np.eye(n, dtype=gram.dtype)
         kkt = np.block([
             [gram, np.ones((n, 1), dtype=gram.dtype)],
             [np.ones((1, n), dtype=gram.dtype), np.zeros((1, 1), dtype=gram.dtype)],
@@ -1130,14 +1176,16 @@ class Calibrator:
         sky_aa_damping: float = 0.5,
         sky_aa_ridge: float = 1e-8,
         sky_aa_max_weight: float = 10.0,
-        sky_line_search_steps: list | None = None,
         beam_sky_reg: float = 1e-3,
         beam_anderson_history: int | None = None,
         beam_aa_start: int = 1,
         beam_aa_damping: float = 0.5,
         beam_aa_ridge: float = 1e-8,
         beam_aa_max_weight: float = 10.0,
-        beam_line_search_steps: list | None = None,
+        sky_initial_step: float | list = 1.0,
+        beam_initial_step: float | list = 1.0,
+        sky_step_gain_factor: float = 2.0,
+        beam_step_gain_factor: float = 2.0,
         solve_every: dict | None = None,
         eff_alpha: float = 0.4,
         target_reduced_chi2: float | None = None,
@@ -1152,11 +1200,6 @@ class Calibrator:
             solve_every = {}
         if beam_anderson_history is None:
             beam_anderson_history = sky_anderson_history
-        _default_line_search_steps = [1.0, 3.0]
-        if sky_line_search_steps is None:
-            sky_line_search_steps = _default_line_search_steps
-        if beam_line_search_steps is None:
-            beam_line_search_steps = _default_line_search_steps
 
         params_active = self._params_to_active_space(params)
 
@@ -1170,9 +1213,9 @@ class Calibrator:
             },
             settings=dict(
                 sky_beam_reg=sky_beam_reg,
-                sky_line_search_steps=sky_line_search_steps,
+                sky_initial_step=sky_initial_step,
                 beam_sky_reg=beam_sky_reg,
-                beam_line_search_steps=beam_line_search_steps,
+                beam_initial_step=beam_initial_step,
                 solve_every=dict(solve_every),
                 eff_alpha=eff_alpha,
                 target_reduced_chi2=target_reduced_chi2,
@@ -1180,11 +1223,13 @@ class Calibrator:
             ),
             sky_acc=AndersonAccelerator(
                 sky_anderson_history, sky_aa_start, sky_aa_damping,
-                sky_aa_ridge, sky_aa_max_weight
+                sky_aa_ridge, sky_aa_max_weight,
+                step_gain_factor=sky_step_gain_factor
             ),
             beam_acc=AndersonAccelerator(
                 beam_anderson_history, beam_aa_start, beam_aa_damping,
-                beam_aa_ridge, beam_aa_max_weight
+                beam_aa_ridge, beam_aa_max_weight,
+                step_gain_factor=beam_step_gain_factor
             ),
         )
 
@@ -1229,56 +1274,101 @@ class Calibrator:
         def _full_params(sky, beam, gains):
             return {'sky_coeffs': sky, 'beam_coeffs': beam, **gains}
 
-        def _sky_plain_step(sky, gains, current_loss):
+        def _sky_plain_step(sky, gains, current_loss, step_gain=1.0):
             resid = self.calibrated_residual({'sky_coeffs': sky, **gains})
-            # Get base update with step_size=1.0 to enable efficient line search
+            # Get base update with step_size=1.0 to enable efficient scaling
             delta_base = self._sky_update_fn(
                 resid, step_size=1.0, beam_reg=s['sky_beam_reg']
             )
 
-            # Line search over multiple step sizes
-            step_sizes = s.get('sky_line_search_steps', [1.0, 3.0])
             best_sky = sky
             best_loss = current_loss
-            best_step_size = 0.0
+            eff_gain = 0.0
+            initial_step = s.get('sky_initial_step', 1.0)
 
-            for step_sz in step_sizes:
-                sky_trial = (sky + step_sz * delta_base).astype(DTYPE_R_JAX)
-                loss_trial = float(self._jit_loss({'sky_coeffs': sky_trial, **gains}, self._effective_weights()))
-                if loss_trial < best_loss:
-                    best_sky = sky_trial
-                    best_loss = loss_trial
-                    best_step_size = step_sz
+            # If initial_step is a list, do one-time line search to pick the best
+            if isinstance(initial_step, (list, tuple)) and len(state.sky_acc._hist_f) == 0 and step_gain == 1.0:
+                selected_step = 1.0
+                for candidate_step in initial_step:
+                    sky_trial = (sky + candidate_step * delta_base).astype(DTYPE_R_JAX)
+                    loss_trial = float(self._jit_loss({'sky_coeffs': sky_trial, **gains}, self._effective_weights()))
+                    if loss_trial < best_loss:
+                        best_sky = sky_trial
+                        best_loss = loss_trial
+                        selected_step = candidate_step
+                # Save the best step as a scalar for future use
+                if best_loss < current_loss:
+                    s['sky_initial_step'] = selected_step
+                    if verbose:
+                        print(f"      [initial line search: selected sky_initial_step={selected_step:.2f}]")
+                eff_gain = 1.0  # Return 1.0 so report_step_gain(1.0) keeps step_gain=1.0
+            else:
+                # Normal retry loop: try current step_gain, then halve if unsuccessful
+                gain_to_try = step_gain
+                while gain_to_try >= state.sky_acc._min_step_gain:
+                    sky_trial = (sky + gain_to_try * initial_step * delta_base).astype(DTYPE_R_JAX)
+                    loss_trial = float(self._jit_loss({'sky_coeffs': sky_trial, **gains}, self._effective_weights()))
+                    if loss_trial < best_loss:
+                        best_sky = sky_trial
+                        best_loss = loss_trial
+                        eff_gain = gain_to_try
+                    if best_loss < current_loss:
+                        break
+                    gain_to_try *= 0.5
 
-            return best_sky, best_loss, best_step_size
+            return best_sky, best_loss, eff_gain
 
-        def _beam_plain_step(sky, beam, gains, current_loss):
+        def _beam_plain_step(sky, beam, gains, current_loss, step_gain=1.0):
             resid = self.calibrated_residual_variable_beam(
                 {'sky_coeffs': sky, 'beam_coeffs': beam, **gains}
             )
-            # Get base update with step_size=1.0 to enable efficient line search
+            # Get base update with step_size=1.0 to enable efficient scaling
             delta_bc_base = self._beam_update_fn(
                 sky, resid, step_size=1.0, sky_reg=s['beam_sky_reg']
             )
 
-            # Line search over multiple step sizes
-            step_sizes = s.get('beam_line_search_steps', [1.0, 3.0])
             best_beam = beam
             best_loss = current_loss
-            best_step_size = 0.0
+            eff_gain = 0.0
+            initial_step = s.get('beam_initial_step', 1.0)
 
-            for step_sz in step_sizes:
-                beam_trial = (beam + step_sz * delta_bc_base).astype(DTYPE_R_JAX)
-                loss_trial = float(self._jit_loss_variable_beam(
-                    {'sky_coeffs': sky, 'beam_coeffs': beam_trial, **gains},
-                    self._effective_weights(),
-                ))
-                if loss_trial < best_loss:
-                    best_beam = beam_trial
-                    best_loss = loss_trial
-                    best_step_size = step_sz
+            # If initial_step is a list, do one-time line search to pick the best
+            if isinstance(initial_step, (list, tuple)) and len(state.beam_acc._hist_f) == 0 and step_gain == 1.0:
+                selected_step = 1.0
+                for candidate_step in initial_step:
+                    beam_trial = (beam + candidate_step * delta_bc_base).astype(DTYPE_R_JAX)
+                    loss_trial = float(self._jit_loss_variable_beam(
+                        {'sky_coeffs': sky, 'beam_coeffs': beam_trial, **gains},
+                        self._effective_weights(),
+                    ))
+                    if loss_trial < best_loss:
+                        best_beam = beam_trial
+                        best_loss = loss_trial
+                        selected_step = candidate_step
+                # Save the best step as a scalar for future use
+                if best_loss < current_loss:
+                    s['beam_initial_step'] = selected_step
+                    if verbose:
+                        print(f"      [initial line search: selected beam_initial_step={selected_step:.2f}]")
+                eff_gain = 1.0  # Return 1.0 so report_step_gain(1.0) keeps step_gain=1.0
+            else:
+                # Normal retry loop: try current step_gain, then halve if unsuccessful
+                gain_to_try = step_gain
+                while gain_to_try >= state.beam_acc._min_step_gain:
+                    beam_trial = (beam + gain_to_try * initial_step * delta_bc_base).astype(DTYPE_R_JAX)
+                    loss_trial = float(self._jit_loss_variable_beam(
+                        {'sky_coeffs': sky, 'beam_coeffs': beam_trial, **gains},
+                        self._effective_weights(),
+                    ))
+                    if loss_trial < best_loss:
+                        best_beam = beam_trial
+                        best_loss = loss_trial
+                        eff_gain = gain_to_try
+                    if best_loss < current_loss:
+                        break
+                    gain_to_try *= 0.5
 
-            return best_beam, best_loss, best_step_size
+            return best_beam, best_loss, eff_gain
 
         overdue = {}
         if sky_max_every > 0 and state.n_since_sky >= sky_max_every:
@@ -1333,7 +1423,8 @@ class Calibrator:
             if state.beam_dirty_pending:
                 self._sync_beam_cache_from_state(state)
             sky_coeffs = state.params['sky_coeffs']
-            sky_plain, loss_plain, step_size_used = _sky_plain_step(sky_coeffs, gain_params, loss)
+            sky_plain, loss_plain, eff_gain = _sky_plain_step(sky_coeffs, gain_params, loss, state.sky_acc.step_gain)
+            state.sky_acc.report_step_gain(eff_gain)
             sky_next = sky_plain
             gain_next = gain_params
             loss_next = loss_plain
@@ -1366,14 +1457,15 @@ class Calibrator:
             state.n_since_gains += 1
             if verbose:
                 tag = 'AA' if used_aa else '  '
-                line = f"    [sky {tag} {state.n_sky - 1:03d}]: loss={loss:.4e}  eff={eff:.2e} frac_Δloss/s"
+                line = f"    [sky {tag} {state.n_sky - 1:03d}]: loss={loss:.4e}  eff={eff:.2e} frac_Δloss/s  step_gain={state.sky_acc.step_gain:.2f}"
                 if aa_proposed and not used_aa:
                     line += f"  [AA rejected: cand={loss_cand:.4e} vs plain={loss_plain:.4e}]"
                 elif not aa_proposed and cand_flat is None and state.sky_acc.history > 0 and state.sky_acc._step > state.sky_acc.start and len(state.sky_acc._hist_f) >= 2:
                     line += "  [AA filtered: beta>max_weight or non-finite]"
                 print(line)
         elif step_type == 'beam':
-            beam_plain, loss_plain, step_size_used = _beam_plain_step(sky_coeffs, beam_coeffs, gain_params, loss)
+            beam_plain, loss_plain, eff_gain = _beam_plain_step(sky_coeffs, beam_coeffs, gain_params, loss, state.beam_acc.step_gain)
+            state.beam_acc.report_step_gain(eff_gain)
             beam_next = beam_plain
             loss_next = loss_plain
             used_aa = False
@@ -1401,7 +1493,7 @@ class Calibrator:
             state.n_since_gains += 1
             if verbose:
                 tag = 'AA' if used_aa else '  '
-                print(f"    [beam {tag} {state.n_beam - 1:03d}]: loss={loss:.4e}  eff={eff:.2e} frac_Δloss/s")
+                print(f"    [beam {tag} {state.n_beam - 1:03d}]: loss={loss:.4e}  eff={eff:.2e} frac_Δloss/s  step_gain={state.beam_acc.step_gain:.2f}")
 
         state.params = {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params}
         state.loss = float(loss)
@@ -1487,14 +1579,16 @@ class Calibrator:
         sky_aa_damping: float = 0.5,
         sky_aa_ridge: float = 1e-8,
         sky_aa_max_weight: float = 10.0,
-        sky_line_search_steps: list | None = None,
         beam_sky_reg: float = 1e-3,
         beam_anderson_history: int | None = None,
         beam_aa_start: int = 1,
         beam_aa_damping: float = 0.5,
         beam_aa_ridge: float = 1e-8,
         beam_aa_max_weight: float = 10.0,
-        beam_line_search_steps: list | None = None,
+        sky_initial_step: float | list = 1.0,
+        beam_initial_step: float | list = 1.0,
+        sky_step_gain_factor: float = 2.0,
+        beam_step_gain_factor: float = 2.0,
         solve_every: dict | None = None,
         eff_alpha: float = 0.4,
         target_reduced_chi2: float | None = None,
@@ -1526,14 +1620,14 @@ class Calibrator:
             sky_aa_damping=sky_aa_damping,
             sky_aa_ridge=sky_aa_ridge,
             sky_aa_max_weight=sky_aa_max_weight,
-            sky_line_search_steps=sky_line_search_steps,
+            sky_initial_step=sky_initial_step,
             beam_sky_reg=beam_sky_reg,
             beam_anderson_history=beam_anderson_history,
             beam_aa_start=beam_aa_start,
             beam_aa_damping=beam_aa_damping,
             beam_aa_ridge=beam_aa_ridge,
             beam_aa_max_weight=beam_aa_max_weight,
-            beam_line_search_steps=beam_line_search_steps,
+            beam_initial_step=beam_initial_step,
             solve_every=solve_every,
             eff_alpha=eff_alpha,
             target_reduced_chi2=target_reduced_chi2,
