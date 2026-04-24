@@ -47,6 +47,7 @@ class ForwardModel:
         eta_max: float | None = None,
         eta_padding: float = 0.0,
         nufft_upsampfac: float = 1.25,
+        freq_batch_size: int = 8,
     ):
         self.array = array
         self.sky_model = sky_model
@@ -55,6 +56,7 @@ class ForwardModel:
         self._nufft_opts = _NufftOpts(upsampfac=nufft_upsampfac)
         self.eta_max = eta_max
         self.eta_padding = float(eta_padding)
+        self.freq_batch_size = freq_batch_size
 
         freqs_np = np.asarray(freqs, dtype=DTYPE_R_NPY)
         self.freqs = jnp.array(freqs_np, dtype=DTYPE_R_JAX)
@@ -916,11 +918,16 @@ class ForwardModel:
     # ------------------------------------------------------------------
 
     def _nufft2d_W_to_vis(self, W, xi, freqs):
-        """Apply per-frequency type-1 2D NUFFTs to a (npix_sky, nfreq) weight array."""
+        """Apply per-frequency type-1 2D NUFFTs to a (npix_sky, nfreq) weight array.
+
+        Uses frequency batching to reduce vmap overhead: groups frequencies into batches
+        before vmapping, reducing JAX trace count from nfreq to ceil(nfreq/freq_batch_size).
+        """
         n_q = self._2d_n_q
         n_r = self._2d_n_r
         q_idx = self._2d_q_idx
         r_idx = self._2d_r_idx
+        freq_batch_size = getattr(self, 'freq_batch_size', 8)  # Default batch size
 
         def one_freq(args):
             W_fi, nu = args
@@ -929,7 +936,24 @@ class ForwardModel:
             grid = nufft1((n_q, n_r), W_fi, x_j, y_j, iflag=1, eps=self.eps, opts=self._nufft_opts)
             return grid[q_idx, r_idx]
 
-        return jax.vmap(one_freq)((W.T, freqs))   # (nfreq, nbls)
+        nfreq = len(freqs)
+        n_batch = (nfreq + freq_batch_size - 1) // freq_batch_size
+
+        # If no batching needed (small nfreq), use simple vmap
+        if n_batch == 1:
+            return jax.vmap(one_freq)((W.T, freqs))
+
+        # Batch frequencies and vmap over batches
+        vis_batches = []
+        for b in range(n_batch):
+            start = b * freq_batch_size
+            end = min(start + freq_batch_size, nfreq)
+            W_batch = W.T[start:end]           # (batch_size, npix_sky)
+            freqs_batch = freqs[start:end]     # (batch_size,)
+            vis_batch = jax.vmap(one_freq)((W_batch, freqs_batch))  # (batch_size, nbls)
+            vis_batches.append(vis_batch)
+
+        return jnp.concatenate(vis_batches, axis=0)  # (nfreq, nbls)
 
     def _simulate_one_2d_precomputed_sky_spec(self, sky_spec, tind):
         """2D hex-rect NUFFT forward for one time step (cached beam).
