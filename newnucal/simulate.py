@@ -526,12 +526,53 @@ class ForwardModel:
         sky_spec = sky_coeffs @ self.A_sky.T
         return self._simulate_one_precomputed_sky_spec(sky_spec, tind)
 
-    def simulate(self, sky_coeffs, rot_matrices):
+    def _simulate_impl(self, sky_coeffs, rot_matrices):
+        """Core simulate implementation (used internally; consider using simulate() instead)."""
         if (not self._geom_ready) or (self._topo_all.shape[0] != rot_matrices.shape[0]):
             self.precompute_time_geometry(rot_matrices)
         sky_spec = sky_coeffs @ self.A_sky.T
         inds = jnp.arange(rot_matrices.shape[0], dtype=jnp.int32)
         return jax.vmap(lambda tind: self._simulate_one_precomputed_sky_spec(sky_spec, tind))(inds)
+
+    def simulate(self, sky_coeffs, rot_matrices, chunk_size=12):
+        """Simulate visibilities with automatic time chunking to reduce memory usage.
+
+        Processes time steps in chunks to keep precomputed geometry arrays small.
+        For a single chunk, falls back to direct simulation; for multiple chunks,
+        accumulates results from each chunk.
+
+        Parameters
+        ----------
+        sky_coeffs : jnp.ndarray, shape (npix_sky, nmodes_sky)
+        rot_matrices : jnp.ndarray, shape (ntime, 3, 3)
+        chunk_size : int, optional
+            Number of time steps per chunk. Default 12 (~6–12× memory reduction
+            for 96-time observations). Set to ntime to disable chunking.
+
+        Returns
+        -------
+        vis : jnp.ndarray, shape (ntime, nfreq, nbls), complex64
+        """
+        ntime = rot_matrices.shape[0]
+        if ntime <= chunk_size:
+            # Single chunk: use direct implementation
+            return self._simulate_impl(sky_coeffs, rot_matrices)
+
+        # Multi-chunk: accumulate results
+        chunks = []
+        for t_start in range(0, ntime, chunk_size):
+            t_end = min(t_start + chunk_size, ntime)
+            rot_chunk = rot_matrices[t_start:t_end]
+            # Invalidate geometry and recompute for this chunk
+            self._geom_ready = False
+            for attr in ('_topo_all', '_horizon_all', '_beam_spec_horizon_all',
+                         '_src_x_all', '_src_y_all', '_src_z_all', '_xi_all',
+                         '_interp_px_all', '_interp_wgt_all'):
+                setattr(self, attr, None)
+            vis_chunk = self._simulate_impl(sky_coeffs, rot_chunk)
+            chunks.append(vis_chunk)
+
+        return jnp.concatenate(chunks, axis=0)
 
     def adjoint_residual_one_time(self, residual_fb, tind):
         """Backproject one-time residuals to a pixel-delay dirty map."""
@@ -999,20 +1040,8 @@ class ForwardModel:
         xi = self._xi_all[tind]
         return self._nufft2d_W_to_vis(W, xi, self.freqs)
 
-    def simulate_2d(self, sky_coeffs, rot_matrices):
-        """Simulate all times using the 2D hex-rect NUFFT path.
-
-        Each frequency is handled by a type-1 2D NUFFT that maps sky × beam
-        weighted pixels to a compact uniform uv grid; baselines are read from
-        that grid at their integer axial positions.
-
-        The channel spacing of *freqs* should satisfy
-        :func:`~newnucal.hexrect.critical_channel_spacing` to avoid aliasing.
-
-        Returns
-        -------
-        vis : jnp.ndarray, shape (ntime, nfreq, nbls), complex64
-        """
+    def _simulate_2d_impl(self, sky_coeffs, rot_matrices):
+        """Core 2D simulate implementation (used internally; consider using simulate_2d() instead)."""
         if (not self._geom_ready) or (self._2d_x_flat is None) or (self._topo_all.shape[0] != rot_matrices.shape[0]):
             self.precompute_time_geometry(rot_matrices)
         ntime = self._topo_all.shape[0]
@@ -1034,6 +1063,53 @@ class ForwardModel:
 
         vis_flat = jax.vmap(_one)((W_flat, self._2d_x_flat, self._2d_y_flat))
         return vis_flat.reshape(ntime, self.nfreq, self.nbls)
+
+    def simulate_2d(self, sky_coeffs, rot_matrices, chunk_size=12):
+        """Simulate visibilities using 2D hex-rect NUFFT with automatic time chunking.
+
+        Each frequency is handled by a type-1 2D NUFFT that maps sky × beam
+        weighted pixels to a compact uniform uv grid; baselines are read from
+        that grid at their integer axial positions.
+
+        Processes time steps in chunks to keep precomputed geometry arrays small.
+        For a single chunk, falls back to direct simulation; for multiple chunks,
+        accumulates results from each chunk.
+
+        The channel spacing of *freqs* should satisfy
+        :func:`~newnucal.hexrect.critical_channel_spacing` to avoid aliasing.
+
+        Parameters
+        ----------
+        sky_coeffs : jnp.ndarray, shape (npix_sky, nmodes_sky)
+        rot_matrices : jnp.ndarray, shape (ntime, 3, 3)
+        chunk_size : int, optional
+            Number of time steps per chunk. Default 12 (~6–12× memory reduction
+            for 96-time observations). Set to ntime to disable chunking.
+
+        Returns
+        -------
+        vis : jnp.ndarray, shape (ntime, nfreq, nbls), complex64
+        """
+        ntime = rot_matrices.shape[0]
+        if ntime <= chunk_size:
+            # Single chunk: use direct implementation
+            return self._simulate_2d_impl(sky_coeffs, rot_matrices)
+
+        # Multi-chunk: accumulate results
+        chunks = []
+        for t_start in range(0, ntime, chunk_size):
+            t_end = min(t_start + chunk_size, ntime)
+            rot_chunk = rot_matrices[t_start:t_end]
+            # Invalidate geometry and recompute for this chunk
+            self._geom_ready = False
+            for attr in ('_topo_all', '_horizon_all', '_beam_spec_horizon_all',
+                         '_src_x_all', '_src_y_all', '_src_z_all', '_xi_all',
+                         '_interp_px_all', '_interp_wgt_all', '_2d_x_flat', '_2d_y_flat'):
+                setattr(self, attr, None)
+            vis_chunk = self._simulate_2d_impl(sky_coeffs, rot_chunk)
+            chunks.append(vis_chunk)
+
+        return jnp.concatenate(chunks, axis=0)
 
     def simulate_variable_beam_2d(self, sky_coeffs, beam_coeffs, rot_matrices):
         """Simulate all times with explicit *beam_coeffs* via the 2D path."""

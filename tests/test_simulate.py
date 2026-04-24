@@ -439,6 +439,40 @@ def test_combined_sky_and_beam_update_2d_equivalence(forward_model, A_sky, A_bea
                                err_msg="2D Beam update differs between combined and separate paths")
 
 
+def test_simulate_chunked_matches_unchunked(forward_model, rot_matrices, A_sky):
+    """Chunked simulation should produce identical results to non-chunked."""
+    fwd = forward_model
+    sky_coeffs = _zenith_sky_coeffs(fwd.sky_model.nside, A_sky)
+
+    # Simulate without chunking
+    vis_no_chunk = fwd.simulate(sky_coeffs, rot_matrices, chunk_size=rot_matrices.shape[0])
+
+    # Simulate with chunking (smaller chunks)
+    vis_chunked = fwd.simulate(sky_coeffs, rot_matrices, chunk_size=1)
+
+    # Results should match within float32 tolerance
+    assert jnp.allclose(vis_no_chunk, vis_chunked, rtol=1e-5, atol=1e-8), (
+        f"Chunked vs non-chunked mismatch: max diff = {float(jnp.max(jnp.abs(vis_no_chunk - vis_chunked)))}"
+    )
+
+
+def test_simulate_2d_chunked_matches_unchunked(forward_model, rot_matrices):
+    """Chunked 2D simulation should produce identical results to non-chunked."""
+    fwd = forward_model
+    sky_coeffs = _zenith_sky_coeffs(fwd.sky_model.nside, fwd.A_sky)
+
+    # Simulate without chunking
+    vis_no_chunk = fwd.simulate_2d(sky_coeffs, rot_matrices, chunk_size=rot_matrices.shape[0])
+
+    # Simulate with chunking (smaller chunks)
+    vis_chunked = fwd.simulate_2d(sky_coeffs, rot_matrices, chunk_size=1)
+
+    # Results should match within float32 tolerance
+    assert jnp.allclose(vis_no_chunk, vis_chunked, rtol=1e-5, atol=1e-8), (
+        f"Chunked vs non-chunked mismatch: max diff = {float(jnp.max(jnp.abs(vis_no_chunk - vis_chunked)))}"
+    )
+
+
 def test_calibrator_method_2d(forward_model, A_sky, rot_matrices):
     """Calibrator with method='2d' initialises without error and has non-zero loss."""
     from newnucal.calibrator import Calibrator
