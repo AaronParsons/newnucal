@@ -631,8 +631,8 @@ class Calibrator:
         Pixels where mask is True will be simulated and solved for.
         Pixels where mask is False are left at their original values.
 
-        Note: Masks are permanent and cannot be removed; create a new Calibrator
-        if you need to work with different masks.
+        Applying a new mask supersedes any previously-applied mask, allowing
+        you to iterate on different masks without recreating the Calibrator.
 
         Parameters
         ----------
@@ -676,24 +676,24 @@ class Calibrator:
         """
         return self.fwd.build_sky_mask_altitude(self.rot_matrices, min_altitude_deg)
 
-    def build_beam_mask_altitude(self, max_zenith_angle_deg=90.0):
-        """Build mask for beam pixels within zenith angle limit.
+    def build_beam_mask_altitude(self, min_altitude_deg=0.0):
+        """Build mask for beam pixels above minimum altitude.
 
-        Masks beam pixels to only those within the specified angular distance from
-        zenith. The beam is fixed in the topocentric frame.
+        The beam is fixed in the topocentric frame. Returns pixels with
+        altitude >= min_altitude_deg.
 
         Parameters
         ----------
-        max_zenith_angle_deg : float, optional
-            Maximum zenith angle in degrees. Default 90 (all sky above horizon).
-            Use 90 for all above-horizon pixels, lower values for narrower beams.
+        min_altitude_deg : float, optional
+            Minimum altitude in degrees. Default 0 (horizon).
+            Use 0 to remove permanently below-horizon pixels.
 
         Returns
         -------
         np.ndarray, dtype bool, shape (npix_beam_full,)
-            Boolean mask where True indicates pixels within zenith angle threshold.
+            Boolean mask where True indicates pixels above altitude threshold.
         """
-        return self.fwd.build_beam_mask_altitude(self.rot_matrices, max_zenith_angle_deg)
+        return self.fwd.build_beam_mask_altitude(self.rot_matrices, min_altitude_deg)
 
     def build_sky_mask_from_beam_pixels(self, beam_pixel_mask):
         """Build mask for sky pixels illuminated by selected beam pixels.

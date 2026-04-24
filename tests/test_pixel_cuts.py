@@ -224,6 +224,40 @@ class TestApplyPixelMask:
             f"Masked model relative error {rms_err/rms_sig:.3e} > 1e-2"
         )
 
+    def test_mask_supersession_empty_then_valid(self, fwd, rot2):
+        """Applying a new mask should supersede a previous empty mask."""
+        f, A = fwd
+        npix_full = f.npix_sky
+
+        # First: apply an empty mask (e.g., no pixels above altitude threshold)
+        empty_mask = np.zeros(npix_full, dtype=bool)
+        f.apply_sky_mask(empty_mask)
+        f.precompute_time_geometry(rot2)
+        assert f.npix_sky == 0, "Empty mask should result in 0 active pixels"
+
+        # Second: apply a valid mask (e.g., some pixels above horizon)
+        valid_mask = f.build_sky_mask_altitude(rot2, min_altitude_deg=0.0)
+        assert valid_mask.sum() > 0, "Valid mask should have > 0 pixels"
+        f.apply_sky_mask(valid_mask)  # Should not error
+        f.precompute_time_geometry(rot2)
+        assert f.npix_sky == int(valid_mask.sum()), "Active pixel count mismatch after supersession"
+        assert f.eq_coords.shape == (3, int(valid_mask.sum())), "eq_coords shape incorrect"
+
+    def test_build_sky_mask_from_beam_returns_full_sky_size(self, fwd, rot2):
+        """build_sky_mask_from_beam_pixels should always return full-sky-size mask."""
+        f, _ = fwd
+        f.precompute_time_geometry(rot2)
+
+        # Create a beam mask (some beam pixels)
+        beam_mask = np.zeros(healpy.nside2npix(NSIDE_BEAM), dtype=bool)
+        beam_mask[:healpy.nside2npix(NSIDE_BEAM) // 4] = True
+
+        # Get sky mask: should be full-sky size
+        sky_mask = f.build_sky_mask_from_beam_pixels(beam_mask)
+        assert sky_mask.shape[0] == f.npix_sky_full, (
+            f"Expected full-sky mask size {f.npix_sky_full}, got {sky_mask.shape[0]}"
+        )
+
 
 # =============================================================================
 # 2.  Calibrator convenience methods

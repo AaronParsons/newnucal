@@ -172,17 +172,25 @@ class ForwardModel:
 
     def apply_sky_mask(self, mask):
         """
-        Permanently restrict the sky model to the pixels selected by *mask*.
+        Apply a new pixel mask, replacing any previously-applied mask.
 
         After this call ``npix_sky`` equals ``mask.sum()`` and sky-coefficient
         arrays must have that many rows.  The precomputed geometry is
         invalidated; call :meth:`precompute_time_geometry` again.
+
+        Applying a new mask always supersedes any previously-applied mask,
+        allowing users to iterate on different masks without recreating
+        the ForwardModel.
 
         Parameters
         ----------
         mask : array_like of bool, shape (npix_sky_full,)
         """
         mask = np.asarray(mask, dtype=bool)
+        # Always reset to full-sky coordinates to avoid state corruption
+        # when switching from an empty mask to a non-empty one.
+        self.eq_coords = jnp.array(self._eq_coords_full, dtype=DTYPE_R_JAX)
+
         self._pixel_mask = mask
         self._pixel_indices = np.where(mask)[0].astype(np.int32)
         eq_full = np.asarray(self._eq_coords_full)   # (3, npix_full)
@@ -220,44 +228,41 @@ class ForwardModel:
     # Beam masking helpers
     # ------------------------------------------------------------------
 
-    def build_beam_mask_altitude(self, rot_matrices, max_zenith_angle_deg=90.0):
+    def build_beam_mask_altitude(self, rot_matrices, min_altitude_deg=0.0):
         """
-        Return a boolean array for beam pixels within max_zenith_angle from zenith.
+        Return a boolean array for beam pixels above minimum altitude.
 
-        The beam is fixed in the topocentric frame. This method computes the zenith
-        angle for each beam pixel (in HEALPix coordinates) and returns a mask of
-        pixels within the specified angular distance from zenith.
+        The beam is fixed in the topocentric frame. Since the beam doesn't rotate,
+        all beam pixels have constant altitude; this method returns pixels with
+        altitude >= min_altitude_deg.
 
         Parameters
         ----------
         rot_matrices : array, shape (ntime, 3, 3)
             Rotation matrices (unused, kept for API compatibility).
-        max_zenith_angle_deg : float, optional
-            Maximum zenith angle in degrees. Default 90 (all sky above horizon).
-            Set to 90 to include all above-horizon pixels.
+        min_altitude_deg : float, optional
+            Minimum altitude in degrees. Default 0 (horizon).
+            Use 0 to remove permanently below-horizon pixels.
 
         Returns
         -------
         mask : np.ndarray, shape (npix_beam_full,), dtype bool
-            True for beam pixels with zenith angle <= max_zenith_angle_deg.
+            True for beam pixels with altitude >= min_altitude_deg.
         """
         nside = self.beam_model.nside
         npix_beam_full = healpy.nside2npix(nside)
 
-        max_zenith_rad = np.radians(max_zenith_angle_deg)
+        min_altitude_rad = np.radians(min_altitude_deg)
 
         # Get HEALPix coordinates for all beam pixels
         theta, phi = healpy.pix2ang(nside, np.arange(npix_beam_full))
 
-        # Convert to topocentric unit vectors
         # In topocentric frame: z points to zenith, x to East, y to North
-        # HEALPix theta is colatitude (angle from North pole), phi is azimuth
-        # Convert HEALPix (theta, phi) to topocentric (alt, az):
-        # alt = pi/2 - theta,  az = phi
+        # HEALPix theta is colatitude (angle from North pole)
+        # Altitude = pi/2 - theta
         alt = np.pi / 2 - theta
-        zenith_angle = np.pi / 2 - alt  # zenith_angle = theta in HEALPix coords
 
-        return zenith_angle <= max_zenith_rad
+        return alt >= min_altitude_rad
 
     def build_sky_mask_from_beam_pixels(self, beam_pixel_mask):
         """
@@ -288,13 +293,21 @@ class ForwardModel:
             raise RuntimeError('Call precompute_time_geometry() first.')
 
         beam_pixel_mask = np.asarray(beam_pixel_mask, dtype=bool)
-        sky_mask = np.zeros(self.npix_sky, dtype=bool)
+        # Compute mask in active-sky space
+        sky_mask_active = np.zeros(self.npix_sky, dtype=bool)
 
         for tind in range(len(self._interp_px_all)):
             px = np.asarray(self._interp_px_all[tind], dtype=np.int32)  # (4, npix_sky)
-            sky_mask |= np.any(beam_pixel_mask[px], axis=0)
+            sky_mask_active |= np.any(beam_pixel_mask[px], axis=0)
 
-        return sky_mask
+        # Expand to full-sky space if a mask is active
+        if hasattr(self, '_pixel_indices') and self._pixel_indices is not None:
+            sky_mask = np.zeros(self.npix_sky_full, dtype=bool)
+            sky_mask[self._pixel_indices] = sky_mask_active
+            return sky_mask
+
+        # No mask applied; return in active (full-sky) space
+        return sky_mask_active
 
     def build_beam_mask_from_sky_pixels(self, sky_pixel_mask):
         """
