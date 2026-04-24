@@ -1613,6 +1613,7 @@ class Calibrator:
         gain_params = {k: state.params[k] for k in self._GAIN_PARAM_KEYS}
         loss = float(state.loss)
         step = state.step
+        weights = self._effective_weights()
 
         def _full_params(sky, beam, gains):
             return {'sky_coeffs': sky, 'beam_coeffs': beam, **gains}
@@ -1636,7 +1637,7 @@ class Calibrator:
                 selected_step = 1.0
                 for candidate_step in initial_step:
                     sky_trial = (sky + candidate_step * delta_base).astype(DTYPE_R_JAX)
-                    loss_trial = float(self._jit_loss({'sky_coeffs': sky_trial, **gains}, self._effective_weights()))
+                    loss_trial = float(self._jit_loss({'sky_coeffs': sky_trial, **gains}, weights))
                     if loss_trial < best_loss:
                         best_sky = sky_trial
                         best_loss = loss_trial
@@ -1652,7 +1653,7 @@ class Calibrator:
                 gain_to_try = step_gain
                 while gain_to_try >= state.sky_acc._min_step_gain:
                     sky_trial = (sky + gain_to_try * initial_step * delta_base).astype(DTYPE_R_JAX)
-                    loss_trial = float(self._jit_loss({'sky_coeffs': sky_trial, **gains}, self._effective_weights()))
+                    loss_trial = float(self._jit_loss({'sky_coeffs': sky_trial, **gains}, weights))
                     if loss_trial < best_loss:
                         best_sky = sky_trial
                         best_loss = loss_trial
@@ -1686,7 +1687,7 @@ class Calibrator:
                     beam_trial = (beam + candidate_step * delta_bc_base).astype(DTYPE_R_JAX)
                     loss_trial = float(self._jit_loss_variable_beam(
                         {'sky_coeffs': sky, 'beam_coeffs': beam_trial, **gains},
-                        self._effective_weights(),
+                        weights,
                     ))
                     if loss_trial < best_loss:
                         best_beam = beam_trial
@@ -1705,7 +1706,7 @@ class Calibrator:
                     beam_trial = (beam + gain_to_try * initial_step * delta_bc_base).astype(DTYPE_R_JAX)
                     loss_trial = float(self._jit_loss_variable_beam(
                         {'sky_coeffs': sky, 'beam_coeffs': beam_trial, **gains},
-                        self._effective_weights(),
+                        weights,
                     ))
                     if loss_trial < best_loss:
                         best_beam = beam_trial
@@ -1784,7 +1785,7 @@ class Calibrator:
             if cand_flat is not None:
                 sky_cand = jnp.array(cand_flat.reshape(sky_coeffs.shape), dtype=DTYPE_R_JAX)
                 gain_cand, _ = self.fit_gains_linear(sky_cand)
-                loss_cand = float(self._jit_loss(_full_params(sky_cand, beam_coeffs, gain_cand), self._effective_weights()))
+                loss_cand = float(self._jit_loss(_full_params(sky_cand, beam_coeffs, gain_cand), weights))
                 aa_proposed = True
                 if loss_cand < loss_plain:
                     sky_next = sky_cand
@@ -1822,7 +1823,7 @@ class Calibrator:
             )
             if cand_flat is not None:
                 beam_cand = jnp.array(cand_flat.reshape(beam_coeffs.shape), dtype=DTYPE_R_JAX)
-                loss_cand = float(self._jit_loss_variable_beam(_full_params(sky_coeffs, beam_cand, gain_params), self._effective_weights()))
+                loss_cand = float(self._jit_loss_variable_beam(_full_params(sky_coeffs, beam_cand, gain_params), weights))
                 if loss_cand < loss_plain:
                     beam_next = beam_cand
                     loss_next = loss_cand
@@ -1885,6 +1886,7 @@ class Calibrator:
         gain_params = {k: state.params[k] for k in self._GAIN_PARAM_KEYS}
         loss = float(state.loss)
         step = state.step
+        weights = self._effective_weights()
 
         t_step = _time.perf_counter()
         loss_pre = loss
@@ -1943,7 +1945,7 @@ class Calibrator:
                     joint_beam_step = (beam_coeffs + candidate_step * delta_beam_base).astype(DTYPE_R_JAX)
                     joint_loss_step = float(self._jit_loss_variable_beam(
                         {'sky_coeffs': joint_sky_step, 'beam_coeffs': joint_beam_step, **gain_params},
-                        self._effective_weights()
+                        weights
                     ))
                     if joint_loss_step < joint_loss_trial:
                         joint_sky_trial = joint_sky_step
@@ -1964,7 +1966,7 @@ class Calibrator:
                     joint_beam_step = (beam_coeffs + gain_to_try * initial_step * delta_beam_base).astype(DTYPE_R_JAX)
                     joint_loss_step = float(self._jit_loss_variable_beam(
                         {'sky_coeffs': joint_sky_step, 'beam_coeffs': joint_beam_step, **gain_params},
-                        self._effective_weights()
+                        weights
                     ))
                     if joint_loss_step < joint_loss_trial:
                         joint_sky_trial = joint_sky_step
@@ -1986,7 +1988,7 @@ class Calibrator:
             used_aa = False
 
             # Apply Anderson acceleration to joint (sky, beam) pair
-            if state.joint_acc is not None and state.joint_acc.history > 0:
+            if state.joint_acc is not None:
                 current_flat = np.concatenate([
                     np.asarray(sky_coeffs, dtype=np.float64).ravel(),
                     np.asarray(beam_coeffs, dtype=np.float64).ravel(),
@@ -2011,7 +2013,7 @@ class Calibrator:
                     )
                     joint_loss_cand = float(self._jit_loss_variable_beam(
                         {'sky_coeffs': joint_sky_cand, 'beam_coeffs': joint_beam_cand, **gain_params},
-                        self._effective_weights()
+                        weights
                     ))
                     if joint_loss_cand < joint_loss_plain:
                         joint_sky_next = joint_sky_cand
@@ -2033,7 +2035,7 @@ class Calibrator:
             if verbose:
                 tag = 'AA' if used_aa else '  '
                 line = f"    [joint {tag} {state.n_joint - 1:03d}]: loss={loss:.4e}  eff={eff:.2e} frac_Δloss/s  step_gain={state.joint_acc.step_gain:.2f}"
-                if used_aa and joint_loss_cand is not None and joint_loss_plain is not None:
+                if used_aa:
                     line += f"  [AA improved: cand={joint_loss_cand:.4e} vs plain={joint_loss_plain:.4e}]"
                 print(line)
 
