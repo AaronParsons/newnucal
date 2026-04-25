@@ -326,6 +326,7 @@ class Calibrator:
         self._jit_loss = jax.jit(self._loss)
         self._jit_val_grad = jax.jit(jax.value_and_grad(self._loss))
         self._jit_loss_variable_beam = jax.jit(self._loss_variable_beam)
+        self._jit_residual_variable_beam = jax.jit(self._residual_variable_beam)
         self._jit_simulate = jax.jit(self._sim_fn)
         self._jit_simulate_variable_beam = jax.jit(self._var_beam_sim_fn)
         self.set_channel_weights(channel_weights)
@@ -1012,6 +1013,7 @@ class Calibrator:
         self._jit_loss = jax.jit(self._loss)
         self._jit_val_grad = jax.jit(jax.value_and_grad(self._loss))
         self._jit_loss_variable_beam = jax.jit(self._loss_variable_beam)
+        self._jit_residual_variable_beam = jax.jit(self._residual_variable_beam)
         self._jit_simulate = jax.jit(self._sim_fn)
         self._jit_simulate_variable_beam = jax.jit(self._var_beam_sim_fn)
 
@@ -1649,11 +1651,19 @@ class Calibrator:
         eff_alpha: float = 0.4,
         target_reduced_chi2: float | None = None,
         reduced_chi2_check_every: int = 1,
+        accept_without_loss_check: bool = False,
     ):
         """Create a persistent state for resumable joint sky/beam dirty fits.
 
         Input params can be in full-sky or active (masked) format.
         Internal state uses active format; output params are always full-sky.
+
+        Parameters
+        ----------
+        accept_without_loss_check : bool, default False
+            If True, skip expensive loss checks: line search, retry loop, and
+            Anderson acceleration validation. Use this for faster iterations
+            when convergence monitoring is less critical.
         """
         if solve_every is None:
             solve_every = {}
@@ -1675,6 +1685,7 @@ class Calibrator:
                 eff_alpha=eff_alpha,
                 target_reduced_chi2=target_reduced_chi2,
                 reduced_chi2_check_every=max(int(reduced_chi2_check_every), 1),
+                accept_without_loss_check=accept_without_loss_check,
             ),
             joint_acc=AndersonAccelerator(
                 joint_anderson_history, joint_aa_start, joint_aa_damping,
@@ -2023,8 +2034,9 @@ class Calibrator:
                 print(f"    [gains {state.n_gains - 1:03d}]: loss={loss:.4e}  eff={eff:.2e} frac_Δloss/s")
         else:
             # Joint sky+beam step with Anderson acceleration
-            resid = self.calibrated_residual_variable_beam(
-                {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params}
+            resid = self._jit_residual_variable_beam(
+                {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params},
+                weights,
             )
             updates = self.compute_adjoint_updates(
                 sky_coeffs, resid, update_mode='both',
@@ -2039,9 +2051,18 @@ class Calibrator:
             joint_loss_trial = loss
             eff_gain = 0.0
             initial_step = s.get('joint_initial_step', 1.0)
+            accept_without_check = s.get('accept_without_loss_check', False)
 
-            # If initial_step is a list, do one-time line search to pick the best
-            if isinstance(initial_step, (list, tuple)) and len(state.joint_acc._hist_f) == 0 and state.joint_acc.step_gain == 1.0:
+            if accept_without_check:
+                # Cheap mode: skip all loss checks, just take the step
+                step_size = 1.0 if isinstance(initial_step, (list, tuple)) else initial_step
+                joint_sky_plain = (sky_coeffs + state.joint_acc.step_gain * step_size * delta_sky_base).astype(DTYPE_R_JAX)
+                joint_beam_plain = (beam_coeffs + state.joint_acc.step_gain * step_size * delta_beam_base).astype(DTYPE_R_JAX)
+                # Skip loss evaluation for efficiency
+                joint_loss_plain = loss
+                eff_gain = 1.0
+            elif isinstance(initial_step, (list, tuple)) and len(state.joint_acc._hist_f) == 0 and state.joint_acc.step_gain == 1.0:
+                # Line search on first iteration if initial_step is a list
                 selected_step = 1.0
                 for candidate_step in initial_step:
                     joint_sky_step = (sky_coeffs + candidate_step * delta_sky_base).astype(DTYPE_R_JAX)
@@ -2061,6 +2082,9 @@ class Calibrator:
                     if verbose:
                         print(f"      [initial line search: selected joint_initial_step={selected_step:.2f}]")
                 eff_gain = 1.0  # Return 1.0 so report_step_gain keeps step_gain=1.0
+                joint_sky_plain = joint_sky_trial
+                joint_beam_plain = joint_beam_trial
+                joint_loss_plain = joint_loss_trial
             else:
                 # Normal retry loop: try current step_gain, then halve if unsuccessful
                 gain_to_try = state.joint_acc.step_gain
@@ -2079,19 +2103,19 @@ class Calibrator:
                     if joint_loss_trial < loss:
                         break
                     gain_to_try *= 0.5
+                joint_sky_plain = joint_sky_trial
+                joint_beam_plain = joint_beam_trial
+                joint_loss_plain = joint_loss_trial
 
             state.joint_acc.report_step_gain(eff_gain)
-            joint_sky_plain = joint_sky_trial
-            joint_beam_plain = joint_beam_trial
-            joint_loss_plain = joint_loss_trial
 
             joint_sky_next = joint_sky_plain
             joint_beam_next = joint_beam_plain
             joint_loss_next = joint_loss_plain
             used_aa = False
 
-            # Apply Anderson acceleration to joint (sky, beam) pair
-            if state.joint_acc is not None:
+            # Apply Anderson acceleration to joint (sky, beam) pair (skip if cheap mode)
+            if not accept_without_check and state.joint_acc is not None:
                 current_flat = np.concatenate([
                     np.asarray(sky_coeffs, dtype=np.float64).ravel(),
                     np.asarray(beam_coeffs, dtype=np.float64).ravel(),
@@ -2127,6 +2151,13 @@ class Calibrator:
             sky_coeffs = joint_sky_next
             beam_coeffs = joint_beam_next
             loss = joint_loss_next
+
+            # In cheap mode, compute final loss since we skipped intermediate checks
+            if accept_without_check:
+                loss = float(self._jit_loss_variable_beam(
+                    {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params},
+                    weights
+                ))
 
             dt = max(_time.perf_counter() - t_step, 1e-3)
             dloss = max(0.0, loss_pre - loss)
@@ -2275,6 +2306,7 @@ class Calibrator:
         target_reduced_chi2: float | None = None,
         reduced_chi2_check_every: int = 1,
         subtract_static_sky: bool = False,
+        accept_without_loss_check: bool = False,
         verbose: bool = False,
         _stop_flag=None,
     ):
@@ -2320,6 +2352,10 @@ class Calibrator:
             Check reduced chi-squared every this many steps.
         subtract_static_sky : bool, default False
             Subtract cached static sky contribution from data before fitting.
+        accept_without_loss_check : bool, default False
+            If True, skip expensive loss checks: line search, retry loop, and
+            Anderson acceleration validation. Use this for faster iterations
+            when convergence monitoring is less critical.
         verbose : bool
         """
         state = self.init_joint_sky_beam_dirty_state(
@@ -2335,6 +2371,7 @@ class Calibrator:
             eff_alpha=eff_alpha,
             target_reduced_chi2=target_reduced_chi2,
             reduced_chi2_check_every=reduced_chi2_check_every,
+            accept_without_loss_check=accept_without_loss_check,
         )
         state.subtract_static_sky = subtract_static_sky
         state = self.run_joint_sky_beam_dirty_state(state, n_iter=n_iter, verbose=verbose, _stop_flag=_stop_flag)
