@@ -321,6 +321,7 @@ class Calibrator:
         self._jit_val_grad = jax.jit(jax.value_and_grad(self._loss))
         self._jit_loss_variable_beam = jax.jit(self._loss_variable_beam)
         self._jit_simulate = jax.jit(self._sim_fn)
+        self._jit_simulate_variable_beam = jax.jit(self._var_beam_sim_fn)
         self.set_channel_weights(channel_weights)
         self.set_inv_noise_var(inv_noise_var)
         if noise_sigma is not None:
@@ -590,7 +591,7 @@ class Calibrator:
         """
         sky_coeffs = self._ensure_sky_is_active(params['sky_coeffs'])
         if 'beam_coeffs' in params:
-            vis_model = self._var_beam_sim_fn(
+            vis_model = self._jit_simulate_variable_beam(
                 sky_coeffs, params['beam_coeffs'], self.rot_matrices
             )
         else:
@@ -615,7 +616,7 @@ class Calibrator:
         inv = self._invert_gains(params)
         data_cal = apply_gains(self.data, inv['log_amp'], inv['phase'], inv['phi'], self.bls)
         sky_coeffs = self._ensure_sky_is_active(params['sky_coeffs'])
-        vis_model = self._var_beam_sim_fn(
+        vis_model = self._jit_simulate_variable_beam(
             sky_coeffs, params['beam_coeffs'], self.rot_matrices
         )
         resid = data_cal - vis_model
@@ -912,6 +913,7 @@ class Calibrator:
         self._jit_val_grad = jax.jit(jax.value_and_grad(self._loss))
         self._jit_loss_variable_beam = jax.jit(self._loss_variable_beam)
         self._jit_simulate = jax.jit(self._sim_fn)
+        self._jit_simulate_variable_beam = jax.jit(self._var_beam_sim_fn)
 
     def compute_adjoint_updates(self, sky_coeffs, residual_vis, update_mode='both', **kwargs):
         """Unified interface for sky/beam adjoint updates.
