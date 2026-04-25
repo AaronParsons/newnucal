@@ -969,3 +969,33 @@ class TestBeamSkyMaskingReverse:
         # Should have selected some beam pixels (the weighted ones)
         assert beam_mask.sum() > 0, "Expected non-empty beam mask"
 
+    def test_fit_gains_linear_variable_beam_uses_current_beam(self, calibrator_gains_setup, sky_coeffs_true):
+        """fit_gains_linear_variable_beam should use the provided beam_coeffs, not cached beam."""
+        cal, true_gains = calibrator_gains_setup
+
+        # Beam coefficients from the calibrator
+        beam_coeffs_true = cal.beam_model.coeffs
+
+        # Test 1: fit_gains_linear_variable_beam with true sky and beam should recover gains
+        gain_params_var, loss_var = cal.fit_gains_linear_variable_beam(sky_coeffs_true, beam_coeffs_true)
+
+        # The recovered gains should be close to true gains
+        assert np.allclose(gain_params_var['log_amp'], true_gains['log_amp'], atol=0.1), \
+            "log_amp not recovered with variable beam"
+        assert np.allclose(gain_params_var['phase'], true_gains['phase'], atol=0.1), \
+            "phase not recovered with variable beam"
+        assert np.allclose(gain_params_var['phi'], true_gains['phi'], atol=0.1), \
+            "phi not recovered with variable beam"
+
+        # Test 2: Verify the loss is computed with variable beam, not cached beam
+        # Create a perturbed beam and verify the loss changes
+        beam_coeffs_perturbed = beam_coeffs_true + 0.1 * np.random.RandomState(42).randn(*beam_coeffs_true.shape)
+        gain_params_perturbed, loss_perturbed = cal.fit_gains_linear_variable_beam(sky_coeffs_true, beam_coeffs_perturbed)
+
+        # Loss should be different with perturbed beam
+        assert loss_var != loss_perturbed, \
+            "Loss should differ when beam coefficients change (variable_beam not being used)"
+        # And the perturbed beam loss should be higher
+        assert loss_perturbed > loss_var, \
+            "Perturbed beam should give worse loss"
+
