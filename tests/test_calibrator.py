@@ -40,7 +40,7 @@ def calibrator_gains_setup(array, beam_model, freqs, rot_matrices,
     ntime = rot_matrices.shape[0]
     nfreq = len(freqs)
 
-    vis_true = forward_model.simulate(sky_coeffs_true, jnp.array(rot_matrices))
+    vis_true = forward_model.simulate_3d(sky_coeffs_true, jnp.array(rot_matrices))
 
     # Smooth gains: exact parametric form that fit_gains_linear inverts analytically
     f_norm = np.linspace(0, 1, nfreq)[None, :]   # (1, nfreq)
@@ -140,7 +140,7 @@ def calibrator_rfi_setup(array, beam_model, freqs, rot_matrices, forward_model,
                           sky_coeffs_true, sky_model):
     """Return a Calibrator whose data matches the true sky and unity gains."""
     from newnucal.calibrator import Calibrator
-    vis_true = forward_model.simulate(sky_coeffs_true, jnp.array(rot_matrices))
+    vis_true = forward_model.simulate_3d(sky_coeffs_true, jnp.array(rot_matrices))
     cal = Calibrator(
         array=array,
         beam_model=beam_model,
@@ -178,7 +178,7 @@ class TestRFIWeightedCalibrator:
     def test_calc_reduced_chi2_near_unity_for_known_noise(self, array, beam_model, freqs, rot_matrices, forward_model, sky_coeffs_true, sky_model):
         from newnucal.calibrator import Calibrator
         rng = np.random.default_rng(123)
-        vis_true = np.array(forward_model.simulate(sky_coeffs_true, jnp.array(rot_matrices)))
+        vis_true = np.array(forward_model.simulate_3d(sky_coeffs_true, jnp.array(rot_matrices)))
         sigma = 0.05
         noise = (rng.normal(size=vis_true.shape) + 1j * rng.normal(size=vis_true.shape)) * (sigma / np.sqrt(2.0))
         data = vis_true + noise.astype(np.complex64)
@@ -253,7 +253,7 @@ def calibrator_noisy_setup(array, beam_model, freqs, rot_matrices, forward_model
     """Return (Calibrator, true params, sigma) for noisy data with the true sky/beam."""
     from newnucal.calibrator import Calibrator
     rng = np.random.default_rng(2024)
-    vis_true = np.array(forward_model.simulate(sky_coeffs_true, jnp.array(rot_matrices)), dtype=np.complex64)
+    vis_true = np.array(forward_model.simulate_3d(sky_coeffs_true, jnp.array(rot_matrices)), dtype=np.complex64)
     sigma = 0.05
     noise = (rng.normal(size=vis_true.shape) + 1j * rng.normal(size=vis_true.shape)) * (sigma / np.sqrt(2.0))
     data = vis_true + noise.astype(np.complex64)

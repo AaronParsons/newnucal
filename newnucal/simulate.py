@@ -534,8 +534,8 @@ class ForwardModel:
         inds = jnp.arange(rot_matrices.shape[0], dtype=jnp.int32)
         return jax.vmap(lambda tind: self._simulate_one_precomputed_sky_spec(sky_spec, tind))(inds)
 
-    def simulate(self, sky_coeffs, rot_matrices, chunk_size=12):
-        """Simulate visibilities with automatic time chunking to reduce memory usage.
+    def simulate_3d(self, sky_coeffs, rot_matrices, t_chunk_size=12):
+        """Simulate visibilities using 3D type-3 NUFFT with automatic time chunking.
 
         Processes time steps in chunks to keep precomputed geometry arrays small.
         For a single chunk, falls back to direct simulation; for multiple chunks,
@@ -545,7 +545,7 @@ class ForwardModel:
         ----------
         sky_coeffs : jnp.ndarray, shape (npix_sky, nmodes_sky)
         rot_matrices : jnp.ndarray, shape (ntime, 3, 3)
-        chunk_size : int, optional
+        t_chunk_size : int, optional
             Number of time steps per chunk. Default 12 (~6–12× memory reduction
             for 96-time observations). Set to ntime to disable chunking.
 
@@ -554,14 +554,14 @@ class ForwardModel:
         vis : jnp.ndarray, shape (ntime, nfreq, nbls), complex64
         """
         ntime = rot_matrices.shape[0]
-        if ntime <= chunk_size:
+        if ntime <= t_chunk_size:
             # Single chunk: use direct implementation
             return self._simulate_impl(sky_coeffs, rot_matrices)
 
         # Multi-chunk: accumulate results
         chunks = []
-        for t_start in range(0, ntime, chunk_size):
-            t_end = min(t_start + chunk_size, ntime)
+        for t_start in range(0, ntime, t_chunk_size):
+            t_end = min(t_start + t_chunk_size, ntime)
             rot_chunk = rot_matrices[t_start:t_end]
             # Invalidate geometry and recompute for this chunk
             self._geom_ready = False
@@ -645,13 +645,13 @@ class ForwardModel:
         delta_eq_pf = delta_eq_pf / residual_vis.shape[0]
         return (delta_eq_pf.real @ self.A_sky).astype(DTYPE_R_JAX)
 
-    def accumulate_equatorial_sky_update(
+    def accumulate_equatorial_sky_update_3d(
         self,
         residual_vis,
         step_size: float = 1.0,
         beam_reg: float = 1e-3,
     ):
-        """Accumulate a global equatorial sky update from all times."""
+        """Accumulate a global equatorial sky update from all times (3D path)."""
         return self._accumulate_equatorial_sky_update_impl(
             residual_vis, self.apparent_sky_update_one_time, step_size, beam_reg
         )
@@ -738,16 +738,16 @@ class ForwardModel:
 
         return jnp.array(delta_bc, dtype=DTYPE_R_JAX)
 
-    def accumulate_beam_update(
+    def accumulate_beam_update_3d(
         self,
         sky_coeffs,
         residual_vis,
         step_size: float = 1.0,
         sky_reg: float = 1e-3,
     ):
-        """Accumulate a global beam-coefficient update from all times.
+        """Accumulate a global beam-coefficient update from all times (3D path).
 
-        Dual of :meth:`accumulate_equatorial_sky_update`.  With sky and gains
+        Dual of :meth:`accumulate_equatorial_sky_update_3d`.  With sky and gains
         held fixed, this backprojects the gain-calibrated residuals through the
         sky model to estimate the beam-coefficient correction that best reduces
         the residual.
@@ -756,7 +756,7 @@ class ForwardModel:
             sky_coeffs, residual_vis, self.dirty_apparent_sky_one_time, step_size, sky_reg
         )
 
-    def accumulate_sky_and_beam_update(
+    def accumulate_sky_and_beam_update_3d(
         self,
         sky_coeffs,
         residual_vis,
@@ -769,7 +769,7 @@ class ForwardModel:
 
         Computes the dirty apparent sky map once per time step and derives both
         sky and beam corrections from it. This is more efficient than calling
-        :meth:`accumulate_equatorial_sky_update` and :meth:`accumulate_beam_update`
+        :meth:`accumulate_equatorial_sky_update_3d` and :meth:`accumulate_beam_update_3d`
         separately on the same residuals, as it halves the number of NUFFT
         adjoint calls.
 
@@ -956,8 +956,8 @@ class ForwardModel:
         sky_spec = sky_coeffs @ self.A_sky.T
         return self._simulate_one_variable_beam_sky_spec(sky_spec, beam_coeffs, tind)
 
-    def simulate_variable_beam(self, sky_coeffs, beam_coeffs, rot_matrices):
-        """Simulate all time steps with *beam_coeffs* as a differentiable input."""
+    def simulate_variable_beam_3d(self, sky_coeffs, beam_coeffs, rot_matrices):
+        """Simulate all time steps with *beam_coeffs* as a differentiable input (3D path)."""
         if not self._geom_ready:
             raise RuntimeError('Call precompute_time_geometry() first.')
         ntime = len(self._interp_px_all)
@@ -1064,7 +1064,7 @@ class ForwardModel:
         vis_flat = jax.vmap(_one)((W_flat, self._2d_x_flat, self._2d_y_flat))
         return vis_flat.reshape(ntime, self.nfreq, self.nbls)
 
-    def simulate_2d(self, sky_coeffs, rot_matrices, chunk_size=12):
+    def simulate_2d(self, sky_coeffs, rot_matrices, t_chunk_size=12):
         """Simulate visibilities using 2D hex-rect NUFFT with automatic time chunking.
 
         Each frequency is handled by a type-1 2D NUFFT that maps sky × beam
@@ -1082,7 +1082,7 @@ class ForwardModel:
         ----------
         sky_coeffs : jnp.ndarray, shape (npix_sky, nmodes_sky)
         rot_matrices : jnp.ndarray, shape (ntime, 3, 3)
-        chunk_size : int, optional
+        t_chunk_size : int, optional
             Number of time steps per chunk. Default 12 (~6–12× memory reduction
             for 96-time observations). Set to ntime to disable chunking.
 
@@ -1091,14 +1091,14 @@ class ForwardModel:
         vis : jnp.ndarray, shape (ntime, nfreq, nbls), complex64
         """
         ntime = rot_matrices.shape[0]
-        if ntime <= chunk_size:
+        if ntime <= t_chunk_size:
             # Single chunk: use direct implementation
             return self._simulate_2d_impl(sky_coeffs, rot_matrices)
 
         # Multi-chunk: accumulate results
         chunks = []
-        for t_start in range(0, ntime, chunk_size):
-            t_end = min(t_start + chunk_size, ntime)
+        for t_start in range(0, ntime, t_chunk_size):
+            t_end = min(t_start + t_chunk_size, ntime)
             rot_chunk = rot_matrices[t_start:t_end]
             # Invalidate geometry and recompute for this chunk
             self._geom_ready = False

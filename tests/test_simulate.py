@@ -51,7 +51,7 @@ def test_zero_sky_gives_zero_vis(forward_model, A_sky):
     sky_coeffs = jnp.zeros((npix, nmodes), dtype=jnp.float32)
     rot_m = _identity_rot()[None, :, :]  # (1, 3, 3)
 
-    vis = forward_model.simulate(sky_coeffs, rot_m)  # (1, nfreq, nbls)
+    vis = forward_model.simulate_3d(sky_coeffs, rot_m)  # (1, nfreq, nbls)
     assert jnp.allclose(vis, 0.0, atol=1e-5), "non-zero visibilities for zero sky"
 
 
@@ -61,7 +61,7 @@ def test_output_shape(forward_model, A_sky, rot_matrices):
     nmodes = A_sky.shape[1]
     sky_coeffs = jnp.zeros((npix, nmodes), dtype=jnp.float32)
 
-    vis = forward_model.simulate(sky_coeffs, rot_matrices)
+    vis = forward_model.simulate_3d(sky_coeffs, rot_matrices)
     ntime = rot_matrices.shape[0]
     assert vis.shape == (ntime, forward_model.nfreq, forward_model.nbls)
 
@@ -71,7 +71,7 @@ def test_nonzero_sky_gives_nonzero_vis(forward_model, A_sky):
     sky_coeffs = _zenith_sky_coeffs(forward_model.sky_model.nside, A_sky, flux_per_pixel=1.0)
     rot_m = _identity_rot()[None, :, :]
 
-    vis = forward_model.simulate(sky_coeffs, rot_m)[0]  # (nfreq, nbls)
+    vis = forward_model.simulate_3d(sky_coeffs, rot_m)[0]  # (nfreq, nbls)
     assert jnp.abs(vis).mean() > 0.0
 
 
@@ -81,7 +81,7 @@ def test_gradient_computable(forward_model, A_sky):
     rot_m = _identity_rot()[None, :, :]
 
     def loss(sc):
-        return jnp.sum(jnp.abs(forward_model.simulate(sc, rot_m)) ** 2).real
+        return jnp.sum(jnp.abs(forward_model.simulate_3d(sc, rot_m)) ** 2).real
 
     grad = jax.grad(loss)(sky_coeffs)
     assert grad.shape == sky_coeffs.shape
@@ -94,14 +94,14 @@ def test_vis_is_complex(forward_model, A_sky):
     sky_coeffs = _zenith_sky_coeffs(forward_model.sky_model.nside, A_sky)
     rot_m = _identity_rot()[None, :, :]
 
-    vis = forward_model.simulate(sky_coeffs, rot_m)
+    vis = forward_model.simulate_3d(sky_coeffs, rot_m)
     assert jnp.issubdtype(vis.dtype, jnp.complexfloating)
 
 
 def test_sky_rotation_changes_vis(forward_model, A_sky, rot_matrices):
     """Different rotation matrices should produce different visibilities."""
     sky_coeffs = _zenith_sky_coeffs(forward_model.sky_model.nside, A_sky)
-    vis = forward_model.simulate(sky_coeffs, rot_matrices)  # (ntime, nfreq, nbls)
+    vis = forward_model.simulate_3d(sky_coeffs, rot_matrices)  # (ntime, nfreq, nbls)
 
     if rot_matrices.shape[0] > 1:
         # Visibilities at different times should differ (sky rotates)
@@ -149,7 +149,7 @@ def test_simulate_2d_matches_3d(forward_model, A_sky):
     sky_coeffs = _zenith_sky_coeffs(forward_model.sky_model.nside, A_sky, flux_per_pixel=1.0)
     rot_m = _identity_rot()[None, :, :]
 
-    vis_3d = forward_model.simulate(sky_coeffs, rot_m)
+    vis_3d = forward_model.simulate_3d(sky_coeffs, rot_m)
     vis_2d = forward_model.simulate_2d(sky_coeffs, rot_m)
 
     assert vis_2d.shape == vis_3d.shape
@@ -167,7 +167,7 @@ def test_simulate_2d_matches_3d_with_rotation(forward_model, A_sky, rot_matrices
     """2D and 3D paths agree across multiple rotation matrices."""
     sky_coeffs = _zenith_sky_coeffs(forward_model.sky_model.nside, A_sky, flux_per_pixel=1.0)
 
-    vis_3d = forward_model.simulate(sky_coeffs, rot_matrices)
+    vis_3d = forward_model.simulate_3d(sky_coeffs, rot_matrices)
     vis_2d = forward_model.simulate_2d(sky_coeffs, rot_matrices)
 
     mean_mag = float(jnp.mean(jnp.abs(vis_3d)))
@@ -341,7 +341,7 @@ def test_sky_update_2d_direction_matches_3d(forward_model, A_sky, rot_matrices):
     delta_2d = forward_model.accumulate_equatorial_sky_update_2d(
         resid, step_size=1.0, beam_reg=1e-3
     )
-    delta_3d = forward_model.accumulate_equatorial_sky_update(
+    delta_3d = forward_model.accumulate_equatorial_sky_update_3d(
         resid, step_size=1.0, beam_reg=1e-3
     )
 
@@ -381,12 +381,12 @@ def test_combined_sky_and_beam_update_equivalence(forward_model, A_sky, A_beam, 
 
     # Get separate updates
     sky_delta_sep, beam_delta_sep = (
-        forward_model.accumulate_equatorial_sky_update(resid, step_size=0.5, beam_reg=1e-3),
-        forward_model.accumulate_beam_update(sky_coeffs, resid, step_size=0.5, sky_reg=1e-3),
+        forward_model.accumulate_equatorial_sky_update_3d(resid, step_size=0.5, beam_reg=1e-3),
+        forward_model.accumulate_beam_update_3d(sky_coeffs, resid, step_size=0.5, sky_reg=1e-3),
     )
 
     # Get combined updates
-    sky_delta_comb, beam_delta_comb = forward_model.accumulate_sky_and_beam_update(
+    sky_delta_comb, beam_delta_comb = forward_model.accumulate_sky_and_beam_update_3d(
         sky_coeffs, resid, sky_step_size=0.5, beam_step_size=0.5, beam_reg=1e-3, sky_reg=1e-3
     )
 
@@ -445,10 +445,10 @@ def test_simulate_chunked_matches_unchunked(forward_model, rot_matrices, A_sky):
     sky_coeffs = _zenith_sky_coeffs(fwd.sky_model.nside, A_sky)
 
     # Simulate without chunking
-    vis_no_chunk = fwd.simulate(sky_coeffs, rot_matrices, chunk_size=rot_matrices.shape[0])
+    vis_no_chunk = fwd.simulate_3d(sky_coeffs, rot_matrices, t_chunk_size=rot_matrices.shape[0])
 
     # Simulate with chunking (smaller chunks)
-    vis_chunked = fwd.simulate(sky_coeffs, rot_matrices, chunk_size=1)
+    vis_chunked = fwd.simulate_3d(sky_coeffs, rot_matrices, t_chunk_size=1)
 
     # Results should match within float32 tolerance
     assert jnp.allclose(vis_no_chunk, vis_chunked, rtol=1e-5, atol=1e-8), (
@@ -462,10 +462,10 @@ def test_simulate_2d_chunked_matches_unchunked(forward_model, rot_matrices):
     sky_coeffs = _zenith_sky_coeffs(fwd.sky_model.nside, fwd.A_sky)
 
     # Simulate without chunking
-    vis_no_chunk = fwd.simulate_2d(sky_coeffs, rot_matrices, chunk_size=rot_matrices.shape[0])
+    vis_no_chunk = fwd.simulate_2d(sky_coeffs, rot_matrices, t_chunk_size=rot_matrices.shape[0])
 
     # Simulate with chunking (smaller chunks)
-    vis_chunked = fwd.simulate_2d(sky_coeffs, rot_matrices, chunk_size=1)
+    vis_chunked = fwd.simulate_2d(sky_coeffs, rot_matrices, t_chunk_size=1)
 
     # Results should match within float32 tolerance
     assert jnp.allclose(vis_no_chunk, vis_chunked, rtol=1e-5, atol=1e-8), (
@@ -479,7 +479,7 @@ def test_calibrator_method_2d(forward_model, A_sky, rot_matrices):
     import numpy as np
 
     sky_coeffs = _zenith_sky_coeffs(forward_model.sky_model.nside, A_sky)
-    vis_data = np.array(forward_model.simulate(sky_coeffs, rot_matrices))
+    vis_data = np.array(forward_model.simulate_3d(sky_coeffs, rot_matrices))
 
     cal = Calibrator(
         forward_model.array,

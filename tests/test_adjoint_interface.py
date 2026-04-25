@@ -495,7 +495,7 @@ def calibrator(array, beam_model, freqs, rot_matrices, sky_model):
     ), dtype=jnp.float32)
 
     # Simulate data
-    vis_model = fwd.simulate(sky_coeffs, jnp.array(rot_matrices))
+    vis_model = fwd.simulate_3d(sky_coeffs, jnp.array(rot_matrices))
 
     # Add some noise
     rng = np.random.default_rng(123)

@@ -269,7 +269,8 @@ class Calibrator:
         channel_weights=None,
         inv_noise_var=None,
         noise_sigma=None,
-        method: str = '3d',
+        method: str = '2d',
+        t_chunk_size: int = 12,
     ):
         """
         Parameters
@@ -277,14 +278,19 @@ class Calibrator:
         sky_model : SkyModel
             Sky model providing ``nside`` and the spectral basis ``A_sky``.
         method : {'3d', '2d'}
-            Forward-model path.  ``'3d'`` uses a single type-3 NUFFT per time
-            step (default).  ``'2d'`` uses per-frequency type-1 2D NUFFTs on
+            Forward-model path.  ``'2d'`` uses per-frequency type-1 2D NUFFTs on
             the compact hex-rect grid — typically 10–30× faster when the
-            channel spacing satisfies the critical Nyquist condition.
+            channel spacing satisfies the critical Nyquist condition (default).
+            ``'3d'`` uses a single type-3 NUFFT per time step.
+        t_chunk_size : int, optional
+            Number of time steps to process per chunk in simulate.
+            Default 12 (~6–12× memory reduction for 96-time observations).
+            Set to ntime to disable chunking.
         """
         if method not in ('3d', '2d'):
             raise ValueError(f"method must be '3d' or '2d', got {method!r}")
         self.method = method
+        self.t_chunk_size = t_chunk_size
 
         self.freqs = jnp.array(freqs, dtype=DTYPE_R_JAX)
         self.rot_matrices = jnp.array(rot_matrices, dtype=DTYPE_R_JAX)
@@ -336,19 +342,19 @@ class Calibrator:
             print(f"  ({npix_above_horizon} above-horizon pixels retained after cut)")
 
     def _select_methods(self):
-        """Bind forward/adjoint callables based on self.method."""
+        """Bind forward/adjoint callables based on self.method. Only JIT the selected path."""
         if self.method == '2d':
-            self._sim_fn            = self.fwd.simulate_2d
+            self._sim_fn            = lambda sc, rm: self.fwd.simulate_2d(sc, rm, t_chunk_size=self.t_chunk_size)
             self._var_beam_sim_fn   = self.fwd.simulate_variable_beam_2d
             self._sky_update_fn     = self.fwd.accumulate_equatorial_sky_update_2d
             self._beam_update_fn    = self.fwd.accumulate_beam_update_2d
             self._combined_update_fn = self.fwd.accumulate_sky_and_beam_update_2d
-        else:
-            self._sim_fn            = self.fwd.simulate
-            self._var_beam_sim_fn   = self.fwd.simulate_variable_beam
-            self._sky_update_fn     = self.fwd.accumulate_equatorial_sky_update
-            self._beam_update_fn    = self.fwd.accumulate_beam_update
-            self._combined_update_fn = self.fwd.accumulate_sky_and_beam_update
+        else:  # method == '3d'
+            self._sim_fn            = lambda sc, rm: self.fwd.simulate_3d(sc, rm, t_chunk_size=self.t_chunk_size)
+            self._var_beam_sim_fn   = self.fwd.simulate_variable_beam_3d
+            self._sky_update_fn     = self.fwd.accumulate_equatorial_sky_update_3d
+            self._beam_update_fn    = self.fwd.accumulate_beam_update_3d
+            self._combined_update_fn = self.fwd.accumulate_sky_and_beam_update_3d
 
     def _get_active_size(self):
         """Return number of active pixels after masking."""
@@ -902,6 +908,82 @@ class Calibrator:
         else:
             loss = float(self._jit_loss({'sky_coeffs': sky_active, **gain_params}, self._effective_weights()))
         self._fit_gains_linear_cache = (sky_active, gain_params, loss)
+        return gain_params, loss
+
+    def fit_gains_linear_variable_beam(self, sky_coeffs, beam_coeffs, subtract_static_sky=False):
+        """Solve for gains with sky and beam held fixed (variable beam version).
+
+        Used in joint sky+beam fitting to ensure gain solve uses the current beam,
+        not the cached fixed beam.
+
+        Parameters
+        ----------
+        sky_coeffs : array, shape (npix,) or (npix, nmodes)
+            Sky coefficients. Can be full-sky or active (masked) pixels.
+        beam_coeffs : array, shape (npix_beam, nmodes_beam)
+            Beam coefficients to use (current joint state, not cached).
+        subtract_static_sky : bool, optional
+            If True, subtract cached static sky contribution from data before fitting.
+            Requires cache_static_sky_coeffs() to be called first.
+
+        Returns
+        -------
+        gain_params : dict
+            Gain parameters (per time/frequency, same for full/masked).
+        loss : float
+            Chi-squared loss computed with the variable beam model.
+        """
+        if subtract_static_sky:
+            if not self._static_sky_cached:
+                raise RuntimeError("Static sky not cached. Call cache_static_sky_coeffs() first.")
+            data_for_fit = self.data - self._cached_static_vis
+        else:
+            data_for_fit = self.data
+
+        sky_active = self._ensure_sky_is_active(sky_coeffs)
+        vis_model = self._var_beam_sim_fn(sky_active, beam_coeffs, self.rot_matrices)
+
+        den = jnp.abs(vis_model) ** 2
+        g_opt = data_for_fit * jnp.conj(vis_model) / (den + 1e-30)
+        log_g = jnp.log(g_opt + 0j)
+
+        w_sum = den.sum(axis=2) + 1e-30
+        log_amp = (den * jnp.real(log_g)).sum(axis=2) / w_sum
+
+        X = jnp.column_stack([
+            jnp.ones(self.nbls, dtype=DTYPE_R_JAX),
+            self.bls[:, 0].astype(DTYPE_R_JAX),
+            self.bls[:, 1].astype(DTYPE_R_JAX),
+        ])
+
+        Xy = jnp.einsum('bk,tfb->tfk', X, den * jnp.imag(log_g))
+        XTX = jnp.einsum('bk,tfb,bl->tfkl', X, den, X)
+        XTX = XTX + 1e-10 * jnp.eye(3, dtype=DTYPE_R_JAX)
+
+        theta = jnp.linalg.solve(XTX, Xy[..., None])[..., 0]
+
+        gain_params = {
+            'log_amp': log_amp.astype(DTYPE_R_JAX),
+            'phase':   theta[:, :, 0].astype(DTYPE_R_JAX),
+            'phi':     theta[:, :, 1:].transpose(0, 2, 1).astype(DTYPE_R_JAX),
+        }
+        # Compute loss with variable beam
+        if subtract_static_sky:
+            orig_data = self.data
+            self.data = data_for_fit
+            try:
+                loss = float(self._jit_loss_variable_beam(
+                    {'sky_coeffs': sky_active, 'beam_coeffs': beam_coeffs, **gain_params},
+                    self._effective_weights()
+                ))
+            finally:
+                self.data = orig_data
+        else:
+            loss = float(self._jit_loss_variable_beam(
+                {'sky_coeffs': sky_active, 'beam_coeffs': beam_coeffs, **gain_params},
+                self._effective_weights()
+            ))
+        self._fit_gains_linear_variable_beam_cache = (sky_active, beam_coeffs, gain_params, loss)
         return gain_params, loss
 
 
@@ -1902,9 +1984,10 @@ class Calibrator:
             do_gains = False
 
         if do_gains:
-            # Solve gains with sky and beam held fixed
+            # Solve gains with sky and beam held fixed (use variable beam to match joint optimization)
             sky_coeffs_for_gains = state.params['sky_coeffs']
-            gain_params, loss = self.fit_gains_linear(sky_coeffs_for_gains)
+            beam_coeffs_for_gains = state.params['beam_coeffs']
+            gain_params, loss = self.fit_gains_linear_variable_beam(sky_coeffs_for_gains, beam_coeffs_for_gains)
             dt = max(_time.perf_counter() - t_step, 1e-3)
             dloss = max(0.0, loss_pre - loss)
             eff = dloss / (max(loss_pre, 1e-30) * dt)
