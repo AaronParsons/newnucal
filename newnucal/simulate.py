@@ -48,6 +48,7 @@ class ForwardModel:
         eta_padding: float = 0.0,
         nufft_upsampfac: float = 1.25,
         freq_batch_size: int = 8,
+        method: str = "3d",
     ):
         self.array = array
         self.sky_model = sky_model
@@ -57,6 +58,9 @@ class ForwardModel:
         self.eta_max = eta_max
         self.eta_padding = float(eta_padding)
         self.freq_batch_size = freq_batch_size
+        if method not in ("2d", "3d"):
+            raise ValueError(f"method must be '2d' or '3d', got {method!r}")
+        self.method = method
 
         freqs_np = np.asarray(freqs, dtype=DTYPE_R_NPY)
         self.freqs = jnp.array(freqs_np, dtype=DTYPE_R_JAX)
@@ -130,6 +134,18 @@ class ForwardModel:
         self._xi_all = None
         self._2d_x_flat = None   # (ntime*nfreq, npix) — cached NUFFT source coords
         self._2d_y_flat = None
+
+    def simulate(self, sky_coeffs, rot_matrices, t_chunk_size=12):
+        if self.method == "2d":
+            return self.simulate_2d(sky_coeffs, rot_matrices, t_chunk_size)
+        else:
+            return self.simulate_3d(sky_coeffs, rot_matrices, t_chunk_size)
+
+    def simulate_variable_beam(self, sky_coeffs, beam_coeffs, rot_matrices):
+        if self.method == "2d":
+            return self.simulate_variable_beam_2d(sky_coeffs, beam_coeffs, rot_matrices)
+        else:
+            return self.simulate_variable_beam_3d(sky_coeffs, beam_coeffs, rot_matrices)
 
     # ------------------------------------------------------------------
     # Pixel masking helpers
