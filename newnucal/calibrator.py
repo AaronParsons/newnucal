@@ -598,7 +598,7 @@ class Calibrator:
         """
         sky_coeffs = self._ensure_sky_is_active(params['sky_coeffs'])
         if 'beam_coeffs' in params:
-            vis_model = self._var_beam_sim_fn(
+            vis_model = self._jit_simulate_variable_beam(
                 sky_coeffs, params['beam_coeffs'], self.rot_matrices
             )
         else:
