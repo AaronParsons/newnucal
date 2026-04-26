@@ -1014,9 +1014,12 @@ class ForwardModel:
 
     def simulate_variable_beam_3d(self, sky_coeffs, beam_coeffs, rot_matrices):
         """Simulate all time steps with *beam_coeffs* as a differentiable input (3D path)."""
-        if not self._geom_ready:
-            raise RuntimeError('Call precompute_time_geometry() first.')
-        ntime = len(self._interp_px_all)
+        if (
+            (not self._geom_ready)
+            or self._topo_all.shape[0] != rot_matrices.shape[0]
+        ):
+            self.precompute_time_geometry(rot_matrices)
+        ntime = rot_matrices.shape[0]
         sky_spec = sky_coeffs @ self.A_sky.T
         return jnp.stack([
             self._simulate_one_variable_beam_sky_spec(sky_spec, beam_coeffs, t)
@@ -1180,9 +1183,12 @@ class ForwardModel:
 
     def simulate_variable_beam_2d(self, sky_coeffs, beam_coeffs, rot_matrices):
         """Simulate all times with explicit *beam_coeffs* via the 2D path."""
-        if not self._geom_ready:
-            raise RuntimeError('Call precompute_time_geometry() first.')
-        ntime = len(self._interp_px_all)
+        if (
+            (not self._geom_ready)
+            or self._topo_all.shape[0] != rot_matrices.shape[0]
+        ):
+            self.precompute_time_geometry(rot_matrices)
+        ntime = rot_matrices.shape[0]
         sky_spec = sky_coeffs @ self.A_sky.T
         return jnp.stack([
             self._simulate_one_2d_variable_beam_sky_spec(sky_spec, beam_coeffs, t)

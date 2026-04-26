@@ -894,8 +894,9 @@ class Calibrator:
         sky_active = self._ensure_sky_is_active(sky_coeffs)
         vis_model = self._jit_simulate(sky_active, self.rot_matrices)
 
-        den = jnp.abs(vis_model) ** 2
-        g_opt = data_for_fit * jnp.conj(vis_model) / (den + 1e-30)
+        w_tf = self._effective_weights()[:, :, None]
+        den = w_tf * jnp.abs(vis_model) ** 2
+        g_opt = data_for_fit * jnp.conj(vis_model) / (jnp.abs(vis_model) ** 2 + 1e-30)
         log_g = jnp.log(g_opt + 0j)
 
         w_sum = den.sum(axis=2) + 1e-30
@@ -962,7 +963,7 @@ class Calibrator:
             data_for_fit = self.data
 
         sky_active = self._ensure_sky_is_active(sky_coeffs)
-        vis_model = self._var_beam_sim_fn(sky_active, beam_coeffs, self.rot_matrices)
+        vis_model = self._jit_simulate_variable_beam(sky_active, beam_coeffs, self.rot_matrices)
 
         den = jnp.abs(vis_model) ** 2
         g_opt = data_for_fit * jnp.conj(vis_model) / (den + 1e-30)
