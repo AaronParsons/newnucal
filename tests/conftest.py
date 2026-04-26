@@ -76,7 +76,7 @@ def sky_model(freqs, sky_basis):
     return SkyModel(nside=NSIDE_SKY, freqs=freqs, basis=sky_basis)
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="function")
 def beam_model(freqs, beam_basis):
     from newnucal.beam import BeamModel
     return BeamModel(nside=NSIDE_BEAM, freqs=freqs, basis=beam_basis)
@@ -94,7 +94,9 @@ def rot_matrices():
     return compute_rotation_matrices(times, HERA_LOC)
 
 
-@pytest.fixture(scope="session")
-def forward_model(array, sky_model, beam_model, freqs):
+@pytest.fixture(scope="function")
+def forward_model(array, sky_model, beam_model, freqs, rot_matrices):
     from newnucal.simulate import ForwardModel
-    return ForwardModel(array, sky_model, beam_model, freqs)
+    fwd = ForwardModel(array, sky_model, beam_model, freqs)
+    fwd.precompute_time_geometry(rot_matrices)
+    return fwd
