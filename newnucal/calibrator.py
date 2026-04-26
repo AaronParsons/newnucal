@@ -896,7 +896,7 @@ class Calibrator:
 
         w_tf = self._effective_weights()[:, :, None]
         den = w_tf * jnp.abs(vis_model) ** 2
-        g_opt = data_for_fit * jnp.conj(vis_model) / (jnp.abs(vis_model) ** 2 + 1e-30)
+        g_opt = (w_tf * data_for_fit * jnp.conj(vis_model)) / (den + 1e-30)
         log_g = jnp.log(g_opt + 0j)
 
         w_sum = den.sum(axis=2) + 1e-30
@@ -967,7 +967,7 @@ class Calibrator:
 
         w_tf = self._effective_weights()[:, :, None]
         den = w_tf * jnp.abs(vis_model) ** 2
-        g_opt = data_for_fit * jnp.conj(vis_model) / (jnp.abs(vis_model) ** 2 + 1e-30)
+        g_opt = (w_tf * data_for_fit * jnp.conj(vis_model)) / (den + 1e-30)
         log_g = jnp.log(g_opt + 0j)
 
         w_sum = den.sum(axis=2) + 1e-30
