@@ -2178,7 +2178,7 @@ class Calibrator:
             if verbose:
                 tag = 'AA' if used_aa else '  '
                 line = f"    [joint {tag} {state.n_joint - 1:03d}]: loss={loss:.4e}  eff={eff:.2e} frac_Δloss/s  step_gain={state.joint_acc.step_gain:.2f}"
-                if used_aa:
+                if used_aa and is_check_step:
                     line += f"  [AA improved: cand={joint_loss_cand:.4e} vs plain={joint_loss_plain:.4e}]"
                 print(line)
 
