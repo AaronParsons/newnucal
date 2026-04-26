@@ -48,7 +48,7 @@ class ForwardModel:
         eta_padding: float = 0.0,
         nufft_upsampfac: float = 1.25,
         freq_batch_size: int = 8,
-        method: str = "3d",
+        method: str = "2d",
     ):
         self.array = array
         self.sky_model = sky_model
