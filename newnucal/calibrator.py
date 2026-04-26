@@ -328,8 +328,10 @@ class Calibrator:
         self._jit_val_grad = jax.jit(jax.value_and_grad(self._loss))
         self._jit_loss_variable_beam = jax.jit(self._loss_variable_beam)
         self._jit_residual_variable_beam = jax.jit(self._residual_variable_beam)
+        self._jit_residual_and_loss_variable_beam = jax.jit(self._residual_and_loss_variable_beam)
         self._jit_simulate = jax.jit(self._sim_fn)
         self._jit_simulate_variable_beam = jax.jit(self._var_beam_sim_fn)
+        self._residual_cache = None  # (sky, beam, log_amp, phase, phi, resid) when valid
         self.set_channel_weights(channel_weights)
         self.set_inv_noise_var(inv_noise_var)
         if noise_sigma is not None:
@@ -456,6 +458,34 @@ class Calibrator:
         vis_cal = apply_gains(vis_model, params['log_amp'], params['phase'], params['phi'], self.bls)
         return jnp.sum(weights[:, :, None] * (jnp.abs(self.data - vis_cal) ** 2))
 
+    def _residual_and_loss_variable_beam(self, params, weights):
+        """Compute residual and loss from a single forward simulate.
+
+        Returns (resid_for_adjoint, loss_scalar) with vis_model shared between them.
+        This avoids the cost of computing vis_model twice: once for the residual (used
+        in the adjoint step) and once for the loss (used in acceptance testing).
+
+        Residual is computed in gain-calibrated model space: (data_cal - vis_model) * weights,
+        matching _residual_variable_beam exactly. Loss is computed in data space:
+        sum(weights * |data - apply_gains(vis_model)|^2).
+        """
+        sky_coeffs = self._ensure_sky_is_active(params['sky_coeffs'])
+        vis_model = self._var_beam_sim_fn(
+            sky_coeffs, params['beam_coeffs'], self.rot_matrices
+        )
+        # Loss: data space
+        vis_cal = apply_gains(vis_model, params['log_amp'], params['phase'], params['phi'], self.bls)
+        loss = jnp.sum(weights[:, :, None] * (jnp.abs(self.data - vis_cal) ** 2))
+
+        # Residual for adjoint: gain-calibrated model space
+        inv_log_amp = -params['log_amp']
+        inv_phase = -params['phase']
+        inv_phi = -params['phi']
+        data_cal = apply_gains(self.data, inv_log_amp, inv_phase, inv_phi, self.bls)
+        resid = (data_cal - vis_model) * weights[:, :, None].astype(DTYPE_C_JAX)
+
+        return resid, loss
+
     def calc_loss(self, params, explicit_beam: bool = False):
         # Fast path: return the loss already computed by fit_gains_linear when
         # called immediately after with the same (sky_coeffs, gain_params) arrays.
@@ -465,6 +495,17 @@ class Calibrator:
             if cache is not None:
                 sc, gp, cached_loss = cache
                 if (params.get('sky_coeffs') is sc
+                        and params.get('log_amp') is gp.get('log_amp')
+                        and params.get('phase') is gp.get('phase')
+                        and params.get('phi') is gp.get('phi')):
+                    return cached_loss
+        else:
+            # Fast path for explicit_beam: check if we cached this loss after a step
+            cache = getattr(self, '_fit_gains_linear_variable_beam_cache', None)
+            if cache is not None:
+                sc, bc, gp, cached_loss = cache
+                if (params.get('sky_coeffs') is sc
+                        and params.get('beam_coeffs') is bc
                         and params.get('log_amp') is gp.get('log_amp')
                         and params.get('phase') is gp.get('phase')
                         and params.get('phi') is gp.get('phi')):
@@ -1017,8 +1058,10 @@ class Calibrator:
         self._jit_val_grad = jax.jit(jax.value_and_grad(self._loss))
         self._jit_loss_variable_beam = jax.jit(self._loss_variable_beam)
         self._jit_residual_variable_beam = jax.jit(self._residual_variable_beam)
+        self._jit_residual_and_loss_variable_beam = jax.jit(self._residual_and_loss_variable_beam)
         self._jit_simulate = jax.jit(self._sim_fn)
         self._jit_simulate_variable_beam = jax.jit(self._var_beam_sim_fn)
+        self._residual_cache = None
 
     def compute_adjoint_updates(self, sky_coeffs, residual_vis, update_mode='both', **kwargs):
         """Unified interface for sky/beam adjoint updates.
@@ -1646,6 +1689,7 @@ class Calibrator:
         self.fwd.update_beam_cache(state.params['beam_coeffs'], recompile=recompile)
         if recompile:
             self._recompile_jit()
+        self._residual_cache = None  # Invalidate residual cache when beam cache changes
         state.beam_dirty_pending = False
 
     def init_joint_sky_beam_dirty_state(
@@ -1790,9 +1834,19 @@ class Calibrator:
             return best_sky, best_loss, eff_gain
 
         def _beam_plain_step(sky, beam, gains, current_loss, step_gain=1.0):
-            resid = self.calibrated_residual_variable_beam(
-                {'sky_coeffs': sky, 'beam_coeffs': beam, **gains}
-            )
+            # Try to reuse residual from the last accepted trial (same params)
+            cache = self._residual_cache
+            if (cache is not None
+                    and cache[0] is sky and cache[1] is beam
+                    and cache[2] is gains['log_amp']
+                    and cache[3] is gains['phase']
+                    and cache[4] is gains['phi']):
+                resid = cache[5]
+            else:
+                resid = self.calibrated_residual_variable_beam(
+                    {'sky_coeffs': sky, 'beam_coeffs': beam, **gains}
+                )
+            self._residual_cache = None  # consume cache
             # Get base update with step_size=1.0 to enable efficient scaling
             updates = self.compute_adjoint_updates(
                 sky, resid, update_mode='beam',
@@ -1802,6 +1856,7 @@ class Calibrator:
 
             best_beam = beam
             best_loss = current_loss
+            best_resid = resid
             eff_gain = 0.0
             initial_step = s.get('beam_initial_step', 1.0)
 
@@ -1829,18 +1884,22 @@ class Calibrator:
                 gain_to_try = step_gain
                 while gain_to_try >= state.beam_acc._min_step_gain:
                     beam_trial = (beam + gain_to_try * initial_step * delta_bc_base).astype(DTYPE_R_JAX)
-                    loss_trial = float(self._jit_loss_variable_beam(
+                    trial_resid, trial_loss_jax = self._jit_residual_and_loss_variable_beam(
                         {'sky_coeffs': sky, 'beam_coeffs': beam_trial, **gains},
                         weights,
-                    ))
+                    )
+                    loss_trial = float(trial_loss_jax)
                     if loss_trial < best_loss:
                         best_beam = beam_trial
                         best_loss = loss_trial
+                        best_resid = trial_resid
                         eff_gain = gain_to_try
                     if best_loss < current_loss:
                         break
                     gain_to_try *= 0.5
 
+            # Cache the accepted trial residual for next step
+            self._residual_cache = (sky, best_beam, gains['log_amp'], gains['phase'], gains['phi'], best_resid)
             return best_beam, best_loss, eff_gain
 
         overdue = {}
@@ -2028,6 +2087,7 @@ class Calibrator:
 
         if do_gains:
             # Solve gains with sky and beam held fixed (use variable beam to match joint optimization)
+            self._residual_cache = None  # invalidate cache when gains change
             sky_coeffs_for_gains = state.params['sky_coeffs']
             beam_coeffs_for_gains = state.params['beam_coeffs']
             gain_params, loss = self.fit_gains_linear_variable_beam(sky_coeffs_for_gains, beam_coeffs_for_gains)
@@ -2046,10 +2106,20 @@ class Calibrator:
                 print(f"    [gains {state.n_gains - 1:03d}]: loss={loss:.4e}  eff={eff:.2e} frac_Δloss/s")
         else:
             # Joint sky+beam step with Anderson acceleration
-            resid = self._jit_residual_variable_beam(
-                {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params},
-                weights,
-            )
+            # Try to reuse residual from the last accepted trial (same params)
+            cache = self._residual_cache
+            if (cache is not None
+                    and cache[0] is sky_coeffs and cache[1] is beam_coeffs
+                    and cache[2] is gain_params['log_amp']
+                    and cache[3] is gain_params['phase']
+                    and cache[4] is gain_params['phi']):
+                resid = cache[5]
+            else:
+                resid, _ = self._jit_residual_and_loss_variable_beam(
+                    {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params},
+                    weights,
+                )
+            self._residual_cache = None  # consume cache
             updates = self.compute_adjoint_updates(
                 sky_coeffs, resid, update_mode='both',
                 sky_step_size=1.0, beam_step_size=1.0,
@@ -2090,20 +2160,27 @@ class Calibrator:
                 joint_sky_plain = joint_sky_trial
                 joint_beam_plain = joint_beam_trial
                 joint_loss_plain = joint_loss_trial
+                joint_resid_trial, _ = self._jit_residual_and_loss_variable_beam(
+                    {'sky_coeffs': joint_sky_trial, 'beam_coeffs': joint_beam_trial, **gain_params},
+                    weights
+                )
             else:
                 # Normal retry loop: try current step_gain, then halve if unsuccessful
                 gain_to_try = state.joint_acc.step_gain
+                joint_resid_trial = resid
                 while gain_to_try >= state.joint_acc._min_step_gain:
                     joint_sky_step = (sky_coeffs + gain_to_try * initial_step * delta_sky_base).astype(DTYPE_R_JAX)
                     joint_beam_step = (beam_coeffs + gain_to_try * initial_step * delta_beam_base).astype(DTYPE_R_JAX)
-                    joint_loss_step = float(self._jit_loss_variable_beam(
+                    trial_resid, trial_loss_jax = self._jit_residual_and_loss_variable_beam(
                         {'sky_coeffs': joint_sky_step, 'beam_coeffs': joint_beam_step, **gain_params},
                         weights
-                    ))
+                    )
+                    joint_loss_step = float(trial_loss_jax)
                     if joint_loss_step < joint_loss_trial:
                         joint_sky_trial = joint_sky_step
                         joint_beam_trial = joint_beam_step
                         joint_loss_trial = joint_loss_step
+                        joint_resid_trial = trial_resid
                         eff_gain = gain_to_try
                     if joint_loss_trial < loss:
                         break
@@ -2111,6 +2188,17 @@ class Calibrator:
                 joint_sky_plain = joint_sky_trial
                 joint_beam_plain = joint_beam_trial
                 joint_loss_plain = joint_loss_trial
+
+            # Cache the accepted trial residual and loss for next step / chi2 checks
+            self._residual_cache = (
+                joint_sky_plain, joint_beam_plain,
+                gain_params['log_amp'], gain_params['phase'], gain_params['phi'],
+                joint_resid_trial
+            )
+            self._fit_gains_linear_variable_beam_cache = (
+                self._ensure_sky_is_active(joint_sky_plain), joint_beam_plain,
+                gain_params, joint_loss_plain
+            )
 
             state.joint_acc.report_step_gain(eff_gain)
 
@@ -2156,6 +2244,7 @@ class Calibrator:
                             joint_loss_next = joint_loss_cand
                             used_aa = True
                             state.settings['_joint_use_aa'] = True
+                            self._residual_cache = None  # cache is stale; AA candidate != plain
                         else:
                             state.settings['_joint_use_aa'] = False
                 else:
@@ -2175,6 +2264,7 @@ class Calibrator:
                         joint_sky_next = joint_sky_cand
                         joint_beam_next = joint_beam_cand
                         used_aa = True
+                        self._residual_cache = None  # cache is stale; AA candidate != plain
 
             sky_coeffs = joint_sky_next
             beam_coeffs = joint_beam_next
