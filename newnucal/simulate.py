@@ -494,11 +494,10 @@ class ForwardModel:
             .astype(DTYPE_R_JAX)
         )
 
-        # Bilinear stencil for beam solving — list of (4, npix_sky) numpy arrays,
-        # one per time step.  Kept as a list so that beam solving can be done with
-        # a per-time Python loop without stacking into a single large array.
-        self._interp_px_all  = interp_px_all   # list[np.ndarray(4, npix_sky), int32]
-        self._interp_wgt_all = interp_wgt_all  # list[np.ndarray(4, npix_sky), DTYPE_R]
+        # Bilinear stencil for beam solving — stacked JAX arrays for array indexing.
+        # Shape: (ntime, 4, npix_sky) for both px and wgt.
+        self._interp_px_all  = jnp.array(np.stack(interp_px_all), dtype=jnp.int32)
+        self._interp_wgt_all = jnp.array(np.stack(interp_wgt_all), dtype=DTYPE_R_JAX)
 
         self._geom_ready = True
         # Invalidate any cached JIT compilation: the precomputed arrays are
@@ -829,10 +828,10 @@ class ForwardModel:
         # Process one time step
         def one_time_step(carry_sky, carry_beam, tind):
             # Get dirty apparent sky via 3D adjoint (includes IFFT)
-            dirty_pf = self.dirty_apparent_sky_one_time(residual_vis[tind], int(tind))
+            dirty_pf = self.dirty_apparent_sky_one_time(residual_vis[tind], tind)
 
             # Sky update contribution
-            beam_spec_h = self._beam_spec_horizon_all[int(tind)]
+            beam_spec_h = self._beam_spec_horizon_all[tind]
             weight = jnp.abs(beam_spec_h) ** 2
             delta_app = sky_step_size * jnp.conj(beam_spec_h.astype(DTYPE_C_JAX)) * dirty_pf / (weight.astype(DTYPE_C_JAX) + beam_reg)
 
@@ -842,13 +841,13 @@ class ForwardModel:
             )
 
             # Beam update contribution
-            horizon = self._horizon_all[int(tind)]
+            horizon = self._horizon_all[tind]
             delta_bsf = beam_step_size * jnp.conj(sky_spec_jax) * dirty_pf / (sky_weight + sky_reg)
             delta_bi = (jnp.real(delta_bsf) * horizon[:, None]) @ jnp.array(self.A_beam, dtype=DTYPE_R_JAX)
 
             # Interpolate beam contributions to beam pixel grid
-            px = self._interp_px_all[int(tind)]       # (4, npix_sky)
-            wgt = self._interp_wgt_all[int(tind)]     # (4, npix_sky)
+            px = self._interp_px_all[tind]       # (4, npix_sky)
+            wgt = self._interp_wgt_all[tind]     # (4, npix_sky)
             px_flat = px.reshape(-1)                  # (4*npix_sky,)
             w_flat = (wgt * sky_pow[None, :]).reshape(-1)  # (4*npix_sky,)
 
@@ -1332,10 +1331,10 @@ class ForwardModel:
         # Process one time step
         def one_time_step(carry_sky, carry_beam, tind):
             # Get dirty apparent sky via 2D adjoint
-            dirty_pf = self.dirty_apparent_sky_one_time_2d(residual_vis[tind], int(tind))
+            dirty_pf = self.dirty_apparent_sky_one_time_2d(residual_vis[tind], tind)
 
             # Sky update contribution
-            beam_spec_h = self._beam_spec_horizon_all[int(tind)]
+            beam_spec_h = self._beam_spec_horizon_all[tind]
             weight = jnp.abs(beam_spec_h) ** 2
             delta_app = sky_step_size * jnp.conj(beam_spec_h.astype(DTYPE_C_JAX)) * dirty_pf / (weight.astype(DTYPE_C_JAX) + beam_reg)
 
@@ -1345,13 +1344,13 @@ class ForwardModel:
             )
 
             # Beam update contribution: interpolate and scatter
-            horizon = self._horizon_all[int(tind)]
+            horizon = self._horizon_all[tind]
             delta_bsf = beam_step_size * jnp.conj(sky_spec_jax) * dirty_pf / (sky_weight + sky_reg)
             delta_bi = (jnp.real(delta_bsf) * horizon[:, None]) @ jnp.array(self.A_beam, dtype=DTYPE_R_JAX)
 
             # Interpolate beam contributions to beam pixel grid
-            px = self._interp_px_all[int(tind)]       # (4, npix_sky)
-            wgt = self._interp_wgt_all[int(tind)]     # (4, npix_sky)
+            px = self._interp_px_all[tind]       # (4, npix_sky)
+            wgt = self._interp_wgt_all[tind]     # (4, npix_sky)
             px_flat = px.reshape(-1)                  # (4*npix_sky,)
             w_flat = (wgt * sky_pow[None, :]).reshape(-1)  # (4*npix_sky,)
 
