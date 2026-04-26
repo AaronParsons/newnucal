@@ -574,12 +574,12 @@ class ForwardModel:
             # Single chunk: use direct implementation
             return self._simulate_impl(sky_coeffs, rot_matrices)
 
-        # Multi-chunk: accumulate results
+        # Multi-chunk: accumulate results with local geometry per chunk
         chunks = []
         for t_start in range(0, ntime, t_chunk_size):
             t_end = min(t_start + t_chunk_size, ntime)
             rot_chunk = rot_matrices[t_start:t_end]
-            # Invalidate geometry and recompute for this chunk
+            # Invalidate geometry: recompute locally for this chunk only
             self._geom_ready = False
             for attr in ('_topo_all', '_horizon_all', '_beam_spec_horizon_all',
                          '_src_x_all', '_src_y_all', '_src_z_all', '_xi_all',
@@ -587,6 +587,17 @@ class ForwardModel:
                 setattr(self, attr, None)
             vis_chunk = self._simulate_impl(sky_coeffs, rot_chunk)
             chunks.append(vis_chunk)
+
+        # Restore canonical full-time geometry cache to avoid silent bugs in
+        # subsequent variable_beam simulation. Without this, the cache would
+        # correspond only to the last chunk, causing variable_beam to use wrong
+        # time count/cache.
+        self._geom_ready = False
+        for attr in ('_topo_all', '_horizon_all', '_beam_spec_horizon_all',
+                     '_src_x_all', '_src_y_all', '_src_z_all', '_xi_all',
+                     '_interp_px_all', '_interp_wgt_all'):
+            setattr(self, attr, None)
+        self.precompute_time_geometry(rot_matrices)
 
         return jnp.concatenate(chunks, axis=0)
 
@@ -1132,12 +1143,12 @@ class ForwardModel:
             # Single chunk: use direct implementation
             return self._simulate_2d_impl(sky_coeffs, rot_matrices)
 
-        # Multi-chunk: accumulate results
+        # Multi-chunk: accumulate results with local geometry per chunk
         chunks = []
         for t_start in range(0, ntime, t_chunk_size):
             t_end = min(t_start + t_chunk_size, ntime)
             rot_chunk = rot_matrices[t_start:t_end]
-            # Invalidate geometry and recompute for this chunk
+            # Invalidate geometry: recompute locally for this chunk only
             self._geom_ready = False
             for attr in ('_topo_all', '_horizon_all', '_beam_spec_horizon_all',
                          '_src_x_all', '_src_y_all', '_src_z_all', '_xi_all',
@@ -1145,6 +1156,17 @@ class ForwardModel:
                 setattr(self, attr, None)
             vis_chunk = self._simulate_2d_impl(sky_coeffs, rot_chunk)
             chunks.append(vis_chunk)
+
+        # Restore canonical full-time geometry cache to avoid silent bugs in
+        # subsequent variable_beam simulation. Without this, the cache would
+        # correspond only to the last chunk, causing variable_beam to use wrong
+        # time count/cache.
+        self._geom_ready = False
+        for attr in ('_topo_all', '_horizon_all', '_beam_spec_horizon_all',
+                     '_src_x_all', '_src_y_all', '_src_z_all', '_xi_all',
+                     '_interp_px_all', '_interp_wgt_all', '_2d_x_flat', '_2d_y_flat'):
+            setattr(self, attr, None)
+        self.precompute_time_geometry(rot_matrices)
 
         return jnp.concatenate(chunks, axis=0)
 
