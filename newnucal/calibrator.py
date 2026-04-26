@@ -2119,33 +2119,9 @@ class Calibrator:
                 ])
 
                 aa_candidate_flat = state.joint_acc.push(current_flat, plain_flat)
-                # Only evaluate AA candidate on check steps; otherwise use cached decision
-                if is_check_step and aa_candidate_flat is not None:
-                    sky_shape = sky_coeffs.shape
-                    beam_shape = beam_coeffs.shape
-                    sky_size = int(np.prod(sky_shape))
-                    joint_sky_cand = jnp.array(
-                        aa_candidate_flat[:sky_size].reshape(sky_shape),
-                        dtype=DTYPE_R_JAX
-                    )
-                    joint_beam_cand = jnp.array(
-                        aa_candidate_flat[sky_size:].reshape(beam_shape),
-                        dtype=DTYPE_R_JAX
-                    )
-                    joint_loss_cand = float(self._jit_loss_variable_beam(
-                        {'sky_coeffs': joint_sky_cand, 'beam_coeffs': joint_beam_cand, **gain_params},
-                        weights
-                    ))
-                    if joint_loss_cand < joint_loss_plain:
-                        joint_sky_next = joint_sky_cand
-                        joint_beam_next = joint_beam_cand
-                        joint_loss_next = joint_loss_cand
-                        used_aa = True
-                        state.settings['_last_joint_use_aa'] = True
-                    else:
-                        state.settings['_last_joint_use_aa'] = False
-                elif not is_check_step and state.settings.get('_last_joint_use_aa', False):
-                    # Use cached decision from last check step: recompute AA candidate now
+
+                if is_check_step:
+                    # Evaluate both plain and AA candidate; decide which to use
                     if aa_candidate_flat is not None:
                         sky_shape = sky_coeffs.shape
                         beam_shape = beam_coeffs.shape
@@ -2162,9 +2138,30 @@ class Calibrator:
                             {'sky_coeffs': joint_sky_cand, 'beam_coeffs': joint_beam_cand, **gain_params},
                             weights
                         ))
+                        if joint_loss_cand < joint_loss_plain:
+                            joint_sky_next = joint_sky_cand
+                            joint_beam_next = joint_beam_cand
+                            joint_loss_next = joint_loss_cand
+                            used_aa = True
+                            state.settings['_joint_use_aa'] = True
+                        else:
+                            state.settings['_joint_use_aa'] = False
+                else:
+                    # Use cached decision from last check step: blindly take AA or plain
+                    if state.settings.get('_joint_use_aa', False) and aa_candidate_flat is not None:
+                        sky_shape = sky_coeffs.shape
+                        beam_shape = beam_coeffs.shape
+                        sky_size = int(np.prod(sky_shape))
+                        joint_sky_cand = jnp.array(
+                            aa_candidate_flat[:sky_size].reshape(sky_shape),
+                            dtype=DTYPE_R_JAX
+                        )
+                        joint_beam_cand = jnp.array(
+                            aa_candidate_flat[sky_size:].reshape(beam_shape),
+                            dtype=DTYPE_R_JAX
+                        )
                         joint_sky_next = joint_sky_cand
                         joint_beam_next = joint_beam_cand
-                        joint_loss_next = joint_loss_cand
                         used_aa = True
 
             sky_coeffs = joint_sky_next
