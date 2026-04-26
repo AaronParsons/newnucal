@@ -311,6 +311,7 @@ class Calibrator:
             eps=eps,
             eta_max=eta_max,
             eta_padding=eta_padding,
+            method=method,
         )
         self.fwd.precompute_time_geometry(self.rot_matrices)
 
