@@ -941,17 +941,24 @@ class ForwardModel:
             beam_spec_horizon_all.append(bs)
         return jnp.array(np.stack(beam_spec_horizon_all), dtype=DTYPE_R_JAX)
 
-    def update_beam_cache(self, beam_coeffs):
+    def update_beam_cache(self, beam_coeffs, recompile=True):
         """Recompute :attr:`_beam_spec_horizon_all` from new *beam_coeffs*.
 
         Cheaper than a full :meth:`precompute_time_geometry` call because the
         NUFFT source coordinates and interpolation stencil are already stored.
-        After this call :attr:`_jit_one` is recompiled so subsequent
-        :meth:`simulate` calls use the updated beam.
+        By default recompiles :attr:`_jit_one` and :attr:`_jit_one_2d` so
+        subsequent :meth:`simulate` calls use the updated beam; set ``recompile=False``
+        to skip recompilation when the fixed-beam path is not needed (e.g., during
+        variable-beam fitting iterations).
 
         Parameters
         ----------
         beam_coeffs : array_like, shape (npix_beam, nmodes_beam)
+        recompile : bool, optional
+            If True (default), recompile JIT functions to use updated beam cache.
+            Set to False during iterative variable-beam fitting to avoid expensive
+            recompilation; recompile should be True only when fixed-beam simulation
+            is needed or at the end of optimization.
         """
         if not self._geom_ready:
             raise RuntimeError('Call precompute_time_geometry() first.')
@@ -977,9 +984,10 @@ class ForwardModel:
         else:
             self.beam_coeffs = jnp.array(bc_np, dtype=DTYPE_R_JAX)
         self.beam_model.coeffs = bc_np
-        # Invalidate compiled simulations so the new precomputed beam is used.
-        self._jit_one = jax.jit(self._simulate_one_precomputed)
-        self._jit_one_2d = jax.jit(self._simulate_one_2d_precomputed_sky_spec)
+        # Recompile JIT functions only if requested (skip during variable-beam loops)
+        if recompile:
+            self._jit_one = jax.jit(self._simulate_one_precomputed)
+            self._jit_one_2d = jax.jit(self._simulate_one_2d_precomputed_sky_spec)
 
     def _simulate_one_variable_beam_sky_spec(self, sky_spec, beam_coeffs, tind):
         """Forward model for one time step with *beam_coeffs* as a traced input."""

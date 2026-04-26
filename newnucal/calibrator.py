@@ -1632,9 +1632,18 @@ class Calibrator:
             )
         return state
 
-    def _sync_beam_cache_from_state(self, state: AlternatingDirtyFitState):
-        self.fwd.update_beam_cache(state.params['beam_coeffs'])
-        self._recompile_jit()
+    def _sync_beam_cache_from_state(self, state: AlternatingDirtyFitState, recompile=True):
+        """Sync ForwardModel beam cache from state, optionally skipping recompilation.
+
+        Parameters
+        ----------
+        recompile : bool, optional
+            If True (default), recompile JIT functions after cache update.
+            Set to False during iterative fitting to defer expensive recompilation.
+        """
+        self.fwd.update_beam_cache(state.params['beam_coeffs'], recompile=recompile)
+        if recompile:
+            self._recompile_jit()
         state.beam_dirty_pending = False
 
     def init_joint_sky_beam_dirty_state(
