@@ -2415,9 +2415,12 @@ class Calibrator:
             if not self._static_sky_cached:
                 raise RuntimeError("Static sky not cached. Call cache_static_sky_coeffs() first.")
             orig_data = self.data
+            orig_cache = self._variable_beam_eval_cache
             self.data = self.data - self._cached_static_vis
+            self._variable_beam_eval_cache = None
         else:
             orig_data = None
+            orig_cache = None
 
         if _stop_flag is None:
             stop = _StopFitFlag()
@@ -2438,6 +2441,7 @@ class Calibrator:
         finally:
             if orig_data is not None:
                 self.data = orig_data
+                self._variable_beam_eval_cache = None
             if _stop_flag is None:
                 _StopFitFlag.restore(old_handler)
         return state
