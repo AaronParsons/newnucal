@@ -16,12 +16,36 @@ from jax_finufft import nufft1, nufft2, nufft3
 from jax_finufft.options import Opts as _NufftOpts
 from healjax import get_interp_weights
 import healjax
+from dataclasses import dataclass
+from typing import Optional
 
 from .array import HERAArray
 from .beam import BeamModel
 from .sky import SkyModel
 from .hexrect import hex_lattice_matrix, axial_grid_size
 from .utils import DTYPE_R_JAX, DTYPE_C_JAX, DTYPE_R_NPY, C
+
+
+@dataclass
+class TimeGeometry:
+    """Local time-dependent geometry state for a simulation.
+
+    Holds precomputed coordinate transformations and interpolation weights
+    for a specific time range. Using separate objects avoids mutating global
+    ForwardModel state during chunked simulation.
+    """
+    geom_ready: bool = False
+    topo_all: Optional[jnp.ndarray] = None
+    horizon_all: Optional[jnp.ndarray] = None
+    beam_spec_horizon_all: Optional[jnp.ndarray] = None
+    src_x_all: Optional[jnp.ndarray] = None
+    src_y_all: Optional[jnp.ndarray] = None
+    src_z_all: Optional[jnp.ndarray] = None
+    xi_all: Optional[jnp.ndarray] = None
+    interp_px_all: Optional[jnp.ndarray] = None
+    interp_wgt_all: Optional[jnp.ndarray] = None
+    _2d_x_flat: Optional[jnp.ndarray] = None
+    _2d_y_flat: Optional[jnp.ndarray] = None
 
 
 class ForwardModel:
@@ -396,12 +420,17 @@ class ForwardModel:
             setattr(self, attr, None)
         return self
 
-    def precompute_time_geometry(self, rot_matrices):
-        """Precompute time-only geometry and interpolation operators.
+    def _build_time_geometry(self, rot_matrices) -> TimeGeometry:
+        """Build a local TimeGeometry object without mutating self state.
 
         Parameters
         ----------
         rot_matrices : array_like, shape (ntime, 3, 3)
+
+        Returns
+        -------
+        TimeGeometry
+            Local geometry object with all time-dependent arrays.
         """
         rot_ms = jnp.array(rot_matrices, dtype=DTYPE_R_JAX)
         ntime = int(rot_ms.shape[0])
@@ -442,14 +471,9 @@ class ForwardModel:
             px = np.array(px, dtype=np.int32)
             wgts = np.array(wgts, dtype=DTYPE_R_NPY)
 
-            # Store interpolation stencil for beam solving (update_beam_cache /
-            # simulate_variable_beam).  px/wgts shape: (4, npix_sky).
             interp_px_all.append(px)
             interp_wgt_all.append(wgts)
 
-            # Beam spec × horizon for all pixels.  This precomputed array is
-            # used by _simulate_one_precomputed and apparent_sky_update_one_time,
-            # removing the beam gather and matmul from the JIT hot path.
             bi_np = np.sum(wgts[:, :, None] * bc_np[px], axis=0)   # (npix_sky, nmodes_beam)
             bs_np = (bi_np @ ab_np.T) * horizon[:, None]             # (npix_sky, nfreq)
             beam_spec_horizon_all.append(bs_np)
@@ -458,7 +482,6 @@ class ForwardModel:
             src_y = np.repeat(topo[1], ndelay).astype(DTYPE_R_NPY) * two_pi
             src_z = np.tile(eta_np, npix).astype(DTYPE_R_NPY) * two_pi
 
-            # 2D path: axial sky coordinates xi = A_lat.T @ topo[:2]
             xi = (lat_mat_np.T @ topo[:2, :]).astype(DTYPE_R_NPY)   # (2, npix_sky)
 
             topo_all.append(topo)
@@ -468,37 +491,65 @@ class ForwardModel:
             src_z_all.append(src_z)
             xi_all.append(xi)
 
-        self._topo_all = jnp.array(np.stack(topo_all), dtype=DTYPE_R_JAX)
-        self._horizon_all = jnp.array(np.stack(horizon_all), dtype=DTYPE_R_JAX)
-        self._beam_spec_horizon_all = jnp.array(np.stack(beam_spec_horizon_all), dtype=DTYPE_R_JAX)
-        self._src_x_all = jnp.array(np.stack(src_x_all), dtype=DTYPE_R_JAX)
-        self._src_y_all = jnp.array(np.stack(src_y_all), dtype=DTYPE_R_JAX)
-        self._src_z_all = jnp.array(np.stack(src_z_all), dtype=DTYPE_R_JAX)
-        self._xi_all = jnp.array(np.stack(xi_all), dtype=DTYPE_R_JAX)   # (ntime, 2, npix_sky)
+        topo_all_jax = jnp.array(np.stack(topo_all), dtype=DTYPE_R_JAX)
+        horizon_all_jax = jnp.array(np.stack(horizon_all), dtype=DTYPE_R_JAX)
+        beam_spec_horizon_all_jax = jnp.array(np.stack(beam_spec_horizon_all), dtype=DTYPE_R_JAX)
+        src_x_all_jax = jnp.array(np.stack(src_x_all), dtype=DTYPE_R_JAX)
+        src_y_all_jax = jnp.array(np.stack(src_y_all), dtype=DTYPE_R_JAX)
+        src_z_all_jax = jnp.array(np.stack(src_z_all), dtype=DTYPE_R_JAX)
+        xi_all_jax = jnp.array(np.stack(xi_all), dtype=DTYPE_R_JAX)
 
-        # 2D path: precompute flattened NUFFT source coords for all (time, freq) pairs.
-        # x_flat[t*nfreq + f, j] = 2π * freqs[f] / C * xi[t, 0, j]
-        # Shape: (ntime*nfreq, npix_sky).  Cached here so simulate_2d avoids
-        # recomputing the freq-scale per call.
+        # 2D path: precompute flattened NUFFT source coords
         _two_pi_over_c = 2.0 * np.pi / C
-        _xi_j = self._xi_all                          # (ntime, 2, npix)
-        _freqs = self.freqs                            # (nfreq,)
-        self._2d_x_flat = (
-            (_two_pi_over_c * _xi_j[:, 0:1, :] * _freqs[None, :, None])
+        _freqs = self.freqs
+        _2d_x_flat = (
+            (_two_pi_over_c * xi_all_jax[:, 0:1, :] * _freqs[None, :, None])
             .reshape(ntime * self.nfreq, self.npix_sky)
             .astype(DTYPE_R_JAX)
         )
-        self._2d_y_flat = (
-            (_two_pi_over_c * _xi_j[:, 1:2, :] * _freqs[None, :, None])
+        _2d_y_flat = (
+            (_two_pi_over_c * xi_all_jax[:, 1:2, :] * _freqs[None, :, None])
             .reshape(ntime * self.nfreq, self.npix_sky)
             .astype(DTYPE_R_JAX)
         )
 
-        # Bilinear stencil for beam solving — stacked JAX arrays for array indexing.
-        # Shape: (ntime, 4, npix_sky) for both px and wgt.
-        self._interp_px_all  = jnp.array(np.stack(interp_px_all), dtype=jnp.int32)
-        self._interp_wgt_all = jnp.array(np.stack(interp_wgt_all), dtype=DTYPE_R_JAX)
+        interp_px_all_jax = jnp.array(np.stack(interp_px_all), dtype=jnp.int32)
+        interp_wgt_all_jax = jnp.array(np.stack(interp_wgt_all), dtype=DTYPE_R_JAX)
 
+        return TimeGeometry(
+            geom_ready=True,
+            topo_all=topo_all_jax,
+            horizon_all=horizon_all_jax,
+            beam_spec_horizon_all=beam_spec_horizon_all_jax,
+            src_x_all=src_x_all_jax,
+            src_y_all=src_y_all_jax,
+            src_z_all=src_z_all_jax,
+            xi_all=xi_all_jax,
+            interp_px_all=interp_px_all_jax,
+            interp_wgt_all=interp_wgt_all_jax,
+            _2d_x_flat=_2d_x_flat,
+            _2d_y_flat=_2d_y_flat,
+        )
+
+    def precompute_time_geometry(self, rot_matrices):
+        """Precompute time-only geometry and interpolation operators.
+
+        Parameters
+        ----------
+        rot_matrices : array_like, shape (ntime, 3, 3)
+        """
+        geom = self._build_time_geometry(rot_matrices)
+        self._topo_all = geom.topo_all
+        self._horizon_all = geom.horizon_all
+        self._beam_spec_horizon_all = geom.beam_spec_horizon_all
+        self._src_x_all = geom.src_x_all
+        self._src_y_all = geom.src_y_all
+        self._src_z_all = geom.src_z_all
+        self._xi_all = geom.xi_all
+        self._interp_px_all = geom.interp_px_all
+        self._interp_wgt_all = geom.interp_wgt_all
+        self._2d_x_flat = geom._2d_x_flat
+        self._2d_y_flat = geom._2d_y_flat
         self._geom_ready = True
         # Invalidate any cached JIT compilation: the precomputed arrays are
         # captured by value in the trace, so a fresh jit is needed after each
@@ -507,29 +558,48 @@ class ForwardModel:
         self._jit_one_2d = jax.jit(self._simulate_one_2d_precomputed_sky_spec)
         return self
 
-    def _forward_components_from_cache_sky_spec(self, sky_spec, tind):
-        topo = self._topo_all[tind]
-        horizon = self._horizon_all[tind]
-        beam_spec_h = self._beam_spec_horizon_all[tind]   # (npix_sky, nfreq), already * horizon
+    def _forward_components_from_cache_sky_spec(self, sky_spec, tind, geom=None):
+        """Extract forward model components using cached geometry.
+
+        Parameters
+        ----------
+        sky_spec : jnp.ndarray, shape (npix_sky, nfreq)
+        tind : int
+            Time index
+        geom : TimeGeometry, optional
+            Local geometry object. If None, uses self state.
+        """
+        if geom is None:
+            topo = self._topo_all[tind]
+            horizon = self._horizon_all[tind]
+            beam_spec_h = self._beam_spec_horizon_all[tind]
+        else:
+            topo = geom.topo_all[tind]
+            horizon = geom.horizon_all[tind]
+            beam_spec_h = geom.beam_spec_horizon_all[tind]
         W = sky_spec * beam_spec_h
         W_eta_full = jnp.fft.fft(W, axis=1) * self._phase_full[None, :]
         W_eta = W_eta_full[:, self._eta_idx]
         return topo, horizon, beam_spec_h, W, W_eta
 
-    def _forward_components_from_cache(self, sky_coeffs, tind):
+    def _forward_components_from_cache(self, sky_coeffs, tind, geom=None):
         sky_spec = sky_coeffs @ self.A_sky.T
-        return self._forward_components_from_cache_sky_spec(sky_spec, tind)
+        return self._forward_components_from_cache_sky_spec(sky_spec, tind, geom=geom)
 
     def forward_components_one_time(self, sky_coeffs, tind):
         if not self._geom_ready:
             raise RuntimeError('Call precompute_time_geometry() first.')
         return self._forward_components_from_cache(sky_coeffs, tind)
 
-    def _simulate_one_precomputed_sky_spec(self, sky_spec, tind):
-        _, _, _, _, W_eta = self._forward_components_from_cache_sky_spec(sky_spec, tind)
+    def _simulate_one_precomputed_sky_spec(self, sky_spec, tind, geom=None):
+        _, _, _, _, W_eta = self._forward_components_from_cache_sky_spec(sky_spec, tind, geom=geom)
+        if geom is None:
+            src_x, src_y, src_z = self._src_x_all[tind], self._src_y_all[tind], self._src_z_all[tind]
+        else:
+            src_x, src_y, src_z = geom.src_x_all[tind], geom.src_y_all[tind], geom.src_z_all[tind]
         vis_flat = nufft3(
             W_eta.ravel().astype(DTYPE_C_JAX),
-            self._src_x_all[tind], self._src_y_all[tind], self._src_z_all[tind],
+            src_x, src_y, src_z,
             self._tgt_x, self._tgt_y, self._tgt_z,
             iflag=1,
             eps=self.eps,
@@ -537,24 +607,37 @@ class ForwardModel:
         )
         return vis_flat.reshape(self.nfreq, self.nbls)
 
-    def _simulate_one_precomputed(self, sky_coeffs, tind):
+    def _simulate_one_precomputed(self, sky_coeffs, tind, geom=None):
         sky_spec = sky_coeffs @ self.A_sky.T
-        return self._simulate_one_precomputed_sky_spec(sky_spec, tind)
+        return self._simulate_one_precomputed_sky_spec(sky_spec, tind, geom=geom)
 
-    def _simulate_impl(self, sky_coeffs, rot_matrices):
-        """Core simulate implementation (used internally; consider using simulate() instead)."""
-        if (not self._geom_ready) or (self._topo_all.shape[0] != rot_matrices.shape[0]):
-            self.precompute_time_geometry(rot_matrices)
+    def _simulate_impl(self, sky_coeffs, rot_matrices, geom=None):
+        """Core simulate implementation.
+
+        Parameters
+        ----------
+        sky_coeffs : jnp.ndarray, shape (npix_sky, nmodes_sky)
+        rot_matrices : jnp.ndarray, shape (ntime, 3, 3)
+        geom : TimeGeometry, optional
+            Local geometry object. If None, uses/updates self state.
+        """
+        if geom is None:
+            if (not self._geom_ready) or (self._topo_all.shape[0] != rot_matrices.shape[0]):
+                self.precompute_time_geometry(rot_matrices)
+        else:
+            if not geom.geom_ready or geom.topo_all.shape[0] != rot_matrices.shape[0]:
+                geom = self._build_time_geometry(rot_matrices)
         sky_spec = sky_coeffs @ self.A_sky.T
         inds = jnp.arange(rot_matrices.shape[0], dtype=jnp.int32)
-        return jax.vmap(lambda tind: self._simulate_one_precomputed_sky_spec(sky_spec, tind))(inds)
+        return jax.vmap(lambda tind: self._simulate_one_precomputed_sky_spec(sky_spec, tind, geom=geom))(inds)
 
     def simulate_3d(self, sky_coeffs, rot_matrices, t_chunk_size=12):
         """Simulate visibilities using 3D type-3 NUFFT with automatic time chunking.
 
         Processes time steps in chunks to keep precomputed geometry arrays small.
         For a single chunk, falls back to direct simulation; for multiple chunks,
-        accumulates results from each chunk.
+        accumulates results from each chunk using local geometry per chunk.
+        Global geometry cache is not affected by chunking.
 
         Parameters
         ----------
@@ -573,30 +656,14 @@ class ForwardModel:
             # Single chunk: use direct implementation
             return self._simulate_impl(sky_coeffs, rot_matrices)
 
-        # Multi-chunk: accumulate results with local geometry per chunk
+        # Multi-chunk: use local geometry per chunk, no self mutation
         chunks = []
         for t_start in range(0, ntime, t_chunk_size):
             t_end = min(t_start + t_chunk_size, ntime)
             rot_chunk = rot_matrices[t_start:t_end]
-            # Invalidate geometry: recompute locally for this chunk only
-            self._geom_ready = False
-            for attr in ('_topo_all', '_horizon_all', '_beam_spec_horizon_all',
-                         '_src_x_all', '_src_y_all', '_src_z_all', '_xi_all',
-                         '_interp_px_all', '_interp_wgt_all'):
-                setattr(self, attr, None)
-            vis_chunk = self._simulate_impl(sky_coeffs, rot_chunk)
+            local_geom = self._build_time_geometry(rot_chunk)
+            vis_chunk = self._simulate_impl(sky_coeffs, rot_chunk, geom=local_geom)
             chunks.append(vis_chunk)
-
-        # Restore canonical full-time geometry cache to avoid silent bugs in
-        # subsequent variable_beam simulation. Without this, the cache would
-        # correspond only to the last chunk, causing variable_beam to use wrong
-        # time count/cache.
-        self._geom_ready = False
-        for attr in ('_topo_all', '_horizon_all', '_beam_spec_horizon_all',
-                     '_src_x_all', '_src_y_all', '_src_z_all', '_xi_all',
-                     '_interp_px_all', '_interp_wgt_all'):
-            setattr(self, attr, None)
-        self.precompute_time_geometry(rot_matrices)
 
         return jnp.concatenate(chunks, axis=0)
 
@@ -1067,46 +1134,88 @@ class ForwardModel:
 
         return jnp.concatenate(vis_batches, axis=0)  # (nfreq, nbls)
 
-    def _simulate_one_2d_precomputed_sky_spec(self, sky_spec, tind):
+    def _simulate_one_2d_precomputed_sky_spec(self, sky_spec, tind, geom=None):
         """2D hex-rect NUFFT forward for one time step (cached beam).
 
         Parameters
         ----------
         sky_spec : jnp.ndarray, shape (npix_sky, nfreq)
-        tind     : int
+        tind : int
+        geom : TimeGeometry, optional
+            Local geometry object. If None, uses self state.
 
         Returns
         -------
         vis : jnp.ndarray, shape (nfreq, nbls), complex64
         """
-        beam_spec_h = self._beam_spec_horizon_all[tind]
+        if geom is None:
+            beam_spec_h = self._beam_spec_horizon_all[tind]
+            xi = self._xi_all[tind]
+        else:
+            beam_spec_h = geom.beam_spec_horizon_all[tind]
+            xi = geom.xi_all[tind]
         W = (sky_spec * beam_spec_h).astype(DTYPE_C_JAX)
-        xi = self._xi_all[tind]
         return self._nufft2d_W_to_vis(W, xi, self.freqs)
 
-    def _simulate_one_2d_precomputed(self, sky_coeffs, tind):
+    def _simulate_one_2d_precomputed(self, sky_coeffs, tind, geom=None):
         sky_spec = sky_coeffs @ self.A_sky.T
-        return self._simulate_one_2d_precomputed_sky_spec(sky_spec, tind)
+        return self._simulate_one_2d_precomputed_sky_spec(sky_spec, tind, geom=geom)
 
-    def _simulate_one_2d_variable_beam_sky_spec(self, sky_spec, beam_coeffs, tind):
-        """2D forward for one time step with *beam_coeffs* as a traced input."""
-        px  = self._interp_px_all[tind]
-        wgt = jnp.array(self._interp_wgt_all[tind])
+    def _simulate_one_2d_variable_beam_sky_spec(self, sky_spec, beam_coeffs, tind, geom=None):
+        """2D forward for one time step with *beam_coeffs* as a traced input.
+
+        Parameters
+        ----------
+        sky_spec : jnp.ndarray, shape (npix_sky, nfreq)
+        beam_coeffs : jnp.ndarray, shape (npix_beam, nmodes_beam)
+        tind : int
+        geom : TimeGeometry, optional
+            Local geometry object. If None, uses self state.
+        """
+        if geom is None:
+            px = self._interp_px_all[tind]
+            wgt = jnp.array(self._interp_wgt_all[tind])
+            horizon = self._horizon_all[tind]
+            xi = self._xi_all[tind]
+        else:
+            px = geom.interp_px_all[tind]
+            wgt = jnp.array(geom.interp_wgt_all[tind])
+            horizon = geom.horizon_all[tind]
+            xi = geom.xi_all[tind]
         bi = jnp.sum(wgt[:, :, None] * beam_coeffs[px], axis=0)
-        beam_spec_h = (bi @ self.A_beam.T) * self._horizon_all[tind][:, None]
+        beam_spec_h = (bi @ self.A_beam.T) * horizon[:, None]
         W = (sky_spec * beam_spec_h).astype(DTYPE_C_JAX)
-        xi = self._xi_all[tind]
         return self._nufft2d_W_to_vis(W, xi, self.freqs)
 
-    def _simulate_2d_impl(self, sky_coeffs, rot_matrices):
-        """Core 2D simulate implementation (used internally; consider using simulate_2d() instead)."""
-        if (not self._geom_ready) or (self._2d_x_flat is None) or (self._topo_all.shape[0] != rot_matrices.shape[0]):
-            self.precompute_time_geometry(rot_matrices)
-        ntime = self._topo_all.shape[0]
+    def _simulate_2d_impl(self, sky_coeffs, rot_matrices, geom=None):
+        """Core 2D simulate implementation.
+
+        Parameters
+        ----------
+        sky_coeffs : jnp.ndarray, shape (npix_sky, nmodes_sky)
+        rot_matrices : jnp.ndarray, shape (ntime, 3, 3)
+        geom : TimeGeometry, optional
+            Local geometry object. If None, uses/updates self state.
+        """
+        if geom is None:
+            if (not self._geom_ready) or (self._2d_x_flat is None) or (self._topo_all.shape[0] != rot_matrices.shape[0]):
+                self.precompute_time_geometry(rot_matrices)
+            ntime = self._topo_all.shape[0]
+            beam_spec_h_all = self._beam_spec_horizon_all
+            _2d_x_flat = self._2d_x_flat
+            _2d_y_flat = self._2d_y_flat
+        else:
+            if not geom.geom_ready or geom._2d_x_flat is None or geom.topo_all.shape[0] != rot_matrices.shape[0]:
+                geom = self._build_time_geometry(rot_matrices)
+            ntime = geom.topo_all.shape[0]
+            beam_spec_h_all = geom.beam_spec_horizon_all
+            _2d_x_flat = geom._2d_x_flat
+            _2d_y_flat = geom._2d_y_flat
+
         sky_spec = (sky_coeffs @ self.A_sky.T).astype(DTYPE_C_JAX)   # (npix, nfreq)
         # sky × beam for all times: (ntime, npix, nfreq) → (ntime*nfreq, npix)
         W_flat = (
-            (sky_spec[None, :, :] * self._beam_spec_horizon_all)
+            (sky_spec[None, :, :] * beam_spec_h_all)
             .transpose(0, 2, 1)
             .reshape(ntime * self.nfreq, self.npix_sky)
         )
@@ -1119,7 +1228,7 @@ class ForwardModel:
                 iflag=1, eps=self.eps, opts=self._nufft_opts,
             )[q_idx, r_idx]
 
-        vis_flat = jax.vmap(_one)((W_flat, self._2d_x_flat, self._2d_y_flat))
+        vis_flat = jax.vmap(_one)((W_flat, _2d_x_flat, _2d_y_flat))
         return vis_flat.reshape(ntime, self.nfreq, self.nbls)
 
     def simulate_2d(self, sky_coeffs, rot_matrices, t_chunk_size=12):
@@ -1131,7 +1240,8 @@ class ForwardModel:
 
         Processes time steps in chunks to keep precomputed geometry arrays small.
         For a single chunk, falls back to direct simulation; for multiple chunks,
-        accumulates results from each chunk.
+        accumulates results from each chunk using local geometry per chunk.
+        Global geometry cache is not affected by chunking.
 
         The channel spacing of *freqs* should satisfy
         :func:`~newnucal.hexrect.critical_channel_spacing` to avoid aliasing.
@@ -1153,30 +1263,14 @@ class ForwardModel:
             # Single chunk: use direct implementation
             return self._simulate_2d_impl(sky_coeffs, rot_matrices)
 
-        # Multi-chunk: accumulate results with local geometry per chunk
+        # Multi-chunk: use local geometry per chunk, no self mutation
         chunks = []
         for t_start in range(0, ntime, t_chunk_size):
             t_end = min(t_start + t_chunk_size, ntime)
             rot_chunk = rot_matrices[t_start:t_end]
-            # Invalidate geometry: recompute locally for this chunk only
-            self._geom_ready = False
-            for attr in ('_topo_all', '_horizon_all', '_beam_spec_horizon_all',
-                         '_src_x_all', '_src_y_all', '_src_z_all', '_xi_all',
-                         '_interp_px_all', '_interp_wgt_all', '_2d_x_flat', '_2d_y_flat'):
-                setattr(self, attr, None)
-            vis_chunk = self._simulate_2d_impl(sky_coeffs, rot_chunk)
+            local_geom = self._build_time_geometry(rot_chunk)
+            vis_chunk = self._simulate_2d_impl(sky_coeffs, rot_chunk, geom=local_geom)
             chunks.append(vis_chunk)
-
-        # Restore canonical full-time geometry cache to avoid silent bugs in
-        # subsequent variable_beam simulation. Without this, the cache would
-        # correspond only to the last chunk, causing variable_beam to use wrong
-        # time count/cache.
-        self._geom_ready = False
-        for attr in ('_topo_all', '_horizon_all', '_beam_spec_horizon_all',
-                     '_src_x_all', '_src_y_all', '_src_z_all', '_xi_all',
-                     '_interp_px_all', '_interp_wgt_all', '_2d_x_flat', '_2d_y_flat'):
-            setattr(self, attr, None)
-        self.precompute_time_geometry(rot_matrices)
 
         return jnp.concatenate(chunks, axis=0)
 
