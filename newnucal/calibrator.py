@@ -1865,13 +1865,15 @@ class Calibrator:
                 selected_step = 1.0
                 for candidate_step in initial_step:
                     beam_trial = (beam + candidate_step * delta_bc_base).astype(DTYPE_R_JAX)
-                    loss_trial = float(self._jit_loss_variable_beam(
+                    trial_resid, trial_loss_jax = self._jit_residual_and_loss_variable_beam(
                         {'sky_coeffs': sky, 'beam_coeffs': beam_trial, **gains},
                         weights,
-                    ))
+                    )
+                    loss_trial = float(trial_loss_jax)
                     if loss_trial < best_loss:
                         best_beam = beam_trial
                         best_loss = loss_trial
+                        best_resid = trial_resid
                         selected_step = candidate_step
                 # Save the best step as a scalar for future use
                 if best_loss < current_loss:
@@ -2142,14 +2144,16 @@ class Calibrator:
                 for candidate_step in initial_step:
                     joint_sky_step = (sky_coeffs + candidate_step * delta_sky_base).astype(DTYPE_R_JAX)
                     joint_beam_step = (beam_coeffs + candidate_step * delta_beam_base).astype(DTYPE_R_JAX)
-                    joint_loss_step = float(self._jit_loss_variable_beam(
+                    trial_resid, trial_loss_jax = self._jit_residual_and_loss_variable_beam(
                         {'sky_coeffs': joint_sky_step, 'beam_coeffs': joint_beam_step, **gain_params},
                         weights
-                    ))
+                    )
+                    joint_loss_step = float(trial_loss_jax)
                     if joint_loss_step < joint_loss_trial:
                         joint_sky_trial = joint_sky_step
                         joint_beam_trial = joint_beam_step
                         joint_loss_trial = joint_loss_step
+                        joint_resid_trial = trial_resid
                         selected_step = candidate_step
                 # Save the best step as a scalar for future use
                 if joint_loss_trial < loss:
@@ -2160,10 +2164,6 @@ class Calibrator:
                 joint_sky_plain = joint_sky_trial
                 joint_beam_plain = joint_beam_trial
                 joint_loss_plain = joint_loss_trial
-                joint_resid_trial, _ = self._jit_residual_and_loss_variable_beam(
-                    {'sky_coeffs': joint_sky_trial, 'beam_coeffs': joint_beam_trial, **gain_params},
-                    weights
-                )
             else:
                 # Normal retry loop: try current step_gain, then halve if unsuccessful
                 gain_to_try = state.joint_acc.step_gain
