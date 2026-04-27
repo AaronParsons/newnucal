@@ -2234,17 +2234,22 @@ class Calibrator:
                             aa_candidate_flat[sky_size:].reshape(beam_shape),
                             dtype=DTYPE_R_JAX
                         )
-                        joint_loss_cand = float(self._jit_loss_variable_beam(
+                        joint_resid_cand, joint_loss_cand_jax = self._jit_residual_and_loss_variable_beam(
                             {'sky_coeffs': joint_sky_cand, 'beam_coeffs': joint_beam_cand, **gain_params},
                             weights
-                        ))
+                        )
+                        joint_loss_cand = float(joint_loss_cand_jax)
                         if joint_loss_cand < joint_loss_plain:
                             joint_sky_next = joint_sky_cand
                             joint_beam_next = joint_beam_cand
                             joint_loss_next = joint_loss_cand
                             used_aa = True
                             state.settings['_joint_use_aa'] = True
-                            self._residual_cache = None  # cache is stale; AA candidate != plain
+                            self._residual_cache = (
+                                joint_sky_cand, joint_beam_cand,
+                                gain_params['log_amp'], gain_params['phase'], gain_params['phi'],
+                                joint_resid_cand,
+                            )
                         else:
                             state.settings['_joint_use_aa'] = False
                 else:
