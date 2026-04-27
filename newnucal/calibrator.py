@@ -332,7 +332,7 @@ class Calibrator:
         self._jit_simulate = jax.jit(self._sim_fn)
         self._jit_simulate_variable_beam = jax.jit(self._var_beam_sim_fn)
         self._jit_gain_solve_and_loss = jax.jit(self._gain_solve_and_loss_from_vis)
-        self._residual_cache = None  # (sky, beam, log_amp, phase, phi, resid) when valid
+        self._variable_beam_eval_cache = None  # (sky, beam, log_amp, phase, phi, weighted_resid_for_adjoint, loss)
         self.set_channel_weights(channel_weights)
         self.set_inv_noise_var(inv_noise_var)
         if noise_sigma is not None:
@@ -1102,7 +1102,7 @@ class Calibrator:
         self._jit_simulate = jax.jit(self._sim_fn)
         self._jit_simulate_variable_beam = jax.jit(self._var_beam_sim_fn)
         self._jit_gain_solve_and_loss = jax.jit(self._gain_solve_and_loss_from_vis)
-        self._residual_cache = None
+        self._variable_beam_eval_cache = None
 
     def compute_adjoint_updates(self, sky_coeffs, residual_vis, update_mode='both', **kwargs):
         """Unified interface for sky/beam adjoint updates.
@@ -1730,7 +1730,7 @@ class Calibrator:
         self.fwd.update_beam_cache(state.params['beam_coeffs'])
         if recompile:
             self._recompile_jit()
-        self._residual_cache = None  # Invalidate residual cache when beam cache changes
+        self._variable_beam_eval_cache = None  # Invalidate cache when beam parameters change
         state.beam_dirty_pending = False
 
     def init_joint_sky_beam_dirty_state(
@@ -1876,7 +1876,7 @@ class Calibrator:
 
         def _beam_plain_step(sky, beam, gains, current_loss, step_gain=1.0):
             # Try to reuse residual from the last accepted trial (same params)
-            cache = self._residual_cache
+            cache = self._variable_beam_eval_cache
             if (cache is not None
                     and cache[0] is sky and cache[1] is beam
                     and cache[2] is gains['log_amp']
@@ -1887,7 +1887,7 @@ class Calibrator:
                 resid = self.calibrated_residual_variable_beam(
                     {'sky_coeffs': sky, 'beam_coeffs': beam, **gains}
                 )
-            self._residual_cache = None  # consume cache
+            self._variable_beam_eval_cache = None  # consume cache
             # Get base update with step_size=1.0 to enable efficient scaling
             updates = self.compute_adjoint_updates(
                 sky, resid, update_mode='beam',
@@ -1941,8 +1941,8 @@ class Calibrator:
                         break
                     gain_to_try *= 0.5
 
-            # Cache the accepted trial residual for next step
-            self._residual_cache = (sky, best_beam, gains['log_amp'], gains['phase'], gains['phi'], best_resid)
+            # Cache the accepted trial residual and loss for next step
+            self._variable_beam_eval_cache = (sky, best_beam, gains['log_amp'], gains['phase'], gains['phi'], best_resid, best_loss)
             return best_beam, best_loss, eff_gain
 
         overdue = {}
@@ -2130,7 +2130,7 @@ class Calibrator:
 
         if do_gains:
             # Solve gains with sky and beam held fixed (use variable beam to match joint optimization)
-            self._residual_cache = None  # invalidate cache when gains change
+            self._variable_beam_eval_cache = None  # invalidate cache when gains change
             sky_coeffs_for_gains = state.params['sky_coeffs']
             beam_coeffs_for_gains = state.params['beam_coeffs']
             gain_params, loss = self.fit_gains_linear_variable_beam(sky_coeffs_for_gains, beam_coeffs_for_gains)
@@ -2150,8 +2150,7 @@ class Calibrator:
         else:
             # Joint sky+beam step with Anderson acceleration
             # Try to reuse residual from the last accepted trial (same params)
-            # Check unified cache first, fall back to old residual cache for compatibility
-            cache = getattr(self, '_variable_beam_eval_cache', None) or self._residual_cache
+            cache = self._variable_beam_eval_cache
             if (cache is not None
                     and cache[0] is sky_coeffs and cache[1] is beam_coeffs
                     and cache[2] is gain_params['log_amp']
@@ -2164,7 +2163,6 @@ class Calibrator:
                     weights,
                 )
             self._variable_beam_eval_cache = None  # consume cache
-            self._residual_cache = None
             updates = self.compute_adjoint_updates(
                 sky_coeffs, resid, update_mode='both',
                 sky_step_size=1.0, beam_step_size=1.0,

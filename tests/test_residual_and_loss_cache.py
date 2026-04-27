@@ -228,15 +228,15 @@ class TestCacheInvalidation:
     """Test that caches are invalidated appropriately."""
 
     def test_residual_cache_invalidated_on_recompile_jit(self, calibrator_gains_setup):
-        """Verify _residual_cache is cleared when _recompile_jit is called."""
+        """Verify _variable_beam_eval_cache is cleared when _recompile_jit is called."""
         cal, _ = calibrator_gains_setup
 
         # Set a dummy cache
-        cal._residual_cache = ("dummy",)
+        cal._variable_beam_eval_cache = ("dummy",)
 
         # Call _recompile_jit
         cal._recompile_jit()
 
         # Cache should be cleared
-        assert cal._residual_cache is None, \
-            "_residual_cache should be cleared after _recompile_jit"
+        assert cal._variable_beam_eval_cache is None, \
+            "_variable_beam_eval_cache should be cleared after _recompile_jit"
