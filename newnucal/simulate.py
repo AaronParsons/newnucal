@@ -758,87 +758,127 @@ class ForwardModel:
             residual_vis, self.apparent_sky_update_one_time, step_size, beam_reg
         )
 
-    def _form_beam_update_one_time(self, sky_spec, sky_weight, dirty_pf, tind, step_size, sky_reg):
-        """Form per-pixel beam update delta from pre-computed dirty apparent sky.
-
-        Parameters
-        ----------
-        sky_spec : np.ndarray, shape (npix_sky, nfreq), complex
-            Sky spectrum (sky_coeffs @ A_sky.T)
-        sky_weight : np.ndarray, shape (npix_sky, nfreq), real
-            Sky power (|sky_spec|^2)
-        dirty_pf : np.ndarray, shape (npix_sky, nfreq), complex
-            Frequency-domain dirty apparent sky
-        tind : int
-            Time index
-        step_size : float
-        sky_reg : float
-            Regularisation for division by sky weight
-
-        Returns
-        -------
-        delta_bi : np.ndarray, shape (npix_sky, nmodes_beam), real
-            Per-pixel beam basis coefficient update
-        """
-        ab_np = np.asarray(self.A_beam, dtype=DTYPE_R_NPY)
-        horizon = np.asarray(self._horizon_all[tind])
-        delta_bsf = step_size * np.conj(sky_spec) * dirty_pf / (sky_weight + sky_reg)
-        delta_bi = (np.real(delta_bsf) * horizon[:, None]) @ ab_np
-        return delta_bi
-
     def _accumulate_beam_update_impl(self, sky_coeffs, residual_vis, dirty_fn, step_size, sky_reg):
-        ab_np = np.asarray(self.A_beam, dtype=DTYPE_R_NPY)
+        """Accumulate beam update over time using JAX scan (not NumPy loop).
 
-        sky_spec = np.asarray((jnp.array(sky_coeffs) @ self.A_sky.T).astype(DTYPE_C_JAX))
-        sky_weight = (sky_spec.real ** 2 + sky_spec.imag ** 2).astype(DTYPE_R_NPY)
-        sky_pow = sky_weight.sum(axis=1)
+        Keeps accumulators on device and avoids host/device transfers.
+        """
+        if not self._geom_ready:
+            raise RuntimeError('Call precompute_time_geometry() first.')
 
-        npix_beam_accum = self.npix_beam
-        has_beam_mask = hasattr(self, '_beam_mask') and self._beam_mask is not None
-        if has_beam_mask:
-            npix_beam_accum = int(self._beam_mask.sum())
-            npix_beam_full = len(self._beam_mask)
-
-        num = np.zeros((npix_beam_accum, self.nmodes_beam), dtype=DTYPE_R_NPY)
-        den = np.zeros(npix_beam_accum, dtype=DTYPE_R_NPY)
+        # Precompute static quantities (keep in JAX to avoid host churn)
+        sky_spec_jax = jnp.array(sky_coeffs) @ self.A_sky.T  # (npix_sky, nfreq)
+        sky_weight = jnp.abs(sky_spec_jax) ** 2              # (npix_sky, nfreq)
+        sky_pow = sky_weight.sum(axis=1)                     # (npix_sky,)
 
         ntime = int(residual_vis.shape[0])
-        for tind in range(ntime):
-            dirty_pf = np.asarray(dirty_fn(residual_vis[tind], tind))
-            delta_bi = self._form_beam_update_one_time(sky_spec, sky_weight, dirty_pf, tind, step_size, sky_reg)
 
-            px  = self._interp_px_all[tind]
-            wgt = self._interp_wgt_all[tind]
+        # Determine beam mask status once (before scan)
+        has_beam_mask = hasattr(self, '_beam_mask') and self._beam_mask is not None
+        npix_beam_accum = int(self._beam_mask.sum()) if has_beam_mask else self.npix_beam
 
-            px_flat = px.reshape(-1)
-            w_flat = (wgt * sky_pow[None, :]).reshape(-1)
-            contrib = (
-                w_flat[:, None]
-                * np.repeat(delta_bi[None, :, :], 4, axis=0).reshape(-1, self.nmodes_beam)
-            )
+        # Initialize accumulators
+        beam_num_init = jnp.zeros((npix_beam_accum, self.nmodes_beam), dtype=DTYPE_R_JAX)
+        beam_den_init = jnp.zeros(npix_beam_accum, dtype=DTYPE_R_JAX)
 
-            if has_beam_mask:
-                # Only accumulate to masked beam pixels
-                mask_flat = self._beam_mask[px_flat]
-                px_masked = np.searchsorted(self._beam_indices, px_flat[mask_flat])
-                np.add.at(num, px_masked, contrib[mask_flat])
-                np.add.at(den, px_masked, w_flat[mask_flat])
-            else:
-                np.add.at(num, px_flat, contrib)
-                np.add.at(den, px_flat, w_flat)
-
-        delta_bc_masked = num / (den[:, None] + self.eps)
-        delta_bc_masked /= ntime
-
-        # Expand back to full beam if mask was applied
+        # Precompute constants for beam scatter (outside scan for efficiency)
         if has_beam_mask:
-            delta_bc_full = np.zeros((npix_beam_full, self.nmodes_beam), dtype=DTYPE_R_NPY)
-            delta_bc_full[self._beam_indices] = np.asarray(delta_bc_masked)
+            beam_mask_jax = jnp.array(self._beam_mask)
+            beam_indices_jax = jnp.array(self._beam_indices)
+
+        # Process one time step (no Python conditionals inside scan)
+        if has_beam_mask:
+            def one_time_step_masked(carry, tind):
+                beam_carry = carry
+                # Get dirty apparent sky
+                dirty_pf = dirty_fn(residual_vis[tind], tind)
+                horizon = self._horizon_all[tind]
+                delta_bsf = step_size * jnp.conj(sky_spec_jax) * dirty_pf / (sky_weight + sky_reg)
+                delta_bi = (jnp.real(delta_bsf) * horizon[:, None]) @ jnp.array(self.A_beam, dtype=DTYPE_R_JAX)
+
+                px = self._interp_px_all[tind]  # (4, npix_sky)
+                wgt = self._interp_wgt_all[tind]  # (4, npix_sky)
+
+                # Scatter beam contributions for each of 4 neighbors (avoid large temporary)
+                beam_num_update = jnp.zeros((npix_beam_accum, self.nmodes_beam), dtype=DTYPE_R_JAX)
+                beam_den_update = jnp.zeros(npix_beam_accum, dtype=DTYPE_R_JAX)
+
+                def scatter_neighbor_masked(k, carry):
+                    b_num, b_den = carry
+                    px_k = px[k]  # (npix_sky,)
+                    w_k = wgt[k] * sky_pow  # (npix_sky,)
+                    mask_k = beam_mask_jax[px_k]
+                    # Compute indices for all pixels; searchsorted handles out-of-range gracefully
+                    px_k_masked = jnp.searchsorted(beam_indices_jax, px_k)
+                    # Zero out contributions where mask is False to avoid spurious accumulation
+                    safe_w = jnp.where(mask_k, w_k, 0.0)
+                    safe_delta = jnp.where(mask_k[:, None], delta_bi, 0.0)
+                    b_num = b_num.at[px_k_masked].add(safe_w[:, None] * safe_delta)
+                    b_den = b_den.at[px_k_masked].add(safe_w)
+                    return (b_num, b_den)
+
+                beam_num_update, beam_den_update = jax.lax.fori_loop(
+                    0, 4, scatter_neighbor_masked, (beam_num_update, beam_den_update)
+                )
+
+                new_beam_carry = (
+                    beam_carry[0] + beam_num_update,
+                    beam_carry[1] + beam_den_update,
+                )
+
+                return new_beam_carry, None
+
+            body_fn = one_time_step_masked
+        else:
+            def one_time_step_full(carry, tind):
+                beam_carry = carry
+                # Get dirty apparent sky
+                dirty_pf = dirty_fn(residual_vis[tind], tind)
+                horizon = self._horizon_all[tind]
+                delta_bsf = step_size * jnp.conj(sky_spec_jax) * dirty_pf / (sky_weight + sky_reg)
+                delta_bi = (jnp.real(delta_bsf) * horizon[:, None]) @ jnp.array(self.A_beam, dtype=DTYPE_R_JAX)
+
+                px = self._interp_px_all[tind]
+                wgt = self._interp_wgt_all[tind]
+                px_flat = px.reshape(-1)
+                w_flat = (wgt * sky_pow[None, :]).reshape(-1)
+                contrib = (w_flat[:, None] * jnp.repeat(delta_bi[None, :, :], 4, axis=0).reshape(-1, self.nmodes_beam))
+
+                beam_num_update = jnp.zeros((self.npix_beam, self.nmodes_beam), dtype=DTYPE_R_JAX)
+                beam_den_update = jnp.zeros(self.npix_beam, dtype=DTYPE_R_JAX)
+                beam_num_update = beam_num_update.at[px_flat].add(contrib)
+                beam_den_update = beam_den_update.at[px_flat].add(w_flat)
+
+                new_beam_carry = (
+                    beam_carry[0] + beam_num_update,
+                    beam_carry[1] + beam_den_update,
+                )
+
+                return new_beam_carry, None
+
+            body_fn = one_time_step_full
+
+        # Accumulate over time using jax.lax.scan
+        (beam_num, beam_den), _ = jax.lax.scan(
+            body_fn,
+            (beam_num_init, beam_den_init),
+            jnp.arange(ntime),
+        )
+
+        # Finalize beam update
+        delta_bc_masked = beam_num / (beam_den[:, None] + self.eps)
+        delta_bc_masked = delta_bc_masked / ntime
+
+        if has_beam_mask:
+            npix_beam_full = len(self._beam_mask)
+            delta_bc_full = jnp.zeros((npix_beam_full, self.nmodes_beam), dtype=DTYPE_R_JAX)
+            beam_indices_jax = jnp.array(self._beam_indices)
+            delta_bc_full = delta_bc_full.at[beam_indices_jax].set(delta_bc_masked)
             delta_bc = delta_bc_full
         else:
             delta_bc = delta_bc_masked
 
-        return jnp.array(delta_bc, dtype=DTYPE_R_JAX)
+        return delta_bc
 
     def accumulate_beam_update_3d(
         self,
@@ -950,9 +990,13 @@ class ForwardModel:
                     px_k = px[k]  # (npix_sky,)
                     w_k = wgt[k] * sky_pow  # (npix_sky,)
                     mask_k = beam_mask_jax[px_k]
-                    px_k_masked = jnp.searchsorted(beam_indices_jax, px_k[mask_k])
-                    b_num = b_num.at[px_k_masked].add(w_k[mask_k, None] * delta_bi[mask_k])
-                    b_den = b_den.at[px_k_masked].add(w_k[mask_k])
+                    # Compute indices for all pixels; searchsorted handles out-of-range gracefully
+                    px_k_masked = jnp.searchsorted(beam_indices_jax, px_k)
+                    # Zero out contributions where mask is False to avoid spurious accumulation
+                    safe_w = jnp.where(mask_k, w_k, 0.0)
+                    safe_delta = jnp.where(mask_k[:, None], delta_bi, 0.0)
+                    b_num = b_num.at[px_k_masked].add(safe_w[:, None] * safe_delta)
+                    b_den = b_den.at[px_k_masked].add(safe_w)
                     return (b_num, b_den)
 
                 beam_num_update, beam_den_update = jax.lax.fori_loop(
