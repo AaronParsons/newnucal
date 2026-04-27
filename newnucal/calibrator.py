@@ -2263,6 +2263,10 @@ class Calibrator:
                         )
                         joint_sky_next = joint_sky_cand
                         joint_beam_next = joint_beam_cand
+                        joint_loss_next = float(self._jit_loss_variable_beam(
+                            {'sky_coeffs': joint_sky_next, 'beam_coeffs': joint_beam_next, **gain_params},
+                            weights,
+                        ))
                         used_aa = True
                         self._residual_cache = None  # cache is stale; AA candidate != plain
 
