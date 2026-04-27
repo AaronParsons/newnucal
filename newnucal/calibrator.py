@@ -434,7 +434,12 @@ class Calibrator:
         return (self.channel_weights * self.inv_noise_var).astype(DTYPE_R_JAX)
 
     def _weighted_chi2(self, resid):
-        """Weighted chi2 using the current channel_weights * inv_noise_var."""
+        """Weighted chi2 using the current channel_weights * inv_noise_var.
+
+        IMPORTANT: resid must be UNweighted. If resid is already weighted (e.g., from
+        _residual_variable_beam or _residual_and_loss_variable_beam), this will apply
+        weights twice, resulting in incorrect chi2. Use unweighted residuals here.
+        """
         w = self._effective_weights()
         return jnp.sum(w[:, :, None] * (jnp.abs(resid) ** 2))
 
@@ -462,13 +467,13 @@ class Calibrator:
     def _residual_and_loss_variable_beam(self, params, weights):
         """Compute residual and loss from a single forward simulate.
 
-        Returns (resid_for_adjoint, loss_scalar) with vis_model shared between them.
+        Returns (weighted_resid_for_adjoint, loss_scalar) with vis_model shared between them.
         This avoids the cost of computing vis_model twice: once for the residual (used
         in the adjoint step) and once for the loss (used in acceptance testing).
 
-        Residual is computed in gain-calibrated model space: (data_cal - vis_model) * weights,
-        matching _residual_variable_beam exactly. Loss is computed in data space:
-        sum(weights * |data - apply_gains(vis_model)|^2).
+        The returned residual is already weighted by weights and is intended for the adjoint
+        computation. It should NOT be passed to _weighted_chi2() as that would apply weights
+        twice. The loss is computed in data space: sum(weights * |data - apply_gains(vis_model)|^2).
         """
         sky_coeffs = self._ensure_sky_is_active(params['sky_coeffs'])
         vis_model = self._var_beam_sim_fn(
@@ -478,14 +483,14 @@ class Calibrator:
         vis_cal = apply_gains(vis_model, params['log_amp'], params['phase'], params['phi'], self.bls)
         loss = jnp.sum(weights[:, :, None] * (jnp.abs(self.data - vis_cal) ** 2))
 
-        # Residual for adjoint: gain-calibrated model space
+        # Weighted residual for adjoint: gain-calibrated model space with weights applied
         inv_log_amp = -params['log_amp']
         inv_phase = -params['phase']
         inv_phi = -params['phi']
         data_cal = apply_gains(self.data, inv_log_amp, inv_phase, inv_phi, self.bls)
-        resid = (data_cal - vis_model) * weights[:, :, None].astype(DTYPE_C_JAX)
+        weighted_resid_for_adjoint = (data_cal - vis_model) * weights[:, :, None].astype(DTYPE_C_JAX)
 
-        return resid, loss
+        return weighted_resid_for_adjoint, loss
 
     def calc_loss(self, params, explicit_beam: bool = False):
         # Fast path: return the loss already computed by fit_gains_linear when
@@ -673,11 +678,12 @@ class Calibrator:
         return resid * (self.channel_weights * self.inv_noise_var)[:, :, None].astype(DTYPE_C_JAX)
 
     def _residual_variable_beam(self, params, weights):
-        """Residual function (variable beam) with weights passed explicitly.
+        """Weighted residual function (variable beam) for adjoint computation.
 
-        Computes calibrated residuals as (data_cal - vis_model) * weights.
-        Inverts gains, applies them to data, and simulates visibilities inside
-        the jitted function to minimize Python-level overhead.
+        Returns weighted residual: (data_cal - vis_model) * weights. This is intended
+        for adjoint updates and should NOT be passed to _weighted_chi2() as that would
+        apply weights twice. Inverts gains, applies them to data, and simulates
+        visibilities inside the jitted function to minimize Python-level overhead.
         """
         sky_coeffs = self._ensure_sky_is_active(params['sky_coeffs'])
         inv_log_amp = -params['log_amp']
