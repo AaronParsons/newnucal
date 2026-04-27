@@ -1596,9 +1596,12 @@ class ForwardModel:
                     px_k = px[k]  # (npix_sky,)
                     w_k = wgt[k] * sky_pow  # (npix_sky,)
                     mask_k = beam_mask_jax[px_k]
-                    px_k_masked = jnp.searchsorted(beam_indices_jax, px_k[mask_k])
-                    b_num = b_num.at[px_k_masked].add(w_k[mask_k, None] * delta_bi[mask_k])
-                    b_den = b_den.at[px_k_masked].add(w_k[mask_k])
+                    px_k_safe = jnp.where(mask_k, px_k, 0)
+                    px_k_masked = jnp.searchsorted(beam_indices_jax, px_k_safe)
+                    contrib = jnp.where(mask_k[:, None], w_k[:, None] * delta_bi, 0.0)
+                    den_contrib = jnp.where(mask_k, w_k, 0.0)
+                    b_num = b_num.at[px_k_masked].add(contrib)
+                    b_den = b_den.at[px_k_masked].add(den_contrib)
                     return (b_num, b_den)
 
                 beam_num_update, beam_den_update = jax.lax.fori_loop(
