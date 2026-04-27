@@ -1042,9 +1042,22 @@ class Calibrator:
         loss : float
             Loss computed directly from vis_model without recomputation.
         """
-        den = weights_tf * jnp.abs(vis_model) ** 2
-        g_opt = (weights_tf * data_for_fit * jnp.conj(vis_model)) / (den + 1e-30)
-        log_g = jnp.log(g_opt + 0j)
+        amp2 = jnp.abs(vis_model) ** 2
+        safe = amp2 > 1e-30
+
+        # Compute gain ratio independent of weights to avoid 0*log(0) = NaN
+        g_opt = jnp.where(
+            safe,
+            data_for_fit * jnp.conj(vis_model) / jnp.maximum(amp2, 1e-30),
+            1.0 + 0.0j,
+        )
+
+        # Avoid log(0) from exactly zero data/model ratio
+        g_opt = jnp.where(jnp.abs(g_opt) > 1e-30, g_opt, 1.0 + 0.0j)
+        log_g = jnp.log(g_opt)
+
+        # Apply weights only to reductions, not to the gain ratio itself
+        den = weights_tf * amp2
 
         w_sum = den.sum(axis=2) + 1e-30
         log_amp = (den * jnp.real(log_g)).sum(axis=2) / w_sum
