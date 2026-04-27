@@ -165,7 +165,7 @@ class TestLossCache:
     """Test Level 2 cache: accepted-step loss for chi2 checks."""
 
     def test_loss_cache_fast_path_after_step(self, calibrator_gains_setup, sky_coeffs_true):
-        """Verify calc_loss hits _fit_gains_linear_variable_beam_cache on subsequent calls."""
+        """Verify calc_loss hits _variable_beam_eval_cache on subsequent calls."""
         cal, true_gains = calibrator_gains_setup
 
         beam_coeffs = jnp.array(cal.fwd.beam_coeffs)
@@ -173,10 +173,15 @@ class TestLossCache:
 
         # Set the cache as if we just completed a step
         loss_value = 123.45  # arbitrary
-        cal._fit_gains_linear_variable_beam_cache = (
+        # The _variable_beam_eval_cache format is (sky, beam, log_amp, phase, phi, resid, loss)
+        resid_placeholder = None  # residual is optional
+        cal._variable_beam_eval_cache = (
             cal._ensure_sky_is_active(sky_coeffs_true),
             beam_coeffs,
-            true_gains,
+            true_gains.get('log_amp'),
+            true_gains.get('phase'),
+            true_gains.get('phi'),
+            resid_placeholder,
             loss_value
         )
 

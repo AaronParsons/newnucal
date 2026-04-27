@@ -429,12 +429,27 @@ class ForwardModel:
         TimeGeometry
             Local geometry object with all time-dependent arrays.
         """
+        # Use JAX arrays throughout for JIT compatibility with traced inputs
         rot_ms = jnp.array(rot_matrices, dtype=DTYPE_R_JAX)
         ntime = int(rot_ms.shape[0])
         npix = self.npix_sky
         ndelay = self.ndelay_eff
         two_pi = 2.0 * np.pi
 
+        # Convert constants to JAX for consistency
+        bc_jax = jnp.array(self.beam_coeffs, dtype=DTYPE_R_JAX)
+        if hasattr(self, '_beam_mask') and self._beam_mask is not None:
+            npix_beam_full = len(self._beam_mask)
+            bc_full = jnp.zeros((npix_beam_full, bc_jax.shape[1]), dtype=DTYPE_R_JAX)
+            bc_full = bc_full.at[self._beam_indices].set(bc_jax)
+            bc_jax = bc_full
+
+        ab_jax = jnp.array(self.A_beam, dtype=DTYPE_R_JAX)
+        eta_jax = jnp.array(self._eta, dtype=DTYPE_R_JAX)
+        lat_mat_jax = jnp.array(self._lat_mat_2d, dtype=DTYPE_R_JAX)
+        eq_coords_jax = jnp.array(self.eq_coords, dtype=DTYPE_R_JAX)
+
+        # Compute all geometry per time using JAX (works in JIT with traced inputs)
         topo_all = []
         horizon_all = []
         beam_spec_horizon_all = []
@@ -445,41 +460,26 @@ class ForwardModel:
         interp_px_all = []
         interp_wgt_all = []
 
-        # Extract beam arrays once outside the loop for efficiency
-        bc_np = np.asarray(self.beam_coeffs)   # (npix_beam, nmodes_beam)
-
-        # If a beam mask is active, expand to full size for interpolation
-        if hasattr(self, '_beam_mask') and self._beam_mask is not None:
-            npix_beam_full = len(self._beam_mask)
-            bc_full = np.zeros((npix_beam_full, bc_np.shape[1]), dtype=bc_np.dtype)
-            bc_full[self._beam_indices] = bc_np
-            bc_np = bc_full
-
-        ab_np = np.asarray(self.A_beam)         # (nfreq, nmodes_beam)
-        eta_np = np.asarray(self._eta, dtype=DTYPE_R_NPY)
-        lat_mat_np = np.asarray(self._lat_mat_2d, dtype=DTYPE_R_NPY)  # (2,2) metres
         for i in range(ntime):
-            topo = np.array(rot_ms[i] @ self.eq_coords, dtype=DTYPE_R_NPY)
-            horizon = (topo[2] > 0).astype(DTYPE_R_NPY)
-            topo_th, topo_ph = healjax.vec2ang(
-                jnp.array(topo[0]), jnp.array(topo[1]), jnp.array(topo[2])
-            )
+            topo = (rot_ms[i] @ eq_coords_jax).astype(DTYPE_R_JAX)
+            horizon = (topo[2] > 0).astype(DTYPE_R_JAX)
+            topo_th, topo_ph = healjax.vec2ang(topo[0], topo[1], topo[2])
             px, wgts = get_interp_weights(topo_th, topo_ph, self.beam_model.nside)
-            px = np.array(px, dtype=np.int32)
-            wgts = np.array(wgts, dtype=DTYPE_R_NPY)
+            px_jax = jnp.array(px, dtype=jnp.int32)
+            wgts_jax = jnp.array(wgts, dtype=DTYPE_R_JAX)
 
-            interp_px_all.append(px)
-            interp_wgt_all.append(wgts)
+            interp_px_all.append(px_jax)
+            interp_wgt_all.append(wgts_jax)
 
-            bi_np = np.sum(wgts[:, :, None] * bc_np[px], axis=0)   # (npix_sky, nmodes_beam)
-            bs_np = (bi_np @ ab_np.T) * horizon[:, None]             # (npix_sky, nfreq)
-            beam_spec_horizon_all.append(bs_np)
+            bi_jax = jnp.sum(wgts_jax[:, :, None] * bc_jax[px_jax], axis=0)
+            bs_jax = (bi_jax @ ab_jax.T) * horizon[:, None]
+            beam_spec_horizon_all.append(bs_jax)
 
-            src_x = np.repeat(topo[0], ndelay).astype(DTYPE_R_NPY) * two_pi
-            src_y = np.repeat(topo[1], ndelay).astype(DTYPE_R_NPY) * two_pi
-            src_z = np.tile(eta_np, npix).astype(DTYPE_R_NPY) * two_pi
+            src_x = jnp.repeat(topo[0], ndelay) * two_pi
+            src_y = jnp.repeat(topo[1], ndelay) * two_pi
+            src_z = jnp.tile(eta_jax, npix) * two_pi
 
-            xi = (lat_mat_np.T @ topo[:2, :]).astype(DTYPE_R_NPY)   # (2, npix_sky)
+            xi = lat_mat_jax.T @ topo[:2, :]
 
             topo_all.append(topo)
             horizon_all.append(horizon)
@@ -488,13 +488,13 @@ class ForwardModel:
             src_z_all.append(src_z)
             xi_all.append(xi)
 
-        topo_all_jax = jnp.array(np.stack(topo_all), dtype=DTYPE_R_JAX)
-        horizon_all_jax = jnp.array(np.stack(horizon_all), dtype=DTYPE_R_JAX)
-        beam_spec_horizon_all_jax = jnp.array(np.stack(beam_spec_horizon_all), dtype=DTYPE_R_JAX)
-        src_x_all_jax = jnp.array(np.stack(src_x_all), dtype=DTYPE_R_JAX)
-        src_y_all_jax = jnp.array(np.stack(src_y_all), dtype=DTYPE_R_JAX)
-        src_z_all_jax = jnp.array(np.stack(src_z_all), dtype=DTYPE_R_JAX)
-        xi_all_jax = jnp.array(np.stack(xi_all), dtype=DTYPE_R_JAX)
+        topo_all_jax = jnp.stack(topo_all)
+        horizon_all_jax = jnp.stack(horizon_all)
+        beam_spec_horizon_all_jax = jnp.stack(beam_spec_horizon_all)
+        src_x_all_jax = jnp.stack(src_x_all)
+        src_y_all_jax = jnp.stack(src_y_all)
+        src_z_all_jax = jnp.stack(src_z_all)
+        xi_all_jax = jnp.stack(xi_all)
 
         # 2D path: precompute flattened NUFFT source coords
         _two_pi_over_c = 2.0 * np.pi / C
@@ -510,8 +510,8 @@ class ForwardModel:
             .astype(DTYPE_R_JAX)
         )
 
-        interp_px_all_jax = jnp.array(np.stack(interp_px_all), dtype=jnp.int32)
-        interp_wgt_all_jax = jnp.array(np.stack(interp_wgt_all), dtype=DTYPE_R_JAX)
+        interp_px_all_jax = jnp.stack(interp_px_all)
+        interp_wgt_all_jax = jnp.stack(interp_wgt_all)
 
         return TimeGeometry(
             geom_ready=True,
@@ -621,12 +621,19 @@ class ForwardModel:
         sky_coeffs : jnp.ndarray, shape (npix_sky, nmodes_sky)
         rot_matrices : jnp.ndarray, shape (ntime, 3, 3)
         geom : TimeGeometry, optional
-            Local geometry object. If None, uses/updates self state.
+            Local geometry object. If None, uses cached state if available,
+            otherwise builds local geometry (works in JIT with traced inputs).
         """
         if geom is None:
-            if (not self._geom_ready) or (self._topo_all.shape[0] != rot_matrices.shape[0]):
-                self.precompute_time_geometry(rot_matrices)
+            # Try to use cached geometry if available and matches
+            if self._geom_ready and self._topo_all.shape[0] == rot_matrices.shape[0]:
+                # Use cached geometry (geom stays None to use self state)
+                pass
+            else:
+                # Build local geometry (works in JIT because _build_time_geometry uses JAX)
+                geom = self._build_time_geometry(rot_matrices)
         else:
+            # Validate provided geometry
             if not geom.geom_ready or geom.topo_all.shape[0] != rot_matrices.shape[0]:
                 geom = self._build_time_geometry(rot_matrices)
         sky_spec = sky_coeffs @ self.A_sky.T
@@ -931,18 +938,26 @@ class ForwardModel:
                 delta_bsf = beam_step_size * jnp.conj(sky_spec_jax) * dirty_pf / (sky_weight + sky_reg)
                 delta_bi = (jnp.real(delta_bsf) * horizon[:, None]) @ jnp.array(self.A_beam, dtype=DTYPE_R_JAX)
 
-                px = self._interp_px_all[tind]
-                wgt = self._interp_wgt_all[tind]
-                px_flat = px.reshape(-1)
-                w_flat = (wgt * sky_pow[None, :]).reshape(-1)
-                contrib = (w_flat[:, None] * jnp.repeat(delta_bi[None, :, :], 4, axis=0).reshape(-1, self.nmodes_beam))
+                px = self._interp_px_all[tind]  # (4, npix_sky)
+                wgt = self._interp_wgt_all[tind]  # (4, npix_sky)
 
-                mask_flat = beam_mask_jax[px_flat]
-                px_masked = jnp.searchsorted(beam_indices_jax, px_flat[mask_flat])
+                # Scatter beam contributions for each of 4 neighbors (avoid large temporary)
                 beam_num_update = jnp.zeros((npix_beam_accum, self.nmodes_beam), dtype=DTYPE_R_JAX)
                 beam_den_update = jnp.zeros(npix_beam_accum, dtype=DTYPE_R_JAX)
-                beam_num_update = beam_num_update.at[px_masked].add(contrib[mask_flat])
-                beam_den_update = beam_den_update.at[px_masked].add(w_flat[mask_flat])
+
+                def scatter_neighbor_masked(k, carry):
+                    b_num, b_den = carry
+                    px_k = px[k]  # (npix_sky,)
+                    w_k = wgt[k] * sky_pow  # (npix_sky,)
+                    mask_k = beam_mask_jax[px_k]
+                    px_k_masked = jnp.searchsorted(beam_indices_jax, px_k[mask_k])
+                    b_num = b_num.at[px_k_masked].add(w_k[mask_k, None] * delta_bi[mask_k])
+                    b_den = b_den.at[px_k_masked].add(w_k[mask_k])
+                    return (b_num, b_den)
+
+                beam_num_update, beam_den_update = jax.lax.fori_loop(
+                    0, 4, scatter_neighbor_masked, (beam_num_update, beam_den_update)
+                )
 
                 new_beam_carry = (
                     beam_carry[0] + beam_num_update,
@@ -973,16 +988,24 @@ class ForwardModel:
                 delta_bsf = beam_step_size * jnp.conj(sky_spec_jax) * dirty_pf / (sky_weight + sky_reg)
                 delta_bi = (jnp.real(delta_bsf) * horizon[:, None]) @ jnp.array(self.A_beam, dtype=DTYPE_R_JAX)
 
-                px = self._interp_px_all[tind]
-                wgt = self._interp_wgt_all[tind]
-                px_flat = px.reshape(-1)
-                w_flat = (wgt * sky_pow[None, :]).reshape(-1)
-                contrib = (w_flat[:, None] * jnp.repeat(delta_bi[None, :, :], 4, axis=0).reshape(-1, self.nmodes_beam))
+                px = self._interp_px_all[tind]  # (4, npix_sky)
+                wgt = self._interp_wgt_all[tind]  # (4, npix_sky)
 
+                # Scatter beam contributions for each of 4 neighbors (avoid large temporary)
                 beam_num_update = jnp.zeros((self.npix_beam, self.nmodes_beam), dtype=DTYPE_R_JAX)
                 beam_den_update = jnp.zeros(self.npix_beam, dtype=DTYPE_R_JAX)
-                beam_num_update = beam_num_update.at[px_flat].add(contrib)
-                beam_den_update = beam_den_update.at[px_flat].add(w_flat)
+
+                def scatter_neighbor_full(k, carry):
+                    b_num, b_den = carry
+                    px_k = px[k]  # (npix_sky,)
+                    w_k = wgt[k] * sky_pow  # (npix_sky,)
+                    b_num = b_num.at[px_k].add(w_k[:, None] * delta_bi)
+                    b_den = b_den.at[px_k].add(w_k)
+                    return (b_num, b_den)
+
+                beam_num_update, beam_den_update = jax.lax.fori_loop(
+                    0, 4, scatter_neighbor_full, (beam_num_update, beam_den_update)
+                )
 
                 new_beam_carry = (
                     beam_carry[0] + beam_num_update,
@@ -1248,16 +1271,29 @@ class ForwardModel:
         sky_coeffs : jnp.ndarray, shape (npix_sky, nmodes_sky)
         rot_matrices : jnp.ndarray, shape (ntime, 3, 3)
         geom : TimeGeometry, optional
-            Local geometry object. If None, uses/updates self state.
+            Local geometry object. If None, uses cached state if available,
+            otherwise builds local geometry (works in JIT with traced inputs).
         """
         if geom is None:
-            if (not self._geom_ready) or (self._2d_x_flat is None) or (self._topo_all.shape[0] != rot_matrices.shape[0]):
-                self.precompute_time_geometry(rot_matrices)
-            ntime = self._topo_all.shape[0]
-            beam_spec_h_all = self._beam_spec_horizon_all
-            _2d_x_flat = self._2d_x_flat
-            _2d_y_flat = self._2d_y_flat
+            # Try to use cached geometry if it matches
+            if (self._geom_ready and
+                self._2d_x_flat is not None and
+                self._topo_all.shape[0] == rot_matrices.shape[0]):
+                # Cached geometry is valid; use it
+                ntime = self._topo_all.shape[0]
+                beam_spec_h_all = self._beam_spec_horizon_all
+                _2d_x_flat = self._2d_x_flat
+                _2d_y_flat = self._2d_y_flat
+            else:
+                # Geometry not cached or shape mismatch; build locally
+                # (_build_time_geometry uses JAX, works in JIT with traced inputs)
+                geom = self._build_time_geometry(rot_matrices)
+                ntime = geom.topo_all.shape[0]
+                beam_spec_h_all = geom.beam_spec_horizon_all
+                _2d_x_flat = geom._2d_x_flat
+                _2d_y_flat = geom._2d_y_flat
         else:
+            # Validate provided geometry
             if not geom.geom_ready or geom._2d_x_flat is None or geom.topo_all.shape[0] != rot_matrices.shape[0]:
                 geom = self._build_time_geometry(rot_matrices)
             ntime = geom.topo_all.shape[0]
@@ -1273,7 +1309,7 @@ class ForwardModel:
             .reshape(ntime * self.nfreq, self.npix_sky)
         )
 
-        vis_flat = jax.vmap(self._kernel_nufft2d_flat)((W_flat, _2d_x_flat, _2d_y_flat))
+        vis_flat = jax.vmap(self._kernel_nufft2d_flat)(W_flat, _2d_x_flat, _2d_y_flat)
         return vis_flat.reshape(ntime, self.nfreq, self.nbls)
 
     def simulate_2d(self, sky_coeffs, rot_matrices, t_chunk_size=12):
@@ -1504,18 +1540,26 @@ class ForwardModel:
                 delta_bsf = beam_step_size * jnp.conj(sky_spec_jax) * dirty_pf / (sky_weight + sky_reg)
                 delta_bi = (jnp.real(delta_bsf) * horizon[:, None]) @ jnp.array(self.A_beam, dtype=DTYPE_R_JAX)
 
-                px = self._interp_px_all[tind]
-                wgt = self._interp_wgt_all[tind]
-                px_flat = px.reshape(-1)
-                w_flat = (wgt * sky_pow[None, :]).reshape(-1)
-                contrib = (w_flat[:, None] * jnp.repeat(delta_bi[None, :, :], 4, axis=0).reshape(-1, self.nmodes_beam))
+                px = self._interp_px_all[tind]  # (4, npix_sky)
+                wgt = self._interp_wgt_all[tind]  # (4, npix_sky)
 
-                mask_flat = beam_mask_jax[px_flat]
-                px_masked = jnp.searchsorted(beam_indices_jax, px_flat[mask_flat])
+                # Scatter beam contributions for each of 4 neighbors (avoid large temporary)
                 beam_num_update = jnp.zeros((npix_beam_accum, self.nmodes_beam), dtype=DTYPE_R_JAX)
                 beam_den_update = jnp.zeros(npix_beam_accum, dtype=DTYPE_R_JAX)
-                beam_num_update = beam_num_update.at[px_masked].add(contrib[mask_flat])
-                beam_den_update = beam_den_update.at[px_masked].add(w_flat[mask_flat])
+
+                def scatter_neighbor_masked_2d(k, carry):
+                    b_num, b_den = carry
+                    px_k = px[k]  # (npix_sky,)
+                    w_k = wgt[k] * sky_pow  # (npix_sky,)
+                    mask_k = beam_mask_jax[px_k]
+                    px_k_masked = jnp.searchsorted(beam_indices_jax, px_k[mask_k])
+                    b_num = b_num.at[px_k_masked].add(w_k[mask_k, None] * delta_bi[mask_k])
+                    b_den = b_den.at[px_k_masked].add(w_k[mask_k])
+                    return (b_num, b_den)
+
+                beam_num_update, beam_den_update = jax.lax.fori_loop(
+                    0, 4, scatter_neighbor_masked_2d, (beam_num_update, beam_den_update)
+                )
 
                 new_beam_carry = (
                     beam_carry[0] + beam_num_update,
