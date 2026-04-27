@@ -1683,10 +1683,10 @@ class Calibrator:
         Parameters
         ----------
         recompile : bool, optional
-            If True (default), recompile JIT functions after cache update.
-            Set to False during iterative fitting to defer expensive recompilation.
+            If True (default), recompile calibrator JIT functions after cache update.
+            Set to False during iterative fitting to defer recompilation.
         """
-        self.fwd.update_beam_cache(state.params['beam_coeffs'], recompile=recompile)
+        self.fwd.update_beam_cache(state.params['beam_coeffs'])
         if recompile:
             self._recompile_jit()
         self._residual_cache = None  # Invalidate residual cache when beam cache changes

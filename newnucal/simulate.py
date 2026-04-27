@@ -145,9 +145,6 @@ class ForwardModel:
         self._2d_q_idx = jnp.array(bl_grid_np[:, 0] + n_q // 2, dtype=jnp.int32)
         self._2d_r_idx = jnp.array(bl_grid_np[:, 1] + n_r // 2, dtype=jnp.int32)
 
-        self._jit_one = jax.jit(self._simulate_one_precomputed)
-        self._jit_one_2d = jax.jit(self._simulate_one_2d_precomputed_sky_spec)
-
         self._geom_ready = False
         self._topo_all = None
         self._horizon_all = None
@@ -551,12 +548,25 @@ class ForwardModel:
         self._2d_x_flat = geom._2d_x_flat
         self._2d_y_flat = geom._2d_y_flat
         self._geom_ready = True
-        # Invalidate any cached JIT compilation: the precomputed arrays are
-        # captured by value in the trace, so a fresh jit is needed after each
-        # geometry recompute to avoid stale compiled code.
-        self._jit_one = jax.jit(self._simulate_one_precomputed)
-        self._jit_one_2d = jax.jit(self._simulate_one_2d_precomputed_sky_spec)
         return self
+
+    def _kernel_simulate_one_3d(self, W_eta, src_x, src_y, src_z):
+        """3D NUFFT kernel with geometry as explicit arguments (no JIT recompilation).
+
+        Parameters
+        ----------
+        W_eta : jnp.ndarray, shape (npix_sky, ndelay_eff)
+        src_x, src_y, src_z : jnp.ndarray, shape (npix_sky * ndelay_eff,)
+        """
+        vis_flat = nufft3(
+            W_eta.ravel().astype(DTYPE_C_JAX),
+            src_x, src_y, src_z,
+            self._tgt_x, self._tgt_y, self._tgt_z,
+            iflag=1,
+            eps=self.eps,
+            opts=self._nufft_opts,
+        )
+        return vis_flat.reshape(self.nfreq, self.nbls)
 
     def _forward_components_from_cache_sky_spec(self, sky_spec, tind, geom=None):
         """Extract forward model components using cached geometry.
@@ -597,15 +607,7 @@ class ForwardModel:
             src_x, src_y, src_z = self._src_x_all[tind], self._src_y_all[tind], self._src_z_all[tind]
         else:
             src_x, src_y, src_z = geom.src_x_all[tind], geom.src_y_all[tind], geom.src_z_all[tind]
-        vis_flat = nufft3(
-            W_eta.ravel().astype(DTYPE_C_JAX),
-            src_x, src_y, src_z,
-            self._tgt_x, self._tgt_y, self._tgt_z,
-            iflag=1,
-            eps=self.eps,
-            opts=self._nufft_opts,
-        )
-        return vis_flat.reshape(self.nfreq, self.nbls)
+        return self._kernel_simulate_one_3d(W_eta, src_x, src_y, src_z)
 
     def _simulate_one_precomputed(self, sky_coeffs, tind, geom=None):
         sky_spec = sky_coeffs @ self.A_sky.T
@@ -1007,24 +1009,15 @@ class ForwardModel:
             beam_spec_horizon_all.append(bs)
         return jnp.array(np.stack(beam_spec_horizon_all), dtype=DTYPE_R_JAX)
 
-    def update_beam_cache(self, beam_coeffs, recompile=True):
+    def update_beam_cache(self, beam_coeffs):
         """Recompute :attr:`_beam_spec_horizon_all` from new *beam_coeffs*.
 
         Cheaper than a full :meth:`precompute_time_geometry` call because the
         NUFFT source coordinates and interpolation stencil are already stored.
-        By default recompiles :attr:`_jit_one` and :attr:`_jit_one_2d` so
-        subsequent :meth:`simulate` calls use the updated beam; set ``recompile=False``
-        to skip recompilation when the fixed-beam path is not needed (e.g., during
-        variable-beam fitting iterations).
 
         Parameters
         ----------
         beam_coeffs : array_like, shape (npix_beam, nmodes_beam)
-        recompile : bool, optional
-            If True (default), recompile JIT functions to use updated beam cache.
-            Set to False during iterative variable-beam fitting to avoid expensive
-            recompilation; recompile should be True only when fixed-beam simulation
-            is needed or at the end of optimization.
         """
         if not self._geom_ready:
             raise RuntimeError('Call precompute_time_geometry() first.')
@@ -1050,10 +1043,6 @@ class ForwardModel:
         else:
             self.beam_coeffs = jnp.array(bc_np, dtype=DTYPE_R_JAX)
         self.beam_model.coeffs = bc_np
-        # Recompile JIT functions only if requested (skip during variable-beam loops)
-        if recompile:
-            self._jit_one = jax.jit(self._simulate_one_precomputed)
-            self._jit_one_2d = jax.jit(self._simulate_one_2d_precomputed_sky_spec)
 
     def _simulate_one_variable_beam_sky_spec(self, sky_spec, beam_coeffs, tind):
         """Forward model for one time step with *beam_coeffs* as a traced input."""
@@ -1134,6 +1123,16 @@ class ForwardModel:
 
         return jnp.concatenate(vis_batches, axis=0)  # (nfreq, nbls)
 
+    def _kernel_nufft2d_W_to_vis(self, W, xi):
+        """2D NUFFT kernel with geometry as explicit argument (no JIT recompilation).
+
+        Parameters
+        ----------
+        W : jnp.ndarray, shape (npix_sky, nfreq), complex
+        xi : jnp.ndarray, shape (2, npix_sky)
+        """
+        return self._nufft2d_W_to_vis(W, xi, self.freqs)
+
     def _simulate_one_2d_precomputed_sky_spec(self, sky_spec, tind, geom=None):
         """2D hex-rect NUFFT forward for one time step (cached beam).
 
@@ -1155,7 +1154,7 @@ class ForwardModel:
             beam_spec_h = geom.beam_spec_horizon_all[tind]
             xi = geom.xi_all[tind]
         W = (sky_spec * beam_spec_h).astype(DTYPE_C_JAX)
-        return self._nufft2d_W_to_vis(W, xi, self.freqs)
+        return self._kernel_nufft2d_W_to_vis(W, xi)
 
     def _simulate_one_2d_precomputed(self, sky_coeffs, tind, geom=None):
         sky_spec = sky_coeffs @ self.A_sky.T
@@ -1186,6 +1185,24 @@ class ForwardModel:
         beam_spec_h = (bi @ self.A_beam.T) * horizon[:, None]
         W = (sky_spec * beam_spec_h).astype(DTYPE_C_JAX)
         return self._nufft2d_W_to_vis(W, xi, self.freqs)
+
+    def _kernel_nufft2d_flat(self, W_fi, x_j, y_j):
+        """2D NUFFT kernel for flat arrays (no JIT recompilation).
+
+        Parameters
+        ----------
+        W_fi : jnp.ndarray, shape (npix_sky,), complex
+            Flat weight array for one (time, freq)
+        x_j, y_j : jnp.ndarray, shape (npix_sky,)
+            Flat NUFFT source coordinates
+        """
+        n_q, n_r = self._2d_n_q, self._2d_n_r
+        q_idx, r_idx = self._2d_q_idx, self._2d_r_idx
+        grid = nufft1(
+            (n_q, n_r), W_fi, x_j, y_j,
+            iflag=1, eps=self.eps, opts=self._nufft_opts,
+        )
+        return grid[q_idx, r_idx]
 
     def _simulate_2d_impl(self, sky_coeffs, rot_matrices, geom=None):
         """Core 2D simulate implementation.
@@ -1219,16 +1236,8 @@ class ForwardModel:
             .transpose(0, 2, 1)
             .reshape(ntime * self.nfreq, self.npix_sky)
         )
-        n_q, n_r = self._2d_n_q, self._2d_n_r
-        q_idx, r_idx = self._2d_q_idx, self._2d_r_idx
 
-        def _one(args):
-            return nufft1(
-                (n_q, n_r), args[0], args[1], args[2],
-                iflag=1, eps=self.eps, opts=self._nufft_opts,
-            )[q_idx, r_idx]
-
-        vis_flat = jax.vmap(_one)((W_flat, _2d_x_flat, _2d_y_flat))
+        vis_flat = jax.vmap(self._kernel_nufft2d_flat)((W_flat, _2d_x_flat, _2d_y_flat))
         return vis_flat.reshape(ntime, self.nfreq, self.nbls)
 
     def simulate_2d(self, sky_coeffs, rot_matrices, t_chunk_size=12):
