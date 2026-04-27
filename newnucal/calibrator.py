@@ -331,6 +331,7 @@ class Calibrator:
         self._jit_residual_and_loss_variable_beam = jax.jit(self._residual_and_loss_variable_beam)
         self._jit_simulate = jax.jit(self._sim_fn)
         self._jit_simulate_variable_beam = jax.jit(self._var_beam_sim_fn)
+        self._jit_gain_solve_and_loss = jax.jit(self._gain_solve_and_loss_from_vis)
         self._residual_cache = None  # (sky, beam, log_amp, phase, phi, resid) when valid
         self.set_channel_weights(channel_weights)
         self.set_inv_noise_var(inv_noise_var)
@@ -1006,9 +1007,37 @@ class Calibrator:
         sky_active = self._ensure_sky_is_active(sky_coeffs)
         vis_model = self._jit_simulate_variable_beam(sky_active, beam_coeffs, self.rot_matrices)
 
+        # Solve for gains and compute loss directly from vis_model (avoids redundant simulation)
         w_tf = self._effective_weights()[:, :, None]
-        den = w_tf * jnp.abs(vis_model) ** 2
-        g_opt = (w_tf * data_for_fit * jnp.conj(vis_model)) / (den + 1e-30)
+        gain_params, loss = self._jit_gain_solve_and_loss(vis_model, data_for_fit, w_tf)
+        loss = float(loss)
+        self._fit_gains_linear_variable_beam_cache = (sky_active, beam_coeffs, gain_params, loss)
+        return gain_params, loss
+
+
+    def _gain_solve_and_loss_from_vis(self, vis_model, data_for_fit, weights_tf):
+        """Solve for gains from pre-computed vis_model and compute loss directly.
+
+        Avoids the redundant second simulation in the gain-fitting loop.
+
+        Parameters
+        ----------
+        vis_model : jnp.ndarray, shape (ntime, nfreq, nbls), complex
+            Pre-computed model visibilities.
+        data_for_fit : jnp.ndarray, shape (ntime, nfreq, nbls), complex
+            Data to fit against (possibly with static sky subtracted).
+        weights_tf : jnp.ndarray, shape (ntime, nfreq, 1)
+            Effective weights for each visibility.
+
+        Returns
+        -------
+        gain_params : dict
+            Gain parameters (log_amp, phase, phi).
+        loss : float
+            Loss computed directly from vis_model without recomputation.
+        """
+        den = weights_tf * jnp.abs(vis_model) ** 2
+        g_opt = (weights_tf * data_for_fit * jnp.conj(vis_model)) / (den + 1e-30)
         log_g = jnp.log(g_opt + 0j)
 
         w_sum = den.sum(axis=2) + 1e-30
@@ -1031,25 +1060,17 @@ class Calibrator:
             'phase':   theta[:, :, 0].astype(DTYPE_R_JAX),
             'phi':     theta[:, :, 1:].transpose(0, 2, 1).astype(DTYPE_R_JAX),
         }
-        # Compute loss with variable beam
-        if subtract_static_sky:
-            orig_data = self.data
-            self.data = data_for_fit
-            try:
-                loss = float(self._jit_loss_variable_beam(
-                    {'sky_coeffs': sky_active, 'beam_coeffs': beam_coeffs, **gain_params},
-                    self._effective_weights()
-                ))
-            finally:
-                self.data = orig_data
-        else:
-            loss = float(self._jit_loss_variable_beam(
-                {'sky_coeffs': sky_active, 'beam_coeffs': beam_coeffs, **gain_params},
-                self._effective_weights()
-            ))
-        self._fit_gains_linear_variable_beam_cache = (sky_active, beam_coeffs, gain_params, loss)
-        return gain_params, loss
 
+        # Compute loss directly from vis_model without recomputation
+        vis_cal = apply_gains(
+            vis_model,
+            gain_params['log_amp'],
+            gain_params['phase'],
+            gain_params['phi'],
+            self.bls,
+        )
+        loss = jnp.sum(weights_tf * jnp.abs(data_for_fit - vis_cal) ** 2)
+        return gain_params, loss
 
     def _recompile_jit(self):
         """Recompile cached-beam JIT functions after precomputed arrays change."""
@@ -1061,6 +1082,7 @@ class Calibrator:
         self._jit_residual_and_loss_variable_beam = jax.jit(self._residual_and_loss_variable_beam)
         self._jit_simulate = jax.jit(self._sim_fn)
         self._jit_simulate_variable_beam = jax.jit(self._var_beam_sim_fn)
+        self._jit_gain_solve_and_loss = jax.jit(self._gain_solve_and_loss_from_vis)
         self._residual_cache = None
 
     def compute_adjoint_updates(self, sky_coeffs, residual_vis, update_mode='both', **kwargs):
