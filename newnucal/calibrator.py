@@ -1363,14 +1363,14 @@ class Calibrator:
 
                 # Apply Anderson acceleration to joint (sky, beam) pair if enabled
                 if aa is not None:
-                    # Flatten both sky and beam to 1D arrays for AA
+                    # Flatten both sky and beam to 1D arrays for AA (DTYPE_R_NPY to avoid precision bloat)
                     current_flat = np.concatenate([
-                        np.asarray(current_sky, dtype=np.float64).ravel(),
-                        np.asarray(current_bc, dtype=np.float64).ravel(),
+                        np.asarray(current_sky, dtype=DTYPE_R_NPY).ravel(),
+                        np.asarray(current_bc, dtype=DTYPE_R_NPY).ravel(),
                     ])
                     trial_flat = np.concatenate([
-                        np.asarray(trial_sky, dtype=np.float64).ravel(),
-                        np.asarray(trial_bc, dtype=np.float64).ravel(),
+                        np.asarray(trial_sky, dtype=DTYPE_R_NPY).ravel(),
+                        np.asarray(trial_bc, dtype=DTYPE_R_NPY).ravel(),
                     ])
 
                     # Try AA proposal
@@ -2005,8 +2005,8 @@ class Calibrator:
             loss_next = loss_plain
             used_aa = False
             cand_flat = state.sky_acc.push(
-                np.asarray(sky_coeffs, dtype=np.float64).ravel(),
-                np.asarray(sky_plain, dtype=np.float64).ravel(),
+                np.asarray(sky_coeffs, dtype=DTYPE_R_NPY).ravel(),
+                np.asarray(sky_plain, dtype=DTYPE_R_NPY).ravel(),
             )
             aa_proposed = False
             if cand_flat is not None:
@@ -2045,8 +2045,8 @@ class Calibrator:
             loss_next = loss_plain
             used_aa = False
             cand_flat = state.beam_acc.push(
-                np.asarray(beam_coeffs, dtype=np.float64).ravel(),
-                np.asarray(beam_plain, dtype=np.float64).ravel(),
+                np.asarray(beam_coeffs, dtype=DTYPE_R_NPY).ravel(),
+                np.asarray(beam_plain, dtype=DTYPE_R_NPY).ravel(),
             )
             if cand_flat is not None:
                 beam_cand = jnp.array(cand_flat.reshape(beam_coeffs.shape), dtype=DTYPE_R_JAX)
@@ -2249,12 +2249,12 @@ class Calibrator:
             # Apply Anderson acceleration to joint (sky, beam) pair
             if state.joint_acc is not None:
                 current_flat = np.concatenate([
-                    np.asarray(sky_coeffs, dtype=np.float64).ravel(),
-                    np.asarray(beam_coeffs, dtype=np.float64).ravel(),
+                    np.asarray(sky_coeffs, dtype=DTYPE_R_NPY).ravel(),
+                    np.asarray(beam_coeffs, dtype=DTYPE_R_NPY).ravel(),
                 ])
                 plain_flat = np.concatenate([
-                    np.asarray(joint_sky_plain, dtype=np.float64).ravel(),
-                    np.asarray(joint_beam_plain, dtype=np.float64).ravel(),
+                    np.asarray(joint_sky_plain, dtype=DTYPE_R_NPY).ravel(),
+                    np.asarray(joint_beam_plain, dtype=DTYPE_R_NPY).ravel(),
                 ])
 
                 aa_candidate_flat = state.joint_acc.push(current_flat, plain_flat)
