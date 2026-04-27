@@ -1400,18 +1400,41 @@ class ForwardModel:
         return jnp.concatenate(chunks, axis=0)
 
     def simulate_variable_beam_2d(self, sky_coeffs, beam_coeffs, rot_matrices):
-        """Simulate all times with explicit *beam_coeffs* via the 2D path."""
+        """Simulate all times with explicit *beam_coeffs* via the 2D path.
+
+        Uses vmap over (time, freq) to avoid Python loop over time steps.
+        """
         if (
             (not self._geom_ready)
             or self._topo_all.shape[0] != rot_matrices.shape[0]
         ):
             self.precompute_time_geometry(rot_matrices)
-        ntime = rot_matrices.shape[0]
-        sky_spec = sky_coeffs @ self.A_sky.T
-        return jnp.stack([
-            self._simulate_one_2d_variable_beam_sky_spec(sky_spec, beam_coeffs, t)
-            for t in range(ntime)
-        ])
+        ntime = self._topo_all.shape[0]
+
+        # Precompute beam_spec_h_all from beam_coeffs for all times
+        interp_px_all = jnp.array(self._interp_px_all)  # (ntime, 4, npix_sky)
+        interp_wgt_all = jnp.array(self._interp_wgt_all)  # (ntime, 4, npix_sky)
+        horizon_all = self._horizon_all  # (ntime, npix_sky)
+        beam_coeffs_jax = jnp.array(beam_coeffs, dtype=DTYPE_R_JAX)
+        A_beam_jax = jnp.array(self.A_beam, dtype=DTYPE_R_JAX)
+
+        # Interpolate beam at all times: (ntime, 4, npix_sky, nmodes_beam)
+        beam_interp = beam_coeffs_jax[interp_px_all]
+        # Sum over 4 neighbors: (ntime, npix_sky, nmodes_beam)
+        bi_all = jnp.sum(interp_wgt_all[:, :, :, None] * beam_interp, axis=1)
+        # Apply horizon and go to frequency domain: (ntime, npix_sky, nfreq)
+        beam_spec_h_all = (bi_all @ A_beam_jax.T) * horizon_all[:, :, None]
+
+        # Compute sky × beam for all times using fixed-beam vmap pattern
+        sky_spec = (sky_coeffs @ self.A_sky.T).astype(DTYPE_C_JAX)  # (npix_sky, nfreq)
+        W_flat = (
+            (sky_spec[None, :, :] * beam_spec_h_all)
+            .transpose(0, 2, 1)
+            .reshape(ntime * self.nfreq, self.npix_sky)
+        )
+
+        vis_flat = jax.vmap(self._kernel_nufft2d_flat)(W_flat, self._2d_x_flat, self._2d_y_flat)
+        return vis_flat.reshape(ntime, self.nfreq, self.nbls)
 
     # ------------------------------------------------------------------
     # 2D hex-rect NUFFT path — adjoint / dirty-map helpers
