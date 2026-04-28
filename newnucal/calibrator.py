@@ -2376,6 +2376,10 @@ class Calibrator:
         state.step += 1
 
         # Handle RFI weight updates
+        # Note: RFI computations use NumPy (np.median, rolling statistics) which don't have
+        # JAX equivalents, so device transfer via jax.device_get() is necessary. Since this
+        # is a one-time computation per update (not part of the differentiable optimization),
+        # the overhead is acceptable.
         rfi_max_every = s['solve_every'].get('rfi', 0)
         rfi_enabled = (rfi_max_every != 0)
         max_rfi = s.get('max_rfi_updates')
@@ -2384,10 +2388,12 @@ class Calibrator:
         if rfi_enabled and not rfi_quota_exhausted and state.n_since_rfi >= rfi_max_every:
             cfg = s['rfi_config']
             current_weights = state.channel_weights if state.channel_weights is not None else np.ones((self.ntime, self.nfreq), dtype=DTYPE_R_NPY)
-            resid = np.asarray(self.calibrated_residual_variable_beam(state.params), dtype=np.complex64)
+            resid_jax = self.calibrated_residual_variable_beam(state.params)
+            resid = np.asarray(jax.device_get(resid_jax))
+            inv_var = np.asarray(jax.device_get(self.inv_noise_var))
             new_weights, diag = update_channel_weights_from_residuals(
                 residual=resid,
-                inv_noise_var=np.asarray(self.inv_noise_var),
+                inv_noise_var=inv_var,
                 prior_weights=current_weights,
                 current_weights=current_weights,
                 config=cfg,
