@@ -8,6 +8,7 @@ from newnucal.rfi import (
     score_to_soft_weights,
     update_channel_weights_from_residuals,
     fit_soft_channel_weights,
+    fit_soft_channel_weights_jax,
 )
 
 
@@ -170,3 +171,44 @@ def test_fit_soft_channel_weights_regularizes_downweighting():
     # Diagnostics should be valid
     assert diag_strong["optimization_success"]
     assert diag_weak["optimization_success"]
+
+
+def test_fit_soft_channel_weights_jax_produces_valid_weights():
+    """Verify JAX version produces valid, reasonable weights."""
+    rng = np.random.default_rng(42)
+    ntime, nfreq, nbls = 4, 8, 3
+    resid = (0.01 * rng.normal(size=(ntime, nfreq, nbls))
+             + 1j * 0.01 * rng.normal(size=(ntime, nfreq, nbls))).astype(np.complex64)
+    # Inject one clearly bad channel across all times/baselines.
+    resid[:, 3, :] += 5.0 + 3.0j
+
+    prior = np.ones((ntime, nfreq), dtype=np.float32) * 0.5
+    prior[:, 6] = 0.1
+
+    # Run JAX version
+    weights_jax, diag_jax = fit_soft_channel_weights_jax(
+        residual=resid,
+        inv_noise_var=np.ones((ntime, nfreq), dtype=np.float32),
+        prior_weights=prior,
+        regularization=1.0,
+        regularization_power=2.0,
+        min_weight=0.01,
+        max_weight=1.0,
+        use_jax=True,
+    )
+
+    # Convert JAX arrays to NumPy for inspection
+    weights_jax_np = np.asarray(weights_jax)
+
+    # Check that weights are valid
+    assert weights_jax_np.shape == (ntime, nfreq)
+    assert np.all(weights_jax_np >= 0.01)
+    assert np.all(weights_jax_np <= 1.0)
+    # Check that prior is respected
+    assert np.all(weights_jax_np <= prior + 1e-6)
+    # Check that bad channel is downweighted
+    assert float(np.mean(weights_jax_np[:, 3])) < 0.4
+    # Check that diagnostics are present
+    assert "final_loss" in diag_jax
+    assert "num_iterations" in diag_jax
+    assert diag_jax["num_iterations"] > 0

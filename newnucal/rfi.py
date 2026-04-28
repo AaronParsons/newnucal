@@ -329,10 +329,10 @@ def fit_soft_channel_weights(
 
         w_flat: weights per frequency, shape (nfreq,)
         Loss = sum_f norm_power[f] * w[f] + reg * sum_f (1 - w[f])^power
+        Bounds are enforced by L-BFGS-B, so no clipping here.
         """
-        w = np.clip(w_flat, min_weight, max_weight)
-        data_term = np.sum(norm_power_f * w)
-        reg_term = regularization * np.sum(np.power(np.maximum(1.0 - w, 0.0), regularization_power))
+        data_term = np.sum(norm_power_f * w_flat)
+        reg_term = regularization * np.sum(np.power(np.maximum(1.0 - w_flat, 0.0), regularization_power))
         loss = data_term + reg_term
         return float(loss)
 
@@ -367,4 +367,125 @@ def fit_soft_channel_weights(
         'optimization_message': result.message if hasattr(result, 'message') else '',
         'final_loss': float(result.fun),
     }
+    return weights_final, diagnostics
+
+
+def fit_soft_channel_weights_jax(
+    *,
+    residual,
+    inv_noise_var=None,
+    prior_weights=None,
+    regularization: float = 1.0,
+    regularization_power: float = 2.0,
+    min_weight: float = 0.01,
+    max_weight: float = 1.0,
+    use_jax: bool = True,
+) -> tuple:
+    """Fit soft channel weights via regularized optimization (JAX-compatible).
+
+    JAX-native implementation using jaxopt.LBFGS for GPU/TPU acceleration.
+    Functionally identical to fit_soft_channel_weights but maintains JAX arrays
+    throughout computation and supports JIT compilation.
+
+    Parameters
+    ----------
+    residual : array_like, shape (ntime, nfreq, nbls)
+        Gain-calibrated model residuals (JAX array or convertible).
+    inv_noise_var : array_like, optional
+        Inverse variance per time/frequency channel (JAX array or convertible).
+    prior_weights : array_like, optional
+        External bootstrap prior from DPSS / high-pass flagging (JAX array).
+    regularization : float, default 1.0
+        Strength of regularization penalizing deviation from weight=1.
+    regularization_power : float, default 2.0
+        Power of the regularization term. 2.0 = quadratic (smooth),
+        values > 2 penalize aggressive downweighting more heavily.
+    min_weight : float, default 0.01
+        Minimum allowed weight.
+    max_weight : float, default 1.0
+        Maximum allowed weight.
+    use_jax : bool, default True
+        If True, use jaxopt.LBFGS (JAX-native). If False, use scipy (NumPy-compatible).
+
+    Returns
+    -------
+    weights : array, shape (ntime, nfreq)
+        Fitted soft channel weights (JAX array if use_jax=True, else NumPy).
+    diagnostics : dict
+        Contains optimization results and intermediate values.
+    """
+    try:
+        import jax
+        import jax.numpy as jnp
+        import jaxopt
+    except ImportError:
+        raise ImportError("JAX and jaxopt required for fit_soft_channel_weights_jax. "
+                         "Install with: pip install jax jaxopt")
+
+    if not use_jax:
+        return fit_soft_channel_weights(
+            residual=residual,
+            inv_noise_var=inv_noise_var,
+            prior_weights=prior_weights,
+            regularization=regularization,
+            regularization_power=regularization_power,
+            min_weight=min_weight,
+            max_weight=max_weight,
+        )
+
+    # Convert inputs to JAX arrays
+    resid = jnp.asarray(residual)
+    if resid.ndim != 3:
+        raise ValueError(f"Expected residual with shape (ntime, nfreq, nbls), got {resid.shape}")
+    ntime, nfreq, nbls = resid.shape
+
+    # Prepare arrays in JAX
+    inv_var_tf = jnp.asarray(_as_tf(inv_noise_var, ntime, nfreq, fill_value=1.0))
+    prior_tf = jnp.asarray(_as_tf(prior_weights, ntime, nfreq, fill_value=1.0))
+
+    # Compute per-channel residual power (median across time)
+    residual_power_tf = jnp.mean(jnp.abs(resid) ** 2, axis=2) * inv_var_tf
+    residual_power_f = jnp.median(residual_power_tf, axis=0)
+
+    # Normalize to avoid scale-dependence of regularization
+    norm_factor = jnp.median(residual_power_f)
+    norm_power_f = residual_power_f / jnp.maximum(norm_factor, 1e-30)
+
+    # Define loss function (JIT-compilable)
+    def loss_fn(w_flat):
+        w = jnp.clip(w_flat, min_weight, max_weight)
+        data_term = jnp.sum(norm_power_f * w)
+        reg_term = regularization * jnp.sum(
+            jnp.power(jnp.maximum(1.0 - w, 0.0), regularization_power)
+        )
+        return data_term + reg_term
+
+    # Initialize with clipped ones respecting prior
+    w_init = jnp.clip(jnp.ones(nfreq, dtype=DTYPE_R), prior_tf[0, :], max_weight)
+
+    # Set up L-BFGS with bounds via projection
+    def loss_with_projection(w_flat):
+        w_clipped = jnp.clip(w_flat, prior_tf[0, :], max_weight)
+        return loss_fn(w_clipped)
+
+    solver = jaxopt.LBFGS(fun=loss_with_projection, maxiter=500, tol=1e-8)
+    result = solver.run(w_init)
+    w_opt = result.params
+
+    # Clip to bounds and combine with prior
+    weights_f = jnp.clip(w_opt, min_weight, max_weight)
+    weights_tf = jnp.broadcast_to(weights_f[None, :], (ntime, nfreq))
+    weights_final = jnp.minimum(weights_tf, prior_tf)
+
+    # Convert diagnostics to NumPy for output (JAX arrays can be expensive to inspect)
+    diagnostics = {
+        'residual_power_tf': np.asarray(residual_power_tf),
+        'residual_power_f': np.asarray(residual_power_f),
+        'weights_f': np.asarray(weights_f),
+        'weights_final_f': np.asarray(weights_final[0, :]),
+        'prior_weights_f': np.asarray(prior_tf[0, :]),
+        'final_loss': float(result.state.value),
+        'num_iterations': int(result.state.iter_num),
+    }
+
     return weights_final, diagnostics
