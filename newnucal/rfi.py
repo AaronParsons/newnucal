@@ -284,7 +284,8 @@ def fit_soft_channel_weights(
         Inverse variance per time/frequency channel.
     prior_weights : array_like, optional
         External bootstrap prior from DPSS / high-pass flagging.
-        Weights cannot go below prior_weights * min_weight.
+        Acts as an upper bound (cap): optimized weights will not exceed prior.
+        Flagged channels with prior << 1 are effectively hard-capped.
     regularization : float, default 1.0
         Strength of regularization penalizing deviation from weight=1.
         Higher values discourage aggressive downweighting.
@@ -336,11 +337,14 @@ def fit_soft_channel_weights(
         loss = data_term + reg_term
         return float(loss)
 
-    # Optimize per-frequency weights with prior bounds
-    # Lower bound: prior weight (hard constraint from external flagging)
-    # Upper bound: max_weight
-    w_init = np.clip(np.ones(nfreq, dtype=DTYPE_R), prior_tf[0, :], max_weight).astype(DTYPE_R)
-    w_bounds = [(prior_tf[0, f], max_weight) for f in range(nfreq)]
+    # Prior acts as an upper bound cap (e.g., flagged channel with prior=0.05 cannot exceed 0.05)
+    upper_f = np.clip(prior_tf[0, :], min_weight, max_weight)
+
+    # Optimize per-frequency weights with proper bounds
+    # Lower bound: min_weight
+    # Upper bound: prior weight (hard constraint from external flagging)
+    w_init = np.clip(np.ones(nfreq, dtype=DTYPE_R), min_weight, upper_f).astype(DTYPE_R)
+    w_bounds = [(min_weight, upper_f[f]) for f in range(nfreq)]
 
     result = minimize(
         loss_and_grad,
@@ -350,12 +354,9 @@ def fit_soft_channel_weights(
         options={'ftol': 1e-8, 'maxiter': 500},
     )
 
-    weights_f = np.clip(result.x, min_weight, max_weight).astype(DTYPE_R)
+    weights_f = np.clip(result.x, min_weight, upper_f).astype(DTYPE_R)
     weights_tf = np.broadcast_to(weights_f[None, :], (ntime, nfreq)).astype(DTYPE_R)
-
-    # Combine with prior: use element-wise minimum to preserve hard prior
-    # (don't allow optimization to override external flags)
-    weights_final = np.minimum(weights_tf, prior_tf).astype(DTYPE_R)
+    weights_final = weights_tf.astype(DTYPE_R)
 
     diagnostics = {
         'residual_power_tf': residual_power_tf,
@@ -368,6 +369,95 @@ def fit_soft_channel_weights(
         'final_loss': float(result.fun),
     }
     return weights_final, diagnostics
+
+
+def fit_soft_channel_weights_closed_form_jax(
+    *,
+    residual,
+    inv_noise_var=None,
+    prior_weights=None,
+    regularization: float = 1.0,
+    min_weight: float = 0.01,
+    max_weight: float = 1.0,
+) -> tuple:
+    """Fit soft channel weights with closed-form solution for quadratic regularization.
+
+    For the common case of regularization_power=2, the optimal weights have a
+    closed-form solution: w_f = 1 - a_f / (2*λ), then clipped to bounds.
+    This is faster, deterministic, fully JAX-compatible, and JIT-friendly.
+
+    Avoids iterative optimization entirely—no convergence issues, no initialization.
+
+    Parameters
+    ----------
+    residual : array_like, shape (ntime, nfreq, nbls)
+        Gain-calibrated model residuals.
+    inv_noise_var : array_like, optional
+        Inverse variance per time/frequency channel.
+    prior_weights : array_like, optional
+        External bootstrap prior; acts as upper bound on weights.
+    regularization : float, default 1.0
+        Strength of quadratic regularization λ.
+    min_weight : float, default 0.01
+        Minimum allowed weight.
+    max_weight : float, default 1.0
+        Maximum allowed weight.
+
+    Returns
+    -------
+    weights : array, shape (ntime, nfreq)
+        Fitted soft channel weights (JAX array).
+    diagnostics : dict
+        Contains residual statistics and final weights.
+    """
+    import jax.numpy as jnp
+
+    resid = jnp.asarray(residual)
+    if resid.ndim != 3:
+        raise ValueError(f"Expected residual with shape (ntime, nfreq, nbls), got {resid.shape}")
+    ntime, nfreq, _ = resid.shape
+
+    # Compute residual power per channel
+    inv_var_tf = jnp.ones((ntime, nfreq)) if inv_noise_var is None else jnp.asarray(inv_noise_var)
+    if inv_var_tf.ndim == 1:
+        inv_var_tf = jnp.broadcast_to(inv_var_tf[None, :], (ntime, nfreq))
+
+    residual_power_tf = jnp.mean(jnp.abs(resid) ** 2, axis=2) * inv_var_tf
+    residual_power_f = jnp.median(residual_power_tf, axis=0)
+
+    # Normalize to scale-invariant form
+    norm_factor = jnp.maximum(jnp.median(residual_power_f), 1e-30)
+    a_f = residual_power_f / norm_factor
+
+    # Prior acts as upper bound
+    if prior_weights is None:
+        upper_f = jnp.ones(nfreq, dtype=DTYPE_R)
+    else:
+        prior_arr = jnp.asarray(prior_weights, dtype=DTYPE_R)
+        if prior_arr.ndim == 2:
+            upper_f = prior_arr[0, :]  # Take first time slice
+        else:
+            upper_f = prior_arr
+    upper_f = jnp.clip(upper_f, min_weight, max_weight)
+
+    # Closed-form solution for quadratic regularization
+    # Unconstrained optimum: w_f = 1 - a_f / (2*λ)
+    lam = jnp.maximum(regularization, 1e-30)
+    weights_f_unconstrained = 1.0 - a_f / (2.0 * lam)
+
+    # Clip to valid range [min_weight, upper_f]
+    weights_f = jnp.clip(weights_f_unconstrained, min_weight, upper_f)
+    weights_tf = jnp.broadcast_to(weights_f[None, :], (ntime, nfreq))
+
+    diagnostics = {
+        'residual_power_tf': jnp.asarray(residual_power_tf),
+        'residual_power_f': jnp.asarray(residual_power_f),
+        'weights_f': jnp.asarray(weights_f),
+        'weights_final_f': jnp.asarray(weights_f),
+        'upper_f': jnp.asarray(upper_f),
+        'method': 'closed_form_quadratic',
+    }
+    return weights_tf, diagnostics
 
 
 def fit_soft_channel_weights_jax(
@@ -451,31 +541,38 @@ def fit_soft_channel_weights_jax(
     norm_factor = jnp.median(residual_power_f)
     norm_power_f = residual_power_f / jnp.maximum(norm_factor, 1e-30)
 
-    # Define loss function (JIT-compilable)
-    def loss_fn(w_flat):
-        w = jnp.clip(w_flat, min_weight, max_weight)
+    # Prior acts as upper bound
+    upper_f = jnp.clip(prior_tf[0, :], min_weight, max_weight)
+
+    # Use logit parameterization to avoid hard clipping in gradient:
+    # w = min_weight + (upper - min_weight) * sigmoid(z)
+    # This keeps gradients smooth everywhere.
+    def loss_fn_logit(z_flat):
+        """Loss in terms of unconstrained logits z."""
+        import jax.scipy as jsp
+        sigmoid_z = jsp.special.expit(z_flat)  # sigmoid
+        w = min_weight + (upper_f - min_weight) * sigmoid_z
         data_term = jnp.sum(norm_power_f * w)
         reg_term = regularization * jnp.sum(
             jnp.power(jnp.maximum(1.0 - w, 0.0), regularization_power)
         )
         return data_term + reg_term
 
-    # Initialize with clipped ones respecting prior
-    w_init = jnp.clip(jnp.ones(nfreq, dtype=DTYPE_R), prior_tf[0, :], max_weight)
+    # Initialize logits at z=0 (w=midpoint between min and upper)
+    z_init = jnp.zeros(nfreq, dtype=DTYPE_R)
 
-    # Set up L-BFGS with bounds via projection
-    def loss_with_projection(w_flat):
-        w_clipped = jnp.clip(w_flat, prior_tf[0, :], max_weight)
-        return loss_fn(w_clipped)
+    # Optimize unconstrained logits
+    solver = jaxopt.LBFGS(fun=loss_fn_logit, maxiter=500, tol=1e-8)
+    result = solver.run(z_init)
+    z_opt = result.params
 
-    solver = jaxopt.LBFGS(fun=loss_with_projection, maxiter=500, tol=1e-8)
-    result = solver.run(w_init)
-    w_opt = result.params
-
-    # Clip to bounds and combine with prior
-    weights_f = jnp.clip(w_opt, min_weight, max_weight)
+    # Convert back to weights
+    import jax.scipy as jsp
+    sigmoid_z = jsp.special.expit(z_opt)
+    weights_f = min_weight + (upper_f - min_weight) * sigmoid_z
+    weights_f = jnp.clip(weights_f, min_weight, upper_f)  # numerical safety
     weights_tf = jnp.broadcast_to(weights_f[None, :], (ntime, nfreq))
-    weights_final = jnp.minimum(weights_tf, prior_tf)
+    weights_final = weights_tf
 
     # Convert diagnostics to NumPy for output (JAX arrays can be expensive to inspect)
     diagnostics = {
