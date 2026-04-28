@@ -17,7 +17,7 @@ from .beam import BeamModel
 from .basis import basis_project
 from .simulate import ForwardModel
 from .gains import apply_gains, init_gain_params
-from .rfi import RFIConfig, prepare_initial_channel_weights, update_channel_weights_from_residuals
+from .rfi import RFIConfig, prepare_initial_channel_weights, update_channel_weights_from_residuals, fit_soft_channel_weights
 from .utils import DTYPE_R_JAX, DTYPE_R_NPY, DTYPE_C_JAX
 
 class _StopFitFlag:
@@ -2391,13 +2391,24 @@ class Calibrator:
             resid_jax = self.calibrated_residual_variable_beam(state.params)
             resid = np.asarray(jax.device_get(resid_jax))
             inv_var = np.asarray(jax.device_get(self.inv_noise_var))
-            new_weights, diag = update_channel_weights_from_residuals(
-                residual=resid,
-                inv_noise_var=inv_var,
-                prior_weights=current_weights,
-                current_weights=current_weights,
-                config=cfg,
-            )
+            if cfg.use_soft_weight_fit:
+                new_weights, diag = fit_soft_channel_weights(
+                    residual=resid,
+                    inv_noise_var=inv_var,
+                    prior_weights=current_weights,
+                    regularization=cfg.regularization,
+                    regularization_power=cfg.regularization_power,
+                    min_weight=cfg.min_weight,
+                    max_weight=cfg.max_weight,
+                )
+            else:
+                new_weights, diag = update_channel_weights_from_residuals(
+                    residual=resid,
+                    inv_noise_var=inv_var,
+                    prior_weights=current_weights,
+                    current_weights=current_weights,
+                    config=cfg,
+                )
             state.channel_weights = new_weights
             self.set_channel_weights(new_weights)
             state.n_rfi += 1

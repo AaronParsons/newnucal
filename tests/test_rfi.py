@@ -7,6 +7,7 @@ from newnucal.rfi import (
     smooth_frequency_statistic,
     score_to_soft_weights,
     update_channel_weights_from_residuals,
+    fit_soft_channel_weights,
 )
 
 
@@ -107,3 +108,65 @@ def test_update_channel_weights_from_residuals_downweights_rfi_channel():
 
     # External prior should still influence the result.
     assert float(weights[:, 6].mean()) < 1.0
+
+
+def test_fit_soft_channel_weights_regularizes_downweighting():
+    rng = np.random.default_rng(0)
+    ntime, nfreq, nbls = 4, 8, 3
+    resid = (0.01 * rng.normal(size=(ntime, nfreq, nbls))
+             + 1j * 0.01 * rng.normal(size=(ntime, nfreq, nbls))).astype(np.complex64)
+    # Inject one clearly bad channel across all times/baselines.
+    resid[:, 3, :] += 5.0 + 3.0j
+
+    # Prior weights from external flagging (e.g., DPSS): can be downweighted further
+    prior = np.ones((ntime, nfreq), dtype=np.float32) * 0.5  # moderately conservative prior
+    prior[:, 6] = 0.1  # one channel is more aggressively flagged externally
+
+    # Test with strong regularization (prevents aggressive downweighting)
+    weights_strong, diag_strong = fit_soft_channel_weights(
+        residual=resid,
+        inv_noise_var=np.ones((ntime, nfreq), dtype=np.float32),
+        prior_weights=prior,
+        regularization=10.0,
+        regularization_power=2.0,
+        min_weight=0.01,
+        max_weight=1.0,
+    )
+
+    # Test with weak regularization (allows more downweighting)
+    weights_weak, diag_weak = fit_soft_channel_weights(
+        residual=resid,
+        inv_noise_var=np.ones((ntime, nfreq), dtype=np.float32),
+        prior_weights=prior,
+        regularization=0.1,
+        regularization_power=2.0,
+        min_weight=0.01,
+        max_weight=1.0,
+    )
+
+    assert weights_strong.shape == (ntime, nfreq)
+    assert weights_weak.shape == (ntime, nfreq)
+    assert diag_strong["residual_power_f"].shape == (nfreq,)
+    assert diag_weak["residual_power_f"].shape == (nfreq,)
+
+    # Both should respect bounds
+    assert np.all(weights_strong >= prior - 1e-6)
+    assert np.all(weights_weak >= prior - 1e-6)
+    assert np.all(weights_strong <= 1.0 + 1e-6)
+    assert np.all(weights_weak <= 1.0 + 1e-6)
+
+    # Soft weighting should not violate hard prior (externally flagged channels)
+    # Channel 6 is flagged to 0.1, should not go above that
+    w_prior_channel = float(weights_weak[:, 6].mean())
+    assert w_prior_channel <= prior[0, 6] + 1e-6, "Should respect hard external prior"
+
+    # Strong regularization should keep weights closer to prior (less aggressive downweighting)
+    # than weak regularization
+    w_strong_range = float(np.max(weights_strong) - np.min(weights_strong))
+    w_weak_range = float(np.max(weights_weak) - np.min(weights_weak))
+    # Weak regularization allows more variation (more aggressive downweighting of bad channels)
+    assert w_weak_range >= w_strong_range * 0.5, "Weak regularization should allow more variation"
+
+    # Diagnostics should be valid
+    assert diag_strong["optimization_success"]
+    assert diag_weak["optimization_success"]

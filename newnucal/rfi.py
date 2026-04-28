@@ -25,10 +25,22 @@ from .utils import DTYPE_R_NPY as DTYPE_R
 
 @dataclass(slots=True)
 class RFIConfig:
-    """Configuration for residual-based channel reweighting.
+    """Configuration for channel reweighting.
 
     Parameters
     ----------
+    use_soft_weight_fit : bool, default False
+        If True, use soft weight optimization with regularization (newer approach
+        that fits weights to minimize residuals while penalizing aggressive
+        downweighting). If False, use residual-based detection with median filtering
+        (legacy approach; kept for backward compatibility).
+    regularization : float, default 1.0
+        Strength of regularization penalizing deviation from weight=1.
+        Only used if use_soft_weight_fit=True. Higher values discourage
+        aggressive downweighting, preventing overfitting to noise.
+    regularization_power : float, default 2.0
+        Power of the regularization term (only used if use_soft_weight_fit=True).
+        2.0 = quadratic (smooth), values > 2 penalize aggressive downweighting more.
     flagged_weight : float
         Weight assigned to channels flagged by the external bootstrap mask.
     min_weight : float
@@ -37,22 +49,31 @@ class RFIConfig:
         Maximum allowed soft weight.
     smooth_window : int
         Odd rolling-median window used to estimate a smooth spectral baseline.
+        (Only used if use_soft_weight_fit=False; legacy approach.)
     score_center : float
         Logistic half-power point for the residual excess score.
+        (Only used if use_soft_weight_fit=False; legacy approach.)
     score_slope : float
         Steepness of the logistic mapping from score to weight.
+        (Only used if use_soft_weight_fit=False; legacy approach.)
     prior_power : float
-        Exponent applied to the external prior weights when combining with the
-        residual-based weights.
+        Exponent applied to the external prior weights.
+        (Only used if use_soft_weight_fit=False; legacy approach.)
     model_power : float
-        Exponent applied to the residual-based weights when combining.
+        Exponent applied to the residual-based weights.
+        (Only used if use_soft_weight_fit=False; legacy approach.)
     blend : float
         Blend between current weights and newly inferred weights; 0 uses only
         the new weights, 1 keeps the current weights unchanged.
+        (Only used if use_soft_weight_fit=False; legacy approach.)
     time_reduce : {"median", "mean"}
         How to collapse per-time statistics to a per-frequency score.
+        (Only used if use_soft_weight_fit=False; legacy approach.)
     """
 
+    use_soft_weight_fit: bool = False
+    regularization: float = 1.0
+    regularization_power: float = 2.0
     flagged_weight: float = 0.05
     min_weight: float = 0.01
     max_weight: float = 1.0
@@ -236,3 +257,114 @@ def update_channel_weights_from_residuals(
         "combined_weights": combined,
     }
     return new_weights, diagnostics
+
+
+def fit_soft_channel_weights(
+    *,
+    residual: np.ndarray,
+    inv_noise_var: np.ndarray | None = None,
+    prior_weights: np.ndarray | None = None,
+    regularization: float = 1.0,
+    regularization_power: float = 2.0,
+    min_weight: float = 0.01,
+    max_weight: float = 1.0,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Fit soft channel weights via regularized optimization.
+
+    Rather than detecting RFI from residuals, this directly optimizes weights
+    to minimize weighted loss while penalizing aggressive downweighting.
+    A soft regularization term discourages deviations from 1, but allows
+    targeted reduction for non-spectrally-redundant features.
+
+    Parameters
+    ----------
+    residual : array_like, shape (ntime, nfreq, nbls)
+        Gain-calibrated model residuals (or |residuals|^2).
+    inv_noise_var : array_like, optional
+        Inverse variance per time/frequency channel.
+    prior_weights : array_like, optional
+        External bootstrap prior from DPSS / high-pass flagging.
+        Weights cannot go below prior_weights * min_weight.
+    regularization : float, default 1.0
+        Strength of regularization penalizing deviation from weight=1.
+        Higher values discourage aggressive downweighting.
+    regularization_power : float, default 2.0
+        Power of the regularization term. 2.0 = quadratic (smooth),
+        values > 2 penalize aggressive downweighting more heavily.
+    min_weight : float, default 0.01
+        Minimum allowed weight.
+    max_weight : float, default 1.0
+        Maximum allowed weight.
+
+    Returns
+    -------
+    weights : np.ndarray, shape (ntime, nfreq)
+        Fitted soft channel weights.
+    diagnostics : dict
+        Contains 'residual_power_tf', 'residual_power_f', 'weights_f',
+        'prior_weights_f', and 'loss_history' if optimization was iterative.
+    """
+    from scipy.optimize import minimize
+
+    resid = np.asarray(residual)
+    if resid.ndim != 3:
+        raise ValueError(f"Expected residual with shape (ntime, nfreq, nbls), got {resid.shape}")
+    ntime, nfreq, nbls = resid.shape
+
+    inv_var_tf = _as_tf(inv_noise_var, ntime, nfreq, fill_value=1.0)
+    prior_tf = _as_tf(prior_weights, ntime, nfreq, fill_value=1.0)
+
+    # Compute per-channel residual power (mean |residual|^2 across baselines)
+    residual_power_tf = np.mean(np.abs(resid) ** 2, axis=2) * inv_var_tf
+    residual_power_f = np.median(residual_power_tf, axis=0)
+
+    # Normalize to avoid scale-dependence of regularization
+    residual_power_f = np.clip(residual_power_f, 1e-30, np.inf)
+    norm_factor = np.median(residual_power_f)
+    norm_power_f = residual_power_f / max(norm_factor, 1e-30)
+
+    # Define per-frequency optimization problem
+    def loss_and_grad(w_flat):
+        """Loss function for soft weight optimization.
+
+        w_flat: weights per frequency, shape (nfreq,)
+        Loss = sum_f norm_power[f] * w[f] + reg * sum_f (1 - w[f])^power
+        """
+        w = np.clip(w_flat, min_weight, max_weight)
+        data_term = np.sum(norm_power_f * w)
+        reg_term = regularization * np.sum(np.power(np.maximum(1.0 - w, 0.0), regularization_power))
+        loss = data_term + reg_term
+        return float(loss)
+
+    # Optimize per-frequency weights with prior bounds
+    # Lower bound: prior weight (hard constraint from external flagging)
+    # Upper bound: max_weight
+    w_init = np.clip(np.ones(nfreq, dtype=DTYPE_R), prior_tf[0, :], max_weight).astype(DTYPE_R)
+    w_bounds = [(prior_tf[0, f], max_weight) for f in range(nfreq)]
+
+    result = minimize(
+        loss_and_grad,
+        w_init,
+        method='L-BFGS-B',
+        bounds=w_bounds,
+        options={'ftol': 1e-8, 'maxiter': 500},
+    )
+
+    weights_f = np.clip(result.x, min_weight, max_weight).astype(DTYPE_R)
+    weights_tf = np.broadcast_to(weights_f[None, :], (ntime, nfreq)).astype(DTYPE_R)
+
+    # Combine with prior: use element-wise minimum to preserve hard prior
+    # (don't allow optimization to override external flags)
+    weights_final = np.minimum(weights_tf, prior_tf).astype(DTYPE_R)
+
+    diagnostics = {
+        'residual_power_tf': residual_power_tf,
+        'residual_power_f': residual_power_f,
+        'weights_f': weights_f,
+        'weights_final_f': weights_final[0, :],
+        'prior_weights_f': prior_tf[0, :],
+        'optimization_success': result.success,
+        'optimization_message': result.message if hasattr(result, 'message') else '',
+        'final_loss': float(result.fun),
+    }
+    return weights_final, diagnostics
