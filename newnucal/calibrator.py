@@ -244,12 +244,16 @@ class JointSkyBeamDirtyFitState:
 
     n_joint: int = 0
     n_gains: int = 0
+    n_rfi: int = 0
 
     n_since_joint: int = 0
     n_since_gains: int = 0
+    n_since_rfi: int = 0
 
     stop_reason: str | None = None
     subtract_static_sky: bool = False
+    channel_weights: np.ndarray | None = None
+    rfi_history: list | None = None
 
 
 class Calibrator:
@@ -1749,6 +1753,10 @@ class Calibrator:
         target_reduced_chi2: float | None = None,
         reduced_chi2_check_every: int = 1,
         check_every: int = 1,
+        initial_channel_weights: np.ndarray | None = None,
+        initial_flags: np.ndarray | None = None,
+        rfi_config: RFIConfig | None = None,
+        max_rfi_updates: int | None = None,
     ):
         """Create a persistent state for resumable joint sky/beam dirty fits.
 
@@ -1761,6 +1769,17 @@ class Calibrator:
             Compare Anderson acceleration vs plain step every N iterations.
             Set to >1 to skip AA evaluation on non-checkpoint steps for speed,
             using the same decision from the last checkpoint.
+        initial_channel_weights : array_like, optional
+            External soft weights, shape ``(nfreq,)`` or ``(ntime, nfreq)``.
+        initial_flags : array_like of bool, optional
+            External hard flags, shape ``(nfreq,)`` or ``(ntime, nfreq)``.
+        rfi_config : RFIConfig, optional
+            Configuration for RFI weight updates. If provided and a non-zero
+            'rfi' cadence is specified in solve_every, RFI weight updates will
+            occur during the fit.
+        max_rfi_updates : int, optional
+            Maximum number of RFI weight updates to perform. If None, updates
+            continue throughout the fit.
         """
         if solve_every is None:
             solve_every = {}
@@ -1783,13 +1802,30 @@ class Calibrator:
                 target_reduced_chi2=target_reduced_chi2,
                 reduced_chi2_check_every=max(int(reduced_chi2_check_every), 1),
                 check_every=max(int(check_every), 1),
+                rfi_config=rfi_config or RFIConfig(),
+                max_rfi_updates=max_rfi_updates,
             ),
             joint_acc=AndersonAccelerator(
                 joint_anderson_history, joint_aa_start, joint_aa_damping,
                 joint_aa_ridge,
                 step_gain_factor=joint_step_gain_factor
             ),
+            rfi_history=[],
         )
+
+        # Initialize channel weights if RFI reweighting is enabled
+        rfi_max_every = solve_every.get('rfi', 0)
+        if rfi_max_every != 0:
+            cfg = state.settings['rfi_config']
+            initial_weights = prepare_initial_channel_weights(
+                ntime=self.ntime,
+                nfreq=self.nfreq,
+                initial_weights=initial_channel_weights,
+                initial_flags=initial_flags,
+                flagged_weight=cfg.flagged_weight,
+            )
+            state.channel_weights = initial_weights
+            self.set_channel_weights(initial_weights)
 
         # Store full input params for later expansion to full-sky
         state.settings['params_input_full'] = params
@@ -2339,6 +2375,43 @@ class Calibrator:
         state.loss = float(loss)
         state.step += 1
 
+        # Handle RFI weight updates
+        rfi_max_every = s['solve_every'].get('rfi', 0)
+        rfi_enabled = (rfi_max_every != 0)
+        max_rfi = s.get('max_rfi_updates')
+        rfi_quota_exhausted = (max_rfi is not None and state.n_rfi >= max_rfi)
+
+        if rfi_enabled and not rfi_quota_exhausted and state.n_since_rfi >= rfi_max_every:
+            cfg = s['rfi_config']
+            current_weights = state.channel_weights if state.channel_weights is not None else np.ones((self.ntime, self.nfreq), dtype=DTYPE_R_NPY)
+            resid = np.asarray(self.calibrated_residual_variable_beam(state.params), dtype=np.complex64)
+            new_weights, diag = update_channel_weights_from_residuals(
+                residual=resid,
+                inv_noise_var=np.asarray(self.inv_noise_var),
+                prior_weights=current_weights,
+                current_weights=current_weights,
+                config=cfg,
+            )
+            state.channel_weights = new_weights
+            self.set_channel_weights(new_weights)
+            state.n_rfi += 1
+            state.n_since_rfi = 0
+            state.n_since_joint += 1
+            state.n_since_gains += 1
+            if state.rfi_history is None:
+                state.rfi_history = []
+            state.rfi_history.append({
+                'step': state.step,
+                'n_rfi': state.n_rfi,
+                'weights': new_weights.copy(),
+                'diagnostics': diag,
+            })
+            if verbose:
+                flagged_frac = float(np.mean(new_weights < 0.5))
+                print(f"    [rfi {state.n_rfi - 1:03d}]: loss={loss:.4e}  frac(w<0.5)={flagged_frac:.3f}")
+        else:
+            state.n_since_rfi += 1
+
         check_every = s['reduced_chi2_check_every']
         target = s['target_reduced_chi2']
         if target is not None and (state.step % check_every == 0):
@@ -2473,15 +2546,19 @@ class Calibrator:
         reduced_chi2_check_every: int = 1,
         subtract_static_sky: bool = False,
         check_every: int = 1,
+        initial_channel_weights: np.ndarray | None = None,
+        initial_flags: np.ndarray | None = None,
+        rfi_config: RFIConfig | None = None,
+        max_rfi_updates: int | None = None,
         verbose: bool = False,
         _stop_flag=None,
     ):
-        """Joint sky+beam dirty-map minimisation with optional gain updates.
+        """Joint sky+beam dirty-map minimisation with optional gain and RFI weight updates.
 
         Simultaneously updates sky and beam coefficients from a shared adjoint,
-        with optional periodic gain solves via the ``solve_every`` dict.
-        Provides the same resumable state-machine interface as
-        :meth:`fit_alternating_dirty`.
+        with optional periodic gain solves and RFI channel weight updates via
+        the ``solve_every`` dict. Provides the same resumable state-machine
+        interface as :meth:`fit_alternating_dirty`.
 
         Parameters are always returned in full-sky format.
 
@@ -2508,8 +2585,9 @@ class Calibrator:
             Factor for adaptive step scaling; step_gain is multiplied by this when
             iterations stall or boosted when they succeed.
         solve_every : dict, optional
-            Cadence control: ``{'gains': n}`` solves gains every n steps.
-            Default is ``{'gains': 1}`` (solve gains every step).
+            Cadence control: ``{'gains': n, 'rfi': m}`` solves gains every n steps,
+            updates RFI weights every m steps. Default ``{'gains': 1}`` (solve gains
+            every step). If ``'rfi'`` is not set or is 0, RFI reweighting is disabled.
         eff_alpha : float, default 0.4
             EMA factor for efficiency tracking.
         target_reduced_chi2 : float, optional
@@ -2522,6 +2600,15 @@ class Calibrator:
             Compare Anderson acceleration vs plain step every N iterations.
             Set to >1 to skip AA evaluation on non-checkpoint steps for speed,
             using the same decision from the last checkpoint.
+        initial_channel_weights : array_like, optional
+            External soft weights, shape ``(nfreq,)`` or ``(ntime, nfreq)``.
+        initial_flags : array_like of bool, optional
+            External hard flags, shape ``(nfreq,)`` or ``(ntime, nfreq)``.
+        rfi_config : RFIConfig, optional
+            Configuration for RFI weight updates.
+        max_rfi_updates : int, optional
+            Maximum number of RFI weight updates to perform. If None, updates
+            continue throughout the fit.
         verbose : bool
         """
         state = self.init_joint_sky_beam_dirty_state(
@@ -2538,6 +2625,10 @@ class Calibrator:
             target_reduced_chi2=target_reduced_chi2,
             reduced_chi2_check_every=reduced_chi2_check_every,
             check_every=check_every,
+            initial_channel_weights=initial_channel_weights,
+            initial_flags=initial_flags,
+            rfi_config=rfi_config,
+            max_rfi_updates=max_rfi_updates,
         )
         state.subtract_static_sky = subtract_static_sky
         state = self.run_joint_sky_beam_dirty_state(state, n_iter=n_iter, verbose=verbose, _stop_flag=_stop_flag)
