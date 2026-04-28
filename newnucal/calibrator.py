@@ -17,7 +17,7 @@ from .beam import BeamModel
 from .basis import basis_project
 from .simulate import ForwardModel
 from .gains import apply_gains, init_gain_params
-from .rfi import RFIConfig, prepare_initial_channel_weights, update_channel_weights_from_residuals, fit_soft_channel_weights, fit_soft_channel_weights_jax, fit_soft_channel_weights_closed_form_jax
+from .rfi import prepare_initial_channel_weights, fit_soft_channel_weights, fit_soft_channel_weights_jax, fit_soft_channel_weights_closed_form_jax
 from .utils import DTYPE_R_JAX, DTYPE_R_NPY, DTYPE_C_JAX
 
 class _StopFitFlag:
@@ -1583,19 +1583,22 @@ class Calibrator:
         n_rounds: int = 3,
         fit_method: str = 'fit_alternating_dirty',
         fit_kwargs: dict | None = None,
-        rfi_config: RFIConfig | None = None,
+        flagged_weight: float = 0.05,
+        regularization: float = 1.0,
+        regularization_power: float = 2.0,
+        min_weight: float = 0.01,
+        max_weight: float = 1.0,
         target_reduced_chi2: float | None = None,
         reduced_chi2_check_every: int = 1,
         verbose: bool = False,
     ):
-        """Iteratively refit with residual-driven channel reweighting.
+        """Iteratively refit with residual-driven soft channel reweighting.
 
         The initial weights should come from an external DPSS/high-pass RFI
-        detector.  After each fit round, residuals are turned into updated soft
+        detector.  After each fit round, residuals are optimized to update soft
         time/frequency channel weights and the model is refit.
         """
         fit_kwargs = {} if fit_kwargs is None else dict(fit_kwargs)
-        cfg = rfi_config or RFIConfig()
         if inv_noise_var is not None:
             self.set_inv_noise_var(inv_noise_var)
         base_weights = prepare_initial_channel_weights(
@@ -1603,7 +1606,7 @@ class Calibrator:
             nfreq=self.nfreq,
             initial_weights=initial_channel_weights,
             initial_flags=initial_flags,
-            flagged_weight=cfg.flagged_weight,
+            flagged_weight=flagged_weight,
         )
         self.set_channel_weights(base_weights)
 
@@ -1613,13 +1616,50 @@ class Calibrator:
         for iround in range(n_rounds):
             params, loss = runner(params, **fit_kwargs)
             resid = np.asarray(self.calibrated_residual_variable_beam(params), dtype=np.complex64)
-            new_weights, diagnostics = update_channel_weights_from_residuals(
-                residual=resid,
-                inv_noise_var=np.asarray(self.inv_noise_var),
-                prior_weights=base_weights,
-                current_weights=current_weights,
-                config=cfg,
-            )
+            # Use closed-form solution for quadratic regularization (fastest)
+            if abs(regularization_power - 2.0) < 1e-6:
+                try:
+                    new_weights, diagnostics = fit_soft_channel_weights_closed_form_jax(
+                        residual=resid,
+                        inv_noise_var=np.asarray(self.inv_noise_var),
+                        prior_weights=base_weights,
+                        regularization=regularization,
+                        min_weight=min_weight,
+                        max_weight=max_weight,
+                    )
+                except ImportError:
+                    new_weights, diagnostics = fit_soft_channel_weights(
+                        residual=resid,
+                        inv_noise_var=np.asarray(self.inv_noise_var),
+                        prior_weights=base_weights,
+                        regularization=regularization,
+                        regularization_power=regularization_power,
+                        min_weight=min_weight,
+                        max_weight=max_weight,
+                    )
+            else:
+                # Use iterative version for non-quadratic regularization
+                try:
+                    new_weights, diagnostics = fit_soft_channel_weights_jax(
+                        residual=resid,
+                        inv_noise_var=np.asarray(self.inv_noise_var),
+                        prior_weights=base_weights,
+                        regularization=regularization,
+                        regularization_power=regularization_power,
+                        min_weight=min_weight,
+                        max_weight=max_weight,
+                        use_jax=True,
+                    )
+                except (ImportError, RuntimeError):
+                    new_weights, diagnostics = fit_soft_channel_weights(
+                        residual=resid,
+                        inv_noise_var=np.asarray(self.inv_noise_var),
+                        prior_weights=base_weights,
+                        regularization=regularization,
+                        regularization_power=regularization_power,
+                        min_weight=min_weight,
+                        max_weight=max_weight,
+                    )
             current_weights = new_weights
             self.set_channel_weights(current_weights)
             chi2_red = self.calc_reduced_chi2(params, explicit_beam=('beam_coeffs' in params), subtract_params='auto')
@@ -1755,7 +1795,11 @@ class Calibrator:
         check_every: int = 1,
         initial_channel_weights: np.ndarray | None = None,
         initial_flags: np.ndarray | None = None,
-        rfi_config: RFIConfig | None = None,
+        rfi_regularization: float = 1.0,
+        rfi_regularization_power: float = 2.0,
+        rfi_min_weight: float = 0.01,
+        rfi_max_weight: float = 1.0,
+        rfi_flagged_weight: float = 0.05,
         max_rfi_updates: int | None = None,
     ):
         """Create a persistent state for resumable joint sky/beam dirty fits.
@@ -1773,10 +1817,16 @@ class Calibrator:
             External soft weights, shape ``(nfreq,)`` or ``(ntime, nfreq)``.
         initial_flags : array_like of bool, optional
             External hard flags, shape ``(nfreq,)`` or ``(ntime, nfreq)``.
-        rfi_config : RFIConfig, optional
-            Configuration for RFI weight updates. If provided and a non-zero
-            'rfi' cadence is specified in solve_every, RFI weight updates will
-            occur during the fit.
+        rfi_regularization : float, default 1.0
+            Strength of regularization for RFI weight updates.
+        rfi_regularization_power : float, default 2.0
+            Power of regularization term (2.0 = quadratic).
+        rfi_min_weight : float, default 0.01
+            Minimum allowed channel weight.
+        rfi_max_weight : float, default 1.0
+            Maximum allowed channel weight.
+        rfi_flagged_weight : float, default 0.05
+            Weight assigned to initially flagged channels.
         max_rfi_updates : int, optional
             Maximum number of RFI weight updates to perform. If None, updates
             continue throughout the fit.
@@ -1802,7 +1852,13 @@ class Calibrator:
                 target_reduced_chi2=target_reduced_chi2,
                 reduced_chi2_check_every=max(int(reduced_chi2_check_every), 1),
                 check_every=max(int(check_every), 1),
-                rfi_config=rfi_config or RFIConfig(),
+                rfi_config={
+                    'regularization': rfi_regularization,
+                    'regularization_power': rfi_regularization_power,
+                    'min_weight': rfi_min_weight,
+                    'max_weight': rfi_max_weight,
+                    'flagged_weight': rfi_flagged_weight,
+                },
                 max_rfi_updates=max_rfi_updates,
             ),
             joint_acc=AndersonAccelerator(
@@ -1822,7 +1878,7 @@ class Calibrator:
                 nfreq=self.nfreq,
                 initial_weights=initial_channel_weights,
                 initial_flags=initial_flags,
-                flagged_weight=cfg.flagged_weight,
+                flagged_weight=cfg['flagged_weight'],
             )
             state.channel_weights = initial_weights
             self.set_channel_weights(initial_weights)
@@ -2391,61 +2447,52 @@ class Calibrator:
             resid_jax = self.calibrated_residual_variable_beam(state.params)
             resid = np.asarray(jax.device_get(resid_jax))
             inv_var = np.asarray(jax.device_get(self.inv_noise_var))
-            if cfg.use_soft_weight_fit:
-                # Use closed-form solution for quadratic case (common and fast)
-                if abs(cfg.regularization_power - 2.0) < 1e-6:
-                    try:
-                        new_weights, diag = fit_soft_channel_weights_closed_form_jax(
-                            residual=resid,
-                            inv_noise_var=inv_var,
-                            prior_weights=current_weights,
-                            regularization=cfg.regularization,
-                            min_weight=cfg.min_weight,
-                            max_weight=cfg.max_weight,
-                        )
-                    except ImportError:
-                        # Fall back to NumPy if JAX not available
-                        new_weights, diag = fit_soft_channel_weights(
-                            residual=resid,
-                            inv_noise_var=inv_var,
-                            prior_weights=current_weights,
-                            regularization=cfg.regularization,
-                            regularization_power=cfg.regularization_power,
-                            min_weight=cfg.min_weight,
-                            max_weight=cfg.max_weight,
-                        )
-                else:
-                    # Use iterative JAX version for non-quadratic regularization
-                    try:
-                        new_weights, diag = fit_soft_channel_weights_jax(
-                            residual=resid,
-                            inv_noise_var=inv_var,
-                            prior_weights=current_weights,
-                            regularization=cfg.regularization,
-                            regularization_power=cfg.regularization_power,
-                            min_weight=cfg.min_weight,
-                            max_weight=cfg.max_weight,
-                            use_jax=True,
-                        )
-                    except (ImportError, RuntimeError):
-                        # Fall back to NumPy/SciPy if JAX not available
-                        new_weights, diag = fit_soft_channel_weights(
-                            residual=resid,
-                            inv_noise_var=inv_var,
-                            prior_weights=current_weights,
-                            regularization=cfg.regularization,
-                            regularization_power=cfg.regularization_power,
-                            min_weight=cfg.min_weight,
-                            max_weight=cfg.max_weight,
-                        )
+            # Use closed-form solution for quadratic case (common and fast)
+            if abs(cfg['regularization_power'] - 2.0) < 1e-6:
+                try:
+                    new_weights, diag = fit_soft_channel_weights_closed_form_jax(
+                        residual=resid,
+                        inv_noise_var=inv_var,
+                        prior_weights=current_weights,
+                        regularization=cfg['regularization'],
+                        min_weight=cfg['min_weight'],
+                        max_weight=cfg['max_weight'],
+                    )
+                except ImportError:
+                    # Fall back to NumPy if JAX not available
+                    new_weights, diag = fit_soft_channel_weights(
+                        residual=resid,
+                        inv_noise_var=inv_var,
+                        prior_weights=current_weights,
+                        regularization=cfg['regularization'],
+                        regularization_power=cfg['regularization_power'],
+                        min_weight=cfg['min_weight'],
+                        max_weight=cfg['max_weight'],
+                    )
             else:
-                new_weights, diag = update_channel_weights_from_residuals(
-                    residual=resid,
-                    inv_noise_var=inv_var,
-                    prior_weights=current_weights,
-                    current_weights=current_weights,
-                    config=cfg,
-                )
+                # Use iterative JAX version for non-quadratic regularization
+                try:
+                    new_weights, diag = fit_soft_channel_weights_jax(
+                        residual=resid,
+                        inv_noise_var=inv_var,
+                        prior_weights=current_weights,
+                        regularization=cfg['regularization'],
+                        regularization_power=cfg['regularization_power'],
+                        min_weight=cfg['min_weight'],
+                        max_weight=cfg['max_weight'],
+                        use_jax=True,
+                    )
+                except (ImportError, RuntimeError):
+                    # Fall back to NumPy/SciPy if JAX not available
+                    new_weights, diag = fit_soft_channel_weights(
+                        residual=resid,
+                        inv_noise_var=inv_var,
+                        prior_weights=current_weights,
+                        regularization=cfg['regularization'],
+                        regularization_power=cfg['regularization_power'],
+                        min_weight=cfg['min_weight'],
+                        max_weight=cfg['max_weight'],
+                    )
             state.channel_weights = new_weights
             self.set_channel_weights(new_weights)
             state.n_rfi += 1
@@ -2602,7 +2649,11 @@ class Calibrator:
         check_every: int = 1,
         initial_channel_weights: np.ndarray | None = None,
         initial_flags: np.ndarray | None = None,
-        rfi_config: RFIConfig | None = None,
+        rfi_regularization: float = 1.0,
+        rfi_regularization_power: float = 2.0,
+        rfi_min_weight: float = 0.01,
+        rfi_max_weight: float = 1.0,
+        rfi_flagged_weight: float = 0.05,
         max_rfi_updates: int | None = None,
         verbose: bool = False,
         _stop_flag=None,
@@ -2658,8 +2709,16 @@ class Calibrator:
             External soft weights, shape ``(nfreq,)`` or ``(ntime, nfreq)``.
         initial_flags : array_like of bool, optional
             External hard flags, shape ``(nfreq,)`` or ``(ntime, nfreq)``.
-        rfi_config : RFIConfig, optional
-            Configuration for RFI weight updates.
+        rfi_regularization : float, default 1.0
+            Strength of regularization for RFI weight updates.
+        rfi_regularization_power : float, default 2.0
+            Power of regularization term (2.0 = quadratic).
+        rfi_min_weight : float, default 0.01
+            Minimum allowed channel weight.
+        rfi_max_weight : float, default 1.0
+            Maximum allowed channel weight.
+        rfi_flagged_weight : float, default 0.05
+            Weight assigned to initially flagged channels.
         max_rfi_updates : int, optional
             Maximum number of RFI weight updates to perform. If None, updates
             continue throughout the fit.
@@ -2681,7 +2740,11 @@ class Calibrator:
             check_every=check_every,
             initial_channel_weights=initial_channel_weights,
             initial_flags=initial_flags,
-            rfi_config=rfi_config,
+            rfi_regularization=rfi_regularization,
+            rfi_regularization_power=rfi_regularization_power,
+            rfi_min_weight=rfi_min_weight,
+            rfi_max_weight=rfi_max_weight,
+            rfi_flagged_weight=rfi_flagged_weight,
             max_rfi_updates=max_rfi_updates,
         )
         state.subtract_static_sky = subtract_static_sky
