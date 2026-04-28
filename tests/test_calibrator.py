@@ -261,6 +261,7 @@ class TestRFIWeightedCalibrator:
             score_center=1.5,
             score_slope=2.0,
             blend=0.0,
+            use_soft_weight_fit=False,  # use legacy detection-based approach
         )
 
         init_w = np.ones((cal.ntime, cal.nfreq), dtype=np.float32)
@@ -281,6 +282,42 @@ class TestRFIWeightedCalibrator:
         assert cal.channel_weights.shape == (cal.ntime, cal.nfreq)
         # The contaminated channel should be downweighted
         assert float(np.mean(cal.channel_weights[:, 2])) < 0.5
+
+    def test_fit_joint_sky_beam_dirty_with_soft_weight_fit(self, calibrator_rfi_setup):
+        cal, params = calibrator_rfi_setup
+        data = np.array(cal.data)
+        data[:, 2, :] += 50.0 + 0.0j
+        cal.data = jnp.array(data, dtype=jnp.complex64)
+
+        from newnucal.rfi import RFIConfig
+        cfg = RFIConfig(
+            use_soft_weight_fit=True,  # use new optimization-based approach
+            regularization=1.0,
+            regularization_power=2.0,
+            min_weight=0.01,
+            max_weight=1.0,
+        )
+
+        # Start with prior weights that allow downweighting
+        init_w = np.ones((cal.ntime, cal.nfreq), dtype=np.float32) * 0.5
+        params_out, loss_out = cal.fit_joint_sky_beam_dirty(
+            params,
+            n_iter=5,
+            solve_every={'gains': 1, 'rfi': 2},
+            initial_channel_weights=init_w,
+            rfi_config=cfg,
+            max_rfi_updates=2,
+            verbose=False,
+        )
+
+        assert params_out.keys() == params.keys()
+        assert loss_out < float(cal.calc_loss(params))
+        # Weights should have been updated
+        assert cal.channel_weights is not None
+        assert cal.channel_weights.shape == (cal.ntime, cal.nfreq)
+        # Weights should be in valid range
+        assert np.all(cal.channel_weights >= 0.01)
+        assert np.all(cal.channel_weights <= 1.0)
 
 
 @pytest.fixture
