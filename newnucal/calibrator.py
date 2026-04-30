@@ -19,11 +19,6 @@ from .simulate import ForwardModel
 from .gains import apply_gains, init_gain_params
 from .rfi import (
     prepare_initial_channel_weights,
-    fit_soft_channel_weights,
-    fit_soft_channel_weights_jax,
-    fit_soft_channel_weights_closed_form_jax,
-    fit_soft_channel_weights_thresholded,
-    fit_channel_weights_dof_conservative,
     fit_channel_weights_local_chi2_exponential,
 )
 from .utils import DTYPE_R_JAX, DTYPE_R_NPY, DTYPE_C_JAX
@@ -753,7 +748,7 @@ class Calibrator:
         """Gain-calibrated residual without channel_weights or inv_noise_var.
 
         Returns raw residual (data_cal - vis_model). Intended for RFI weight fitting
-        and diagnostics, NOT for adjoint updates. Lets fit_soft_channel_weights_*()
+        and diagnostics, NOT for adjoint updates. Lets fit_channel_weights_local_chi2_exponential()
         apply inv_noise_var once, as intended, avoiding double-counting of the noise
         model and current soft weights.
         """
