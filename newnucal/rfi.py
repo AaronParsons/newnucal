@@ -411,3 +411,102 @@ def fit_soft_channel_weights_jax(
     }
 
     return weights_final, diagnostics
+
+
+def fit_soft_channel_weights_thresholded(
+    *,
+    residual: np.ndarray,
+    inv_noise_var: np.ndarray | None = None,
+    prior_weights: np.ndarray | None = None,
+    threshold: float = 1.5,
+    softness: float = 2.0,
+    min_weight: float = 0.10,
+    max_weight: float = 1.0,
+    statistic: str = 'median',
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Robust thresholded soft channel weights via logistic excess penalty.
+
+    Computes per-frequency whitened residual power, normalizes by a robust
+    statistic, and only downweights channels above a threshold. Uses a logistic
+    rule to smoothly penalize excess, avoiding the over-aggressive behavior of
+    quadratic regularization. Intended for RFI weight fitting.
+
+    Parameters
+    ----------
+    residual : np.ndarray, shape (ntime, nfreq, nbls)
+        Gain-calibrated model residuals (unweighted).
+    inv_noise_var : np.ndarray, optional
+        Inverse variance per time/frequency channel. If None, assume uniform.
+    prior_weights : np.ndarray, optional
+        External bootstrap prior (e.g., from DPSS or flagging).
+        Fitted weights will not exceed prior values.
+    threshold : float, default 1.5
+        Normalized residual power above which downweighting begins.
+        Channels with a_f <= threshold keep full weight.
+    softness : float, default 2.0
+        Controls steepness of logistic downweighting. Larger values = gentler.
+        w_target = 1 / (1 + excess / softness), where excess = max(a_f - threshold, 0).
+    min_weight : float, default 0.10
+        Minimum allowed weight (avoid making channels dynamically irrelevant).
+    max_weight : float, default 1.0
+        Maximum allowed weight.
+    statistic : {'median', 'mean'}, default 'median'
+        Robust statistic for normalizing residual power per frequency.
+
+    Returns
+    -------
+    weights : np.ndarray, shape (ntime, nfreq)
+        Fitted soft channel weights (constant across time).
+    diagnostics : dict
+        Contains 'residual_power_tf', 'residual_power_f', 'norm_power_f',
+        'weights_f', 'threshold', 'softness', 'method', etc.
+    """
+    resid = np.asarray(residual)
+    if resid.ndim != 3:
+        raise ValueError(
+            f"Expected residual with shape (ntime, nfreq, nbls), got {resid.shape}"
+        )
+    ntime, nfreq, nbls = resid.shape
+
+    inv_var_tf = _as_tf(inv_noise_var, ntime, nfreq, fill_value=1.0)
+    prior_tf = _as_tf(prior_weights, ntime, nfreq, fill_value=max_weight)
+
+    # Compute per-channel residual power (mean |residual|^2 across baselines)
+    residual_power_tf = np.mean(np.abs(resid) ** 2, axis=2) * inv_var_tf
+
+    # Normalize by robust statistic (median or mean per frequency)
+    if statistic == 'median':
+        residual_power_f = np.median(residual_power_tf, axis=0)
+    elif statistic == 'mean':
+        residual_power_f = np.mean(residual_power_tf, axis=0)
+    else:
+        raise ValueError(f"statistic must be 'median' or 'mean', got {statistic}")
+
+    # Avoid division by zero
+    floor = np.maximum(np.median(residual_power_f), 1e-30)
+    a_f = residual_power_f / floor
+
+    # Logistic rule: only penalize channels above threshold
+    excess = np.maximum(a_f - threshold, 0.0)
+    weights_f = 1.0 / (1.0 + excess / softness)
+
+    # Apply prior bounds (prior acts as upper-bound cap from flagging)
+    upper_f = np.clip(prior_tf[0, :], min_weight, max_weight)
+    weights_f = np.clip(weights_f, min_weight, upper_f)
+
+    # Broadcast to full time/frequency grid
+    weights_tf = np.broadcast_to(weights_f[None, :], (ntime, nfreq)).astype(DTYPE_R)
+
+    diagnostics = {
+        'residual_power_tf': residual_power_tf,
+        'residual_power_f': residual_power_f,
+        'norm_power_f': a_f,
+        'weights_f': weights_f,
+        'weights_final_f': weights_f,
+        'upper_f': upper_f,
+        'threshold': threshold,
+        'softness': softness,
+        'statistic': statistic,
+        'method': 'thresholded_logistic_excess',
+    }
+    return weights_tf, diagnostics

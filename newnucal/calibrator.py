@@ -17,8 +17,69 @@ from .beam import BeamModel
 from .basis import basis_project
 from .simulate import ForwardModel
 from .gains import apply_gains, init_gain_params
-from .rfi import prepare_initial_channel_weights, fit_soft_channel_weights, fit_soft_channel_weights_jax, fit_soft_channel_weights_closed_form_jax
+from .rfi import (
+    prepare_initial_channel_weights,
+    fit_soft_channel_weights,
+    fit_soft_channel_weights_jax,
+    fit_soft_channel_weights_closed_form_jax,
+    fit_soft_channel_weights_thresholded,
+)
 from .utils import DTYPE_R_JAX, DTYPE_R_NPY, DTYPE_C_JAX
+
+
+def smooth_channel_weights(
+    old_w: np.ndarray,
+    target_w: np.ndarray,
+    *,
+    alpha_down: float = 0.15,
+    alpha_up: float = 0.75,
+    max_drop: float = 0.15,
+    min_weight: float = 0.10,
+    max_weight: float = 1.0,
+) -> np.ndarray:
+    """Asymmetric smoothing of channel weight updates.
+
+    Applies slower downweighting and faster upweighting to avoid single bad
+    residual snapshots permanently downweighting a channel. Downweighting
+    requires repeated evidence; upweighting happens quickly once the channel
+    residual becomes normal again.
+
+    Parameters
+    ----------
+    old_w : np.ndarray
+        Current channel weights, shape (nfreq,).
+    target_w : np.ndarray
+        Target weights from RFI fitting, shape (nfreq,).
+    alpha_down : float, default 0.15
+        Mixing weight for downweighting: w = (1 - alpha) * old_w + alpha * target_w.
+        Smaller values = slower downweighting (more conservative).
+    alpha_up : float, default 0.75
+        Mixing weight for upweighting (recovery). Larger values = faster recovery.
+    max_drop : float, default 0.15
+        Maximum weight drop allowed in a single update. Prevents overshooting.
+        If (old_w - new_w) > max_drop, clamp to old_w - max_drop.
+    min_weight : float, default 0.10
+        Minimum allowed weight.
+    max_weight : float, default 1.0
+        Maximum allowed weight.
+
+    Returns
+    -------
+    np.ndarray
+        Smoothed weights, shape (nfreq,), clipped to [min_weight, max_weight].
+    """
+    old_w = np.asarray(old_w, dtype=DTYPE_R_NPY)
+    target_w = np.asarray(target_w, dtype=DTYPE_R_NPY)
+
+    # Choose alpha based on direction of change
+    alpha = np.where(target_w < old_w, alpha_down, alpha_up)
+    w = (1.0 - alpha) * old_w + alpha * target_w
+
+    # Limit how far a channel can fall in one update
+    w = np.maximum(w, old_w - max_drop)
+
+    return np.clip(w, min_weight, max_weight).astype(DTYPE_R_NPY)
+
 
 class _StopFitFlag:
     def __init__(self):
@@ -680,6 +741,22 @@ class Calibrator:
         )
         resid = data_cal - vis_model
         return resid * (self.channel_weights * self.inv_noise_var)[:, :, None].astype(DTYPE_C_JAX)
+
+    def calibrated_residual_variable_beam_unweighted(self, params):
+        """Gain-calibrated residual without channel_weights or inv_noise_var.
+
+        Returns raw residual (data_cal - vis_model). Intended for RFI weight fitting
+        and diagnostics, NOT for adjoint updates. Lets fit_soft_channel_weights_*()
+        apply inv_noise_var once, as intended, avoiding double-counting of the noise
+        model and current soft weights.
+        """
+        inv = self._invert_gains(params)
+        data_cal = apply_gains(self.data, inv['log_amp'], inv['phase'], inv['phi'], self.bls)
+        sky_coeffs = self._ensure_sky_is_active(params['sky_coeffs'])
+        vis_model = self._jit_simulate_variable_beam(
+            sky_coeffs, params['beam_coeffs'], self.rot_matrices
+        )
+        return data_cal - vis_model
 
     def _residual_variable_beam(self, params, weights):
         """Weighted residual function (variable beam) for adjoint computation.
@@ -1800,6 +1877,11 @@ class Calibrator:
         rfi_min_weight: float = 0.01,
         rfi_max_weight: float = 1.0,
         rfi_flagged_weight: float = 0.05,
+        rfi_threshold: float = 1.5,
+        rfi_softness: float = 2.0,
+        rfi_alpha_down: float = 0.15,
+        rfi_alpha_up: float = 0.75,
+        rfi_max_drop: float = 0.15,
         max_rfi_updates: int | None = None,
     ):
         """Create a persistent state for resumable joint sky/beam dirty fits.
@@ -1818,15 +1900,25 @@ class Calibrator:
         initial_flags : array_like of bool, optional
             External hard flags, shape ``(nfreq,)`` or ``(ntime, nfreq)``.
         rfi_regularization : float, default 1.0
-            Strength of regularization for RFI weight updates.
+            Strength of regularization for RFI weight updates (deprecated: kept for compatibility).
         rfi_regularization_power : float, default 2.0
-            Power of regularization term (2.0 = quadratic).
+            Power of regularization term (deprecated: kept for compatibility).
         rfi_min_weight : float, default 0.01
             Minimum allowed channel weight.
         rfi_max_weight : float, default 1.0
             Maximum allowed channel weight.
         rfi_flagged_weight : float, default 0.05
             Weight assigned to initially flagged channels.
+        rfi_threshold : float, default 1.5
+            Normalized residual power threshold above which downweighting begins.
+        rfi_softness : float, default 2.0
+            Controls steepness of logistic downweighting (larger = gentler).
+        rfi_alpha_down : float, default 0.15
+            Mixing weight for downweighting in asymmetric smoothing (smaller = slower).
+        rfi_alpha_up : float, default 0.75
+            Mixing weight for upweighting/recovery (larger = faster recovery).
+        rfi_max_drop : float, default 0.15
+            Maximum weight drop allowed in a single update.
         max_rfi_updates : int, optional
             Maximum number of RFI weight updates to perform. If None, updates
             continue throughout the fit.
@@ -1858,6 +1950,11 @@ class Calibrator:
                     'min_weight': rfi_min_weight,
                     'max_weight': rfi_max_weight,
                     'flagged_weight': rfi_flagged_weight,
+                    'threshold': rfi_threshold,
+                    'softness': rfi_softness,
+                    'alpha_down': rfi_alpha_down,
+                    'alpha_up': rfi_alpha_up,
+                    'max_drop': rfi_max_drop,
                 },
                 max_rfi_updates=max_rfi_updates,
             ),
@@ -2443,57 +2540,42 @@ class Calibrator:
 
         if rfi_enabled and not rfi_quota_exhausted and state.n_since_rfi >= rfi_max_every:
             cfg = s['rfi_config']
-            resid_jax = self.calibrated_residual_variable_beam(state.params)
+            resid_jax = self.calibrated_residual_variable_beam_unweighted(state.params)
             resid = np.asarray(jax.device_get(resid_jax))
             inv_var = np.asarray(jax.device_get(self.inv_noise_var))
-            # Use closed-form solution for quadratic case (common and fast)
-            if abs(cfg['regularization_power'] - 2.0) < 1e-6:
-                try:
-                    new_weights, diag = fit_soft_channel_weights_closed_form_jax(
-                        residual=resid,
-                        inv_noise_var=inv_var,
-                        prior_weights=None,
-                        regularization=cfg['regularization'],
-                        min_weight=cfg['min_weight'],
-                        max_weight=cfg['max_weight'],
-                    )
-                except ImportError:
-                    # Fall back to NumPy if JAX not available
-                    new_weights, diag = fit_soft_channel_weights(
-                        residual=resid,
-                        inv_noise_var=inv_var,
-                        prior_weights=None,
-                        regularization=cfg['regularization'],
-                        regularization_power=cfg['regularization_power'],
-                        min_weight=cfg['min_weight'],
-                        max_weight=cfg['max_weight'],
-                    )
+            # Use thresholded logistic rule (robust and well-behaved)
+            new_weights, diag = fit_soft_channel_weights_thresholded(
+                residual=resid,
+                inv_noise_var=inv_var,
+                prior_weights=None,
+                threshold=cfg.get('threshold', 1.5),
+                softness=cfg.get('softness', 2.0),
+                min_weight=cfg['min_weight'],
+                max_weight=cfg['max_weight'],
+            )
+            # Apply asymmetric smoothing to avoid single bad snapshots killing channels
+            if state.channel_weights is not None:
+                old_weights_tf = np.asarray(state.channel_weights)
+                # Extract per-frequency weights (use first time slice since all times are identical)
+                old_weights_f = old_weights_tf[0, :]
             else:
-                # Use iterative JAX version for non-quadratic regularization
-                try:
-                    new_weights, diag = fit_soft_channel_weights_jax(
-                        residual=resid,
-                        inv_noise_var=inv_var,
-                        prior_weights=None,
-                        regularization=cfg['regularization'],
-                        regularization_power=cfg['regularization_power'],
-                        min_weight=cfg['min_weight'],
-                        max_weight=cfg['max_weight'],
-                        use_jax=True,
-                    )
-                except (ImportError, RuntimeError):
-                    # Fall back to NumPy/SciPy if JAX not available
-                    new_weights, diag = fit_soft_channel_weights(
-                        residual=resid,
-                        inv_noise_var=inv_var,
-                        prior_weights=None,
-                        regularization=cfg['regularization'],
-                        regularization_power=cfg['regularization_power'],
-                        min_weight=cfg['min_weight'],
-                        max_weight=cfg['max_weight'],
-                    )
-            state.channel_weights = new_weights
-            self.set_channel_weights(new_weights)
+                old_weights_f = np.ones(self.nfreq, dtype=DTYPE_R_NPY)
+
+            smoothed_weights_f = smooth_channel_weights(
+                old_weights_f,
+                np.asarray(new_weights[0, :]),  # extract per-frequency weights
+                alpha_down=cfg.get('alpha_down', 0.15),
+                alpha_up=cfg.get('alpha_up', 0.75),
+                max_drop=cfg.get('max_drop', 0.15),
+                min_weight=cfg['min_weight'],
+                max_weight=cfg['max_weight'],
+            )
+            # Broadcast smoothed weights to (ntime, nfreq)
+            smoothed_weights_tf = np.broadcast_to(
+                smoothed_weights_f[None, :], (self.ntime, self.nfreq)
+            ).astype(DTYPE_R_NPY)
+            state.channel_weights = smoothed_weights_tf
+            self.set_channel_weights(smoothed_weights_tf)
             state.n_rfi += 1
             state.n_since_rfi = 0
             state.n_since_joint += 1
@@ -2653,6 +2735,11 @@ class Calibrator:
         rfi_min_weight: float = 0.01,
         rfi_max_weight: float = 1.0,
         rfi_flagged_weight: float = 0.05,
+        rfi_threshold: float = 1.5,
+        rfi_softness: float = 2.0,
+        rfi_alpha_down: float = 0.15,
+        rfi_alpha_up: float = 0.75,
+        rfi_max_drop: float = 0.15,
         max_rfi_updates: int | None = None,
         verbose: bool = False,
         _stop_flag=None,
@@ -2709,15 +2796,25 @@ class Calibrator:
         initial_flags : array_like of bool, optional
             External hard flags, shape ``(nfreq,)`` or ``(ntime, nfreq)``.
         rfi_regularization : float, default 1.0
-            Strength of regularization for RFI weight updates.
+            Strength of regularization for RFI weight updates (deprecated).
         rfi_regularization_power : float, default 2.0
-            Power of regularization term (2.0 = quadratic).
+            Power of regularization term (deprecated).
         rfi_min_weight : float, default 0.01
             Minimum allowed channel weight.
         rfi_max_weight : float, default 1.0
             Maximum allowed channel weight.
         rfi_flagged_weight : float, default 0.05
             Weight assigned to initially flagged channels.
+        rfi_threshold : float, default 1.5
+            Normalized residual power threshold above which downweighting begins.
+        rfi_softness : float, default 2.0
+            Controls steepness of logistic downweighting (larger = gentler).
+        rfi_alpha_down : float, default 0.15
+            Mixing weight for downweighting in asymmetric smoothing (smaller = slower).
+        rfi_alpha_up : float, default 0.75
+            Mixing weight for upweighting/recovery (larger = faster recovery).
+        rfi_max_drop : float, default 0.15
+            Maximum weight drop allowed in a single update.
         max_rfi_updates : int, optional
             Maximum number of RFI weight updates to perform. If None, updates
             continue throughout the fit.
@@ -2744,6 +2841,11 @@ class Calibrator:
             rfi_min_weight=rfi_min_weight,
             rfi_max_weight=rfi_max_weight,
             rfi_flagged_weight=rfi_flagged_weight,
+            rfi_threshold=rfi_threshold,
+            rfi_softness=rfi_softness,
+            rfi_alpha_down=rfi_alpha_down,
+            rfi_alpha_up=rfi_alpha_up,
+            rfi_max_drop=rfi_max_drop,
             max_rfi_updates=max_rfi_updates,
         )
         state.subtract_static_sky = subtract_static_sky
