@@ -2622,11 +2622,12 @@ class Calibrator:
             state.rfi_history.append({
                 'step': state.step,
                 'n_rfi': state.n_rfi,
-                'weights': new_weights.copy(),
+                'log_weights': new_log_weights.copy(),
+                'weights_direct': new_weights_direct.copy(),
                 'diagnostics': diag,
             })
             if verbose:
-                flagged_frac = float(np.mean(new_weights < 0.5))
+                flagged_frac = float(np.mean(new_weights_direct < 0.5))
                 print(f"    [rfi {state.n_rfi - 1:03d}]: frac(w<0.5)={flagged_frac:.3f}")
         else:
             state.n_since_rfi += 1
