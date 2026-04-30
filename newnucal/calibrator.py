@@ -690,6 +690,7 @@ class Calibrator:
         return {
             'sky_coeffs':  jnp.zeros((npix_sky, nmodes_sky), dtype=DTYPE_R_JAX),
             'beam_coeffs': jnp.array(self.fwd.beam_coeffs),
+            'channel_weights': jnp.ones((self.ntime, self.nfreq), dtype=DTYPE_R_JAX),
             **init_gain_params(self.ntime, self.nfreq),
         }
 
@@ -1872,6 +1873,7 @@ class Calibrator:
         target_reduced_chi2: float | None = None,
         reduced_chi2_check_every: int = 1,
         check_every: int = 1,
+        channel_weights: np.ndarray | None = None,
         initial_channel_weights: np.ndarray | None = None,
         initial_flags: np.ndarray | None = None,
         rfi_regularization: float = 1.0,
@@ -1898,10 +1900,17 @@ class Calibrator:
             Compare Anderson acceleration vs plain step every N iterations.
             Set to >1 to skip AA evaluation on non-checkpoint steps for speed,
             using the same decision from the last checkpoint.
+        channel_weights : array_like, optional
+            Per-frequency soft channel weights, shape ``(nfreq,)`` or ``(ntime, nfreq)``.
+            If supplied, overrides initial_channel_weights and initial_flags.
+            If not supplied and neither initial_channel_weights nor initial_flags are
+            provided, defaults to unity weighting.
         initial_channel_weights : array_like, optional
             External soft weights, shape ``(nfreq,)`` or ``(ntime, nfreq)``.
+            Ignored if channel_weights is provided.
         initial_flags : array_like of bool, optional
             External hard flags, shape ``(nfreq,)`` or ``(ntime, nfreq)``.
+            Ignored if channel_weights is provided.
         rfi_regularization : float, default 1.0
             (Deprecated; kept for backward compatibility.)
         rfi_regularization_power : float, default 2.0
@@ -1933,6 +1942,27 @@ class Calibrator:
 
         params_active = self._params_to_active_space(params)
 
+        # Initialize channel weights: priority is channel_weights parameter,
+        # then params['channel_weights'], then initial_channel_weights/initial_flags,
+        # then default to unity
+        if channel_weights is not None:
+            channel_weights_init = channel_weights
+        elif 'channel_weights' in params_active:
+            channel_weights_init = params_active['channel_weights']
+        elif initial_channel_weights is not None or initial_flags is not None:
+            cfg_tmp = {
+                'flagged_weight': rfi_flagged_weight,
+            }
+            channel_weights_init = prepare_initial_channel_weights(
+                ntime=self.ntime,
+                nfreq=self.nfreq,
+                initial_weights=initial_channel_weights,
+                initial_flags=initial_flags,
+                flagged_weight=cfg_tmp['flagged_weight'],
+            )
+        else:
+            channel_weights_init = np.ones((self.ntime, self.nfreq), dtype=DTYPE_R_NPY)
+
         state = JointSkyBeamDirtyFitState(
             params={
                 'sky_coeffs': params_active['sky_coeffs'],
@@ -1940,6 +1970,7 @@ class Calibrator:
                 'log_amp': params_active['log_amp'],
                 'phase': params_active['phase'],
                 'phi': params_active['phi'],
+                'channel_weights': np.asarray(channel_weights_init, dtype=DTYPE_R_NPY),
             },
             settings=dict(
                 sky_beam_reg=sky_beam_reg,
@@ -1972,19 +2003,8 @@ class Calibrator:
             rfi_history=[],
         )
 
-        # Initialize channel weights if RFI reweighting is enabled
-        rfi_max_every = solve_every.get('rfi', 0)
-        if rfi_max_every != 0:
-            cfg = state.settings['rfi_config']
-            initial_weights = prepare_initial_channel_weights(
-                ntime=self.ntime,
-                nfreq=self.nfreq,
-                initial_weights=initial_channel_weights,
-                initial_flags=initial_flags,
-                flagged_weight=cfg['flagged_weight'],
-            )
-            state.channel_weights = initial_weights
-            self.set_channel_weights(initial_weights)
+        # Sync channel weights to the calibrator instance
+        self.set_channel_weights(state.params['channel_weights'])
 
         # Store full input params for later expansion to full-sky
         state.settings['params_input_full'] = params
@@ -2553,11 +2573,8 @@ class Calibrator:
             # Use local chi-squared exponential weighting: detect channels that are
             # outliers relative to their neighbors in chi² space (log scale).
             # No spectral basis required; purely data-driven local outlier detection.
-            if state.channel_weights is not None:
-                old_weights_tf = np.asarray(state.channel_weights)
-                old_weights_f = old_weights_tf[0, :]
-            else:
-                old_weights_f = np.ones(self.nfreq, dtype=DTYPE_R_NPY)
+            old_weights_tf = np.asarray(state.params['channel_weights'])
+            old_weights_f = old_weights_tf[0, :] if old_weights_tf.ndim > 1 else old_weights_tf
 
             new_weights, diag = fit_channel_weights_local_chi2_exponential(
                 residual=resid,
@@ -2574,7 +2591,7 @@ class Calibrator:
                 max_drop_per_update=cfg.get('max_drop', 0.20),
             )
 
-            state.channel_weights = new_weights
+            state.params['channel_weights'] = new_weights
             self.set_channel_weights(new_weights)
             state.n_rfi += 1
             state.n_since_rfi = 0
@@ -2728,6 +2745,7 @@ class Calibrator:
         reduced_chi2_check_every: int = 1,
         subtract_static_sky: bool = False,
         check_every: int = 1,
+        channel_weights: np.ndarray | None = None,
         initial_channel_weights: np.ndarray | None = None,
         initial_flags: np.ndarray | None = None,
         rfi_regularization: float = 1.0,
@@ -2798,10 +2816,17 @@ class Calibrator:
             Compare Anderson acceleration vs plain step every N iterations.
             Set to >1 to skip AA evaluation on non-checkpoint steps for speed,
             using the same decision from the last checkpoint.
+        channel_weights : array_like, optional
+            Per-frequency soft channel weights from params, shape ``(nfreq,)`` or
+            ``(ntime, nfreq)``. If supplied in params dict, overrides initial_channel_weights
+            and initial_flags. If not in params and neither initial_channel_weights nor
+            initial_flags is provided, defaults to unity weighting.
         initial_channel_weights : array_like, optional
             External soft weights, shape ``(nfreq,)`` or ``(ntime, nfreq)``.
+            Ignored if channel_weights is in params dict.
         initial_flags : array_like of bool, optional
             External hard flags, shape ``(nfreq,)`` or ``(ntime, nfreq)``.
+            Ignored if channel_weights is in params dict.
         rfi_regularization : float, default 1.0
             (Deprecated; kept for backward compatibility.)
         rfi_regularization_power : float, default 2.0
@@ -2844,6 +2869,7 @@ class Calibrator:
             target_reduced_chi2=target_reduced_chi2,
             reduced_chi2_check_every=reduced_chi2_check_every,
             check_every=check_every,
+            channel_weights=channel_weights,
             initial_channel_weights=initial_channel_weights,
             initial_flags=initial_flags,
             rfi_regularization=rfi_regularization,
