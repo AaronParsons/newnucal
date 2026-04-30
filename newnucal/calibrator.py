@@ -2290,7 +2290,13 @@ class Calibrator:
                 tag = 'AA' if used_aa else '  '
                 print(f"    [beam {tag} {state.n_beam - 1:03d}]: loss={loss:.4e}  eff={eff:.2e} frac_Δloss/s  step_gain={state.beam_acc.step_gain:.2f}")
 
-        state.params = {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params}
+        # Preserve log_ch_weights when updating params
+        state.params = {
+            'sky_coeffs': sky_coeffs,
+            'beam_coeffs': beam_coeffs,
+            'log_ch_weights': state.params.get('log_ch_weights', np.zeros((self.ntime, self.nfreq), dtype=DTYPE_R_NPY)),
+            **gain_params
+        }
         state.loss = float(loss)
         state.step += 1
 
@@ -2555,7 +2561,13 @@ class Calibrator:
                     line += f"  [AA improved: cand={joint_loss_cand:.4e} vs plain={joint_loss_plain:.4e}]"
                 print(line)
 
-        state.params = {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params}
+        # Preserve log_ch_weights when updating params
+        state.params = {
+            'sky_coeffs': sky_coeffs,
+            'beam_coeffs': beam_coeffs,
+            'log_ch_weights': state.params.get('log_ch_weights', np.zeros((self.ntime, self.nfreq), dtype=DTYPE_R_NPY)),
+            **gain_params
+        }
         state.loss = float(loss)
         state.step += 1
 
