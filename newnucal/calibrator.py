@@ -1622,7 +1622,7 @@ class Calibrator:
                     new_weights, diagnostics = fit_soft_channel_weights_closed_form_jax(
                         residual=resid,
                         inv_noise_var=np.asarray(self.inv_noise_var),
-                        prior_weights=base_weights,
+                        prior_weights=None,
                         regularization=regularization,
                         min_weight=min_weight,
                         max_weight=max_weight,
@@ -1631,7 +1631,7 @@ class Calibrator:
                     new_weights, diagnostics = fit_soft_channel_weights(
                         residual=resid,
                         inv_noise_var=np.asarray(self.inv_noise_var),
-                        prior_weights=base_weights,
+                        prior_weights=None,
                         regularization=regularization,
                         regularization_power=regularization_power,
                         min_weight=min_weight,
@@ -1643,7 +1643,7 @@ class Calibrator:
                     new_weights, diagnostics = fit_soft_channel_weights_jax(
                         residual=resid,
                         inv_noise_var=np.asarray(self.inv_noise_var),
-                        prior_weights=base_weights,
+                        prior_weights=None,
                         regularization=regularization,
                         regularization_power=regularization_power,
                         min_weight=min_weight,
@@ -1654,7 +1654,7 @@ class Calibrator:
                     new_weights, diagnostics = fit_soft_channel_weights(
                         residual=resid,
                         inv_noise_var=np.asarray(self.inv_noise_var),
-                        prior_weights=base_weights,
+                        prior_weights=None,
                         regularization=regularization,
                         regularization_power=regularization_power,
                         min_weight=min_weight,
@@ -1686,7 +1686,7 @@ class Calibrator:
         self,
         params,
         *,
-        sky_beam_reg: float = 1e-3,
+        sky_beam_reg: float = 1e-5,
         sky_anderson_history: int = 0,
         sky_aa_start: int = 2,
         sky_aa_damping: float = 0.5,
@@ -1781,7 +1781,7 @@ class Calibrator:
         self,
         params,
         *,
-        sky_beam_reg: float = 1e-3,
+        sky_beam_reg: float = 1e-5,
         joint_anderson_history: int = 0,
         joint_aa_start: int = 2,
         joint_aa_damping: float = 0.5,
@@ -2443,7 +2443,6 @@ class Calibrator:
 
         if rfi_enabled and not rfi_quota_exhausted and state.n_since_rfi >= rfi_max_every:
             cfg = s['rfi_config']
-            current_weights = state.channel_weights if state.channel_weights is not None else np.ones((self.ntime, self.nfreq), dtype=DTYPE_R_NPY)
             resid_jax = self.calibrated_residual_variable_beam(state.params)
             resid = np.asarray(jax.device_get(resid_jax))
             inv_var = np.asarray(jax.device_get(self.inv_noise_var))
@@ -2453,7 +2452,7 @@ class Calibrator:
                     new_weights, diag = fit_soft_channel_weights_closed_form_jax(
                         residual=resid,
                         inv_noise_var=inv_var,
-                        prior_weights=current_weights,
+                        prior_weights=None,
                         regularization=cfg['regularization'],
                         min_weight=cfg['min_weight'],
                         max_weight=cfg['max_weight'],
@@ -2463,7 +2462,7 @@ class Calibrator:
                     new_weights, diag = fit_soft_channel_weights(
                         residual=resid,
                         inv_noise_var=inv_var,
-                        prior_weights=current_weights,
+                        prior_weights=None,
                         regularization=cfg['regularization'],
                         regularization_power=cfg['regularization_power'],
                         min_weight=cfg['min_weight'],
@@ -2475,7 +2474,7 @@ class Calibrator:
                     new_weights, diag = fit_soft_channel_weights_jax(
                         residual=resid,
                         inv_noise_var=inv_var,
-                        prior_weights=current_weights,
+                        prior_weights=None,
                         regularization=cfg['regularization'],
                         regularization_power=cfg['regularization_power'],
                         min_weight=cfg['min_weight'],
@@ -2487,7 +2486,7 @@ class Calibrator:
                     new_weights, diag = fit_soft_channel_weights(
                         residual=resid,
                         inv_noise_var=inv_var,
-                        prior_weights=current_weights,
+                        prior_weights=None,
                         regularization=cfg['regularization'],
                         regularization_power=cfg['regularization_power'],
                         min_weight=cfg['min_weight'],
@@ -2509,7 +2508,7 @@ class Calibrator:
             })
             if verbose:
                 flagged_frac = float(np.mean(new_weights < 0.5))
-                print(f"    [rfi {state.n_rfi - 1:03d}]: loss={loss:.4e}  frac(w<0.5)={flagged_frac:.3f}")
+                print(f"    [rfi {state.n_rfi - 1:03d}]: frac(w<0.5)={flagged_frac:.3f}")
         else:
             state.n_since_rfi += 1
 
@@ -2634,7 +2633,7 @@ class Calibrator:
         self,
         params,
         n_iter: int = 30,
-        sky_beam_reg: float = 1e-3,
+        sky_beam_reg: float = 1e-5,
         joint_anderson_history: int = 0,
         joint_aa_start: int = 2,
         joint_aa_damping: float = 0.5,
