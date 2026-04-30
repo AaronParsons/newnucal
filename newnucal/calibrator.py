@@ -363,7 +363,7 @@ class Calibrator:
         self.rot_matrices = jnp.array(rot_matrices, dtype=DTYPE_R_JAX)
         self.data = jnp.array(data, dtype=DTYPE_C_JAX)
         self.bls = jnp.array(array.bls, dtype=DTYPE_R_JAX)
-        self.channel_weights = jnp.ones(self.data.shape[:2], dtype=DTYPE_R_JAX)
+        self.log_ch_weights = jnp.zeros(self.data.shape[:2], dtype=DTYPE_R_JAX)
         self.inv_noise_var = jnp.ones(self.data.shape[:2], dtype=DTYPE_R_JAX)
 
         self.A_sky = np.asarray(sky_model.A, dtype=DTYPE_R_NPY)  # (nfreq, nmodes)
@@ -498,7 +498,7 @@ class Calibrator:
         return out
 
     def _effective_weights(self):
-        return (self.channel_weights * self.inv_noise_var).astype(DTYPE_R_JAX)
+        return (jnp.exp(self.log_ch_weights) * self.inv_noise_var).astype(DTYPE_R_JAX)
 
     def _weighted_chi2(self, resid):
         """Weighted chi2 using the current channel_weights * inv_noise_var.
@@ -605,27 +605,28 @@ class Calibrator:
         return npar
 
 
-    def set_channel_weights(self, channel_weights=None):
-        """Set per-time/per-frequency soft reliability weights.
+    def set_channel_weights(self, log_ch_weights=None):
+        """Set per-time/per-frequency log-space soft reliability weights.
 
         Parameters
         ----------
-        channel_weights : array_like or None
-            Shape ``(ntime, nfreq)`` or ``(nfreq,)``. Values are clipped into
-            ``[0, 1]``. ``None`` restores unit weights.
+        log_ch_weights : array_like or None
+            Shape ``(ntime, nfreq)`` or ``(nfreq,)``. Log-space weights where
+            0 = weight 1.0 (no downweighting), -inf = weight 0. Values are clipped
+            to (-inf, 0]. ``None`` restores zero log-weights (unit weights).
         """
-        if channel_weights is None:
-            arr = jnp.ones(self.data.shape[:2], dtype=DTYPE_R_JAX)
+        if log_ch_weights is None:
+            arr = jnp.zeros(self.data.shape[:2], dtype=DTYPE_R_JAX)
         else:
-            arr = jnp.array(channel_weights, dtype=DTYPE_R_JAX)
+            arr = jnp.array(log_ch_weights, dtype=DTYPE_R_JAX)
             if arr.ndim == 1:
                 arr = jnp.broadcast_to(arr[None, :], self.data.shape[:2])
             elif arr.shape != self.data.shape[:2]:
                 raise ValueError(
-                    f"channel_weights must have shape {(self.ntime, self.nfreq)} "
+                    f"log_ch_weights must have shape {(self.ntime, self.nfreq)} "
                     f"or {(self.nfreq,)}, got {arr.shape}"
                 )
-        self.channel_weights = jnp.clip(arr, 0.0, 1.0).astype(DTYPE_R_JAX)
+        self.log_ch_weights = jnp.clip(arr, -jnp.inf, 0.0).astype(DTYPE_R_JAX)
 
     def set_inv_noise_var(self, inv_noise_var=None):
         """Set per-time/per-frequency inverse noise variance."""
@@ -680,7 +681,7 @@ class Calibrator:
             npar = self.estimate_num_params(params)
         else:
             npar = int(subtract_params)
-        dof = max(float(jnp.sum(self.channel_weights) * self.nbls) - npar, 1.0)
+        dof = max(float(jnp.sum(jnp.exp(self.log_ch_weights)) * self.nbls) - npar, 1.0)
         return float(chi2 / dof)
 
 
@@ -690,7 +691,7 @@ class Calibrator:
         return {
             'sky_coeffs':  jnp.zeros((npix_sky, nmodes_sky), dtype=DTYPE_R_JAX),
             'beam_coeffs': jnp.array(self.fwd.beam_coeffs),
-            'channel_weights': jnp.ones((self.ntime, self.nfreq), dtype=DTYPE_R_JAX),
+            'log_ch_weights': jnp.zeros((self.ntime, self.nfreq), dtype=DTYPE_R_JAX),
             **init_gain_params(self.ntime, self.nfreq),
         }
 
@@ -733,7 +734,7 @@ class Calibrator:
         sky_coeffs = self._ensure_sky_is_active(params['sky_coeffs'])
         vis_model = self._sim_fn(sky_coeffs, self.rot_matrices)
         resid = data_cal - vis_model
-        return resid * (self.channel_weights * self.inv_noise_var)[:, :, None].astype(DTYPE_C_JAX)
+        return resid * (jnp.exp(self.log_ch_weights) * self.inv_noise_var)[:, :, None].astype(DTYPE_C_JAX)
 
     def calibrated_residual_variable_beam(self, params):
         inv = self._invert_gains(params)
@@ -743,7 +744,7 @@ class Calibrator:
             sky_coeffs, params['beam_coeffs'], self.rot_matrices
         )
         resid = data_cal - vis_model
-        return resid * (self.channel_weights * self.inv_noise_var)[:, :, None].astype(DTYPE_C_JAX)
+        return resid * (jnp.exp(self.log_ch_weights) * self.inv_noise_var)[:, :, None].astype(DTYPE_C_JAX)
 
     def calibrated_residual_variable_beam_unweighted(self, params):
         """Gain-calibrated residual without channel_weights or inv_noise_var.
@@ -1758,7 +1759,7 @@ class Calibrator:
                     if verbose:
                         print(f'[rfi round {iround:02d}] target reduced chi^2 reached.')
                     break
-        return params, {'channel_weights': current_weights, 'history': history}
+        return params, {'log_ch_weights': current_weights, 'history': history}
 
 
 
@@ -1873,7 +1874,7 @@ class Calibrator:
         target_reduced_chi2: float | None = None,
         reduced_chi2_check_every: int = 1,
         check_every: int = 1,
-        channel_weights: np.ndarray | None = None,
+        log_ch_weights: np.ndarray | None = None,
         initial_channel_weights: np.ndarray | None = None,
         initial_flags: np.ndarray | None = None,
         rfi_regularization: float = 1.0,
@@ -1942,26 +1943,30 @@ class Calibrator:
 
         params_active = self._params_to_active_space(params)
 
-        # Initialize channel weights: priority is channel_weights parameter,
-        # then params['channel_weights'], then initial_channel_weights/initial_flags,
-        # then default to unity
-        if channel_weights is not None:
-            channel_weights_init = channel_weights
-        elif 'channel_weights' in params_active:
-            channel_weights_init = params_active['channel_weights']
+        # Initialize log-space channel weights: priority is log_ch_weights parameter,
+        # then params['log_ch_weights'], then initial_channel_weights/initial_flags,
+        # then default to zero log-space (weight 1.0)
+        if log_ch_weights is not None:
+            log_ch_weights_init = np.asarray(log_ch_weights, dtype=DTYPE_R_NPY)
+        elif 'log_ch_weights' in params_active:
+            log_ch_weights_init = np.asarray(params_active['log_ch_weights'], dtype=DTYPE_R_NPY)
         elif initial_channel_weights is not None or initial_flags is not None:
             cfg_tmp = {
                 'flagged_weight': rfi_flagged_weight,
             }
-            channel_weights_init = prepare_initial_channel_weights(
+            # prepare_initial_channel_weights returns direct-space weights (0 to 1)
+            direct_weights = prepare_initial_channel_weights(
                 ntime=self.ntime,
                 nfreq=self.nfreq,
                 initial_weights=initial_channel_weights,
                 initial_flags=initial_flags,
                 flagged_weight=cfg_tmp['flagged_weight'],
             )
+            # Convert to log space
+            log_ch_weights_init = np.log(np.clip(direct_weights, 1e-30, 1.0)).astype(DTYPE_R_NPY)
         else:
-            channel_weights_init = np.ones((self.ntime, self.nfreq), dtype=DTYPE_R_NPY)
+            # Default to zero log-space (exp(0) = 1.0)
+            log_ch_weights_init = np.zeros((self.ntime, self.nfreq), dtype=DTYPE_R_NPY)
 
         state = JointSkyBeamDirtyFitState(
             params={
@@ -1970,7 +1975,7 @@ class Calibrator:
                 'log_amp': params_active['log_amp'],
                 'phase': params_active['phase'],
                 'phi': params_active['phi'],
-                'channel_weights': np.asarray(channel_weights_init, dtype=DTYPE_R_NPY),
+                'log_ch_weights': log_ch_weights_init,
             },
             settings=dict(
                 sky_beam_reg=sky_beam_reg,
@@ -2004,7 +2009,7 @@ class Calibrator:
         )
 
         # Sync channel weights to the calibrator instance
-        self.set_channel_weights(state.params['channel_weights'])
+        self.set_channel_weights(state.params['log_ch_weights'])
 
         # Store full input params for later expansion to full-sky
         state.settings['params_input_full'] = params
@@ -2573,10 +2578,11 @@ class Calibrator:
             # Use local chi-squared exponential weighting: detect channels that are
             # outliers relative to their neighbors in chi² space (log scale).
             # No spectral basis required; purely data-driven local outlier detection.
-            old_weights_tf = np.asarray(state.params['channel_weights'])
-            old_weights_f = old_weights_tf[0, :] if old_weights_tf.ndim > 1 else old_weights_tf
+            # RFI fitter works in direct space (0 to 1); convert log → direct → log.
+            old_log_weights_tf = np.asarray(state.params['log_ch_weights'])
+            old_weights_f = np.exp(old_log_weights_tf[0, :] if old_log_weights_tf.ndim > 1 else old_log_weights_tf)
 
-            new_weights, diag = fit_channel_weights_local_chi2_exponential(
+            new_weights_direct, diag = fit_channel_weights_local_chi2_exponential(
                 residual=resid,
                 inv_noise_var=inv_var,
                 old_weights=old_weights_f,
@@ -2591,8 +2597,10 @@ class Calibrator:
                 max_drop_per_update=cfg.get('max_drop', 0.20),
             )
 
-            state.params['channel_weights'] = new_weights
-            self.set_channel_weights(new_weights)
+            # Convert direct space (0 to 1) weights back to log space (-inf to 0)
+            new_log_weights = np.log(np.clip(new_weights_direct, 1e-30, 1.0))
+            state.params['log_ch_weights'] = new_log_weights
+            self.set_channel_weights(new_log_weights)
             state.n_rfi += 1
             state.n_since_rfi = 0
             state.n_since_joint += 1
@@ -2745,7 +2753,7 @@ class Calibrator:
         reduced_chi2_check_every: int = 1,
         subtract_static_sky: bool = False,
         check_every: int = 1,
-        channel_weights: np.ndarray | None = None,
+        log_ch_weights: np.ndarray | None = None,
         initial_channel_weights: np.ndarray | None = None,
         initial_flags: np.ndarray | None = None,
         rfi_regularization: float = 1.0,
@@ -2869,7 +2877,7 @@ class Calibrator:
             target_reduced_chi2=target_reduced_chi2,
             reduced_chi2_check_every=reduced_chi2_check_every,
             check_every=check_every,
-            channel_weights=channel_weights,
+            log_ch_weights=log_ch_weights,
             initial_channel_weights=initial_channel_weights,
             initial_flags=initial_flags,
             rfi_regularization=rfi_regularization,
