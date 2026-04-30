@@ -510,3 +510,156 @@ def fit_soft_channel_weights_thresholded(
         'method': 'thresholded_logistic_excess',
     }
     return weights_tf, diagnostics
+
+
+def fit_channel_weights_dof_conservative(
+    *,
+    residual: np.ndarray,
+    A: np.ndarray,
+    inv_noise_var: np.ndarray | None = None,
+    old_weights: np.ndarray | None = None,
+    prior_weights: np.ndarray | None = None,
+    min_weight: float = 0.25,
+    max_weight: float = 1.0,
+    threshold: float = 3.0,
+    softness: float = 3.0,
+    leverage_floor: float = 0.05,
+    alpha_down: float = 0.10,
+    alpha_up: float = 0.70,
+    max_drop_per_update: float = 0.10,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Conservative DoF-aware spectral-inconsistency channel weights.
+
+    Only downweight channels when removing them costs very little information
+    about the spectrally smooth model but removes statistically significant
+    out-of-subspace residual power. Uses spectral leverage (from the hat matrix)
+    to distinguish high-residual channels that the model depends on from those
+    it doesn't.
+
+    Parameters
+    ----------
+    residual : np.ndarray, shape (ntime, nfreq, nbls)
+        Unweighted gain-calibrated residuals.
+    A : np.ndarray, shape (nfreq, nmodes)
+        Spectral model basis (e.g., DPSS sky or beam basis).
+    inv_noise_var : np.ndarray, optional
+        Inverse variance per channel, shape (nfreq,) or (ntime, nfreq).
+    old_weights : np.ndarray, optional
+        Current per-frequency weights for asymmetric smoothing, shape (nfreq,).
+    prior_weights : np.ndarray, optional
+        Upper bound on weights (e.g., from flagging), shape (nfreq,) or (ntime, nfreq).
+    min_weight : float, default 0.25
+        Minimum allowed weight (conservative: 0.25 instead of 0.01).
+    max_weight : float, default 1.0
+        Maximum allowed weight.
+    threshold : float, default 3.0
+        Statistic threshold for downweighting (in units of median residual_dof).
+        Only channels with z > threshold are downweighted. Conservative default.
+    softness : float, default 3.0
+        Steepness of logistic transition (larger = gentler).
+    leverage_floor : float, default 0.05
+        Minimum effective residual DoF (prevents division by zero).
+    alpha_down : float, default 0.10
+        Asymmetric smoothing: slow downweighting (requires repeated evidence).
+    alpha_up : float, default 0.70
+        Asymmetric smoothing: fast upweighting/recovery.
+    max_drop_per_update : float, default 0.10
+        Maximum weight drop allowed in a single update (prevents overshooting).
+
+    Returns
+    -------
+    weights : np.ndarray, shape (ntime, nfreq)
+        Fitted soft channel weights (broadcast across time).
+    diagnostics : dict
+        Contains 'leverage_f', 'residual_dof_f', 'hp_power_f', 'z_f',
+        'target_weights_f', 'weights_f', and method identifier.
+    """
+    residual = np.asarray(residual)
+    A = np.asarray(A)
+
+    ntime, nfreq, nbls = residual.shape
+
+    if inv_noise_var is None:
+        inv_noise_var = np.ones((ntime, nfreq), dtype=DTYPE_R)
+    else:
+        inv_noise_var = _as_tf(inv_noise_var, ntime, nfreq, fill_value=1.0)
+
+    if old_weights is None:
+        old_weights = np.ones(nfreq, dtype=DTYPE_R)
+    else:
+        old_weights = np.asarray(old_weights, dtype=DTYPE_R)
+        if old_weights.ndim == 2:
+            old_weights = np.median(old_weights, axis=0)
+
+    if prior_weights is None:
+        upper = np.full(nfreq, max_weight, dtype=DTYPE_R)
+    else:
+        prior_weights = np.asarray(prior_weights, dtype=DTYPE_R)
+        if prior_weights.ndim == 2:
+            upper = prior_weights[0, :]
+        else:
+            upper = prior_weights
+        upper = np.clip(upper, min_weight, max_weight)
+
+    # Spectral projection and complement
+    # P = A (A^T A)^{-1} A^T projects onto the span of A
+    # Q = I - P projects onto the orthogonal complement
+    G = A.T @ A
+    P = A @ np.linalg.pinv(G, rcond=1e-8) @ A.T
+    Q = np.eye(nfreq, dtype=DTYPE_R) - P
+
+    # Leverage: h_f = P_ff tells how much channel f is needed by the model
+    # Residual DoF: (1 - h_f) tells how much independent residual DoF remains
+    h = np.clip(np.diag(P), 0.0, 1.0).astype(DTYPE_R)
+    residual_dof = np.maximum(1.0 - h, leverage_floor).astype(DTYPE_R)
+
+    # High-pass spectral residual: component not supported by smooth basis
+    # r_hp = Q @ residual (per time/baseline/frequency)
+    r_hp = np.einsum("fg,tgb->tfb", Q, residual)
+
+    # Whitened high-pass residual power per frequency (median over time)
+    hp_power_tf = np.mean(np.abs(r_hp) ** 2, axis=2) * inv_noise_var
+    hp_power_f = np.median(hp_power_tf, axis=0).astype(DTYPE_R)
+
+    # DoF-normalized out-of-subspace statistic
+    # z_f = hp_power_f / residual_dof_f
+    z = hp_power_f / residual_dof
+    z = z / np.maximum(np.median(z), 1e-30)
+
+    # Conservative threshold: only act on clear outliers (z > 3 is ~5-sigma)
+    excess = np.maximum(z - threshold, 0.0)
+    target = 1.0 / (1.0 + excess / softness)
+
+    # Information-cost correction: high-leverage channels are harder to downweight
+    # Channels that contribute strongly to the model should require strong evidence
+    # before being downweighted
+    info_cost = h / np.maximum(np.median(h), 1e-6)
+    target = 1.0 - (1.0 - target) / (1.0 + info_cost)
+
+    target = np.clip(target, min_weight, upper).astype(DTYPE_R)
+
+    # Asymmetric temporal smoothing
+    # Downweighting is slow (requires repeated evidence)
+    # Upweighting/recovery is fast (once the outlier goes away)
+    alpha = np.where(target < old_weights, alpha_down, alpha_up)
+    w = (1.0 - alpha) * old_weights + alpha * target
+
+    # Limit how far a channel can fall in a single update
+    w = np.maximum(w, old_weights - max_drop_per_update)
+    w = np.clip(w, min_weight, upper).astype(DTYPE_R)
+
+    # Broadcast to (ntime, nfreq)
+    weights_tf = np.broadcast_to(w[None, :], (ntime, nfreq)).copy().astype(DTYPE_R)
+
+    diagnostics = {
+        "method": "dof_conservative_spectral_complement",
+        "leverage_f": h,
+        "residual_dof_f": residual_dof,
+        "hp_power_f": hp_power_f,
+        "z_f": z,
+        "target_weights_f": target,
+        "weights_f": w,
+        "threshold": threshold,
+        "softness": softness,
+    }
+    return weights_tf, diagnostics
