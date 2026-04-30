@@ -24,6 +24,7 @@ from .rfi import (
     fit_soft_channel_weights_closed_form_jax,
     fit_soft_channel_weights_thresholded,
     fit_channel_weights_dof_conservative,
+    fit_channel_weights_local_chi2_exponential,
 )
 from .utils import DTYPE_R_JAX, DTYPE_R_NPY, DTYPE_C_JAX
 
@@ -1875,15 +1876,15 @@ class Calibrator:
         initial_flags: np.ndarray | None = None,
         rfi_regularization: float = 1.0,
         rfi_regularization_power: float = 2.0,
-        rfi_min_weight: float = 0.25,
+        rfi_min_weight: float = 0.05,
         rfi_max_weight: float = 1.0,
         rfi_flagged_weight: float = 0.05,
-        rfi_threshold: float = 3.0,
-        rfi_softness: float = 3.0,
-        rfi_leverage_floor: float = 0.05,
-        rfi_alpha_down: float = 0.10,
-        rfi_alpha_up: float = 0.70,
-        rfi_max_drop: float = 0.10,
+        rfi_smooth_width_chans: int = 17,
+        rfi_threshold_ratio: float = 3.0,
+        rfi_gamma: float = 0.75,
+        rfi_alpha_down: float = 0.20,
+        rfi_alpha_up: float = 0.75,
+        rfi_max_drop: float = 0.20,
         max_rfi_updates: int | None = None,
     ):
         """Create a persistent state for resumable joint sky/beam dirty fits.
@@ -1905,24 +1906,24 @@ class Calibrator:
             (Deprecated; kept for backward compatibility.)
         rfi_regularization_power : float, default 2.0
             (Deprecated; kept for backward compatibility.)
-        rfi_min_weight : float, default 0.25
-            Minimum allowed channel weight (conservative default).
+        rfi_min_weight : float, default 0.05
+            Minimum allowed channel weight.
         rfi_max_weight : float, default 1.0
             Maximum allowed channel weight.
         rfi_flagged_weight : float, default 0.05
             Weight assigned to initially flagged channels.
-        rfi_threshold : float, default 3.0
-            DoF-normalized statistic threshold for downweighting.
-        rfi_softness : float, default 3.0
-            Steepness of logistic transition (larger = gentler).
-        rfi_leverage_floor : float, default 0.05
-            Minimum effective residual DoF per channel.
-        rfi_alpha_down : float, default 0.10
+        rfi_smooth_width_chans : int, default 17
+            Width of local chi² baseline filter.
+        rfi_threshold_ratio : float, default 3.0
+            Threshold chi² ratio for downweighting.
+        rfi_gamma : float, default 0.75
+            Exponential decay rate for downweighting.
+        rfi_alpha_down : float, default 0.20
             Asymmetric smoothing: slow downweighting.
-        rfi_alpha_up : float, default 0.70
+        rfi_alpha_up : float, default 0.75
             Asymmetric smoothing: fast upweighting/recovery.
-        rfi_max_drop : float, default 0.10
-            Maximum weight drop allowed in a single update.
+        rfi_max_drop : float, default 0.20
+            Maximum weight drop per update.
         max_rfi_updates : int, optional
             Maximum number of RFI weight updates to perform. If None, updates
             continue throughout the fit.
@@ -1954,9 +1955,9 @@ class Calibrator:
                     'min_weight': rfi_min_weight,
                     'max_weight': rfi_max_weight,
                     'flagged_weight': rfi_flagged_weight,
-                    'threshold': rfi_threshold,
-                    'softness': rfi_softness,
-                    'leverage_floor': rfi_leverage_floor,
+                    'smooth_width_chans': rfi_smooth_width_chans,
+                    'threshold_ratio': rfi_threshold_ratio,
+                    'gamma': rfi_gamma,
                     'alpha_down': rfi_alpha_down,
                     'alpha_up': rfi_alpha_up,
                     'max_drop': rfi_max_drop,
@@ -2549,29 +2550,28 @@ class Calibrator:
             resid = np.asarray(jax.device_get(resid_jax))
             inv_var = np.asarray(jax.device_get(self.inv_noise_var))
 
-            # Use DoF-aware conservative weighting: only downweight channels with
-            # high out-of-subspace power AND low leverage (i.e., the model doesn't need them).
-            # Extract per-frequency old weights for smoothing
+            # Use local chi-squared exponential weighting: detect channels that are
+            # outliers relative to their neighbors in chi² space (log scale).
+            # No spectral basis required; purely data-driven local outlier detection.
             if state.channel_weights is not None:
                 old_weights_tf = np.asarray(state.channel_weights)
                 old_weights_f = old_weights_tf[0, :]
             else:
                 old_weights_f = np.ones(self.nfreq, dtype=DTYPE_R_NPY)
 
-            new_weights, diag = fit_channel_weights_dof_conservative(
+            new_weights, diag = fit_channel_weights_local_chi2_exponential(
                 residual=resid,
-                A=np.asarray(self.A_sky),  # Use sky basis for spectral structure
                 inv_noise_var=inv_var,
                 old_weights=old_weights_f,
                 prior_weights=None,
-                min_weight=cfg.get('min_weight_dof', cfg['min_weight']),
+                min_weight=cfg.get('min_weight', 0.05),
                 max_weight=cfg['max_weight'],
-                threshold=cfg.get('threshold', 3.0),
-                softness=cfg.get('softness', 3.0),
-                leverage_floor=cfg.get('leverage_floor', 0.05),
-                alpha_down=cfg.get('alpha_down', 0.10),
-                alpha_up=cfg.get('alpha_up', 0.70),
-                max_drop_per_update=cfg.get('max_drop', 0.10),
+                smooth_width_chans=cfg.get('smooth_width_chans', 17),
+                threshold_ratio=cfg.get('threshold_ratio', 3.0),
+                gamma=cfg.get('gamma', 0.75),
+                alpha_down=cfg.get('alpha_down', 0.20),
+                alpha_up=cfg.get('alpha_up', 0.75),
+                max_drop_per_update=cfg.get('max_drop', 0.20),
             )
 
             state.channel_weights = new_weights
@@ -2732,15 +2732,15 @@ class Calibrator:
         initial_flags: np.ndarray | None = None,
         rfi_regularization: float = 1.0,
         rfi_regularization_power: float = 2.0,
-        rfi_min_weight: float = 0.25,
+        rfi_min_weight: float = 0.05,
         rfi_max_weight: float = 1.0,
         rfi_flagged_weight: float = 0.05,
-        rfi_threshold: float = 3.0,
-        rfi_softness: float = 3.0,
-        rfi_leverage_floor: float = 0.05,
-        rfi_alpha_down: float = 0.10,
-        rfi_alpha_up: float = 0.70,
-        rfi_max_drop: float = 0.10,
+        rfi_smooth_width_chans: int = 17,
+        rfi_threshold_ratio: float = 3.0,
+        rfi_gamma: float = 0.75,
+        rfi_alpha_down: float = 0.20,
+        rfi_alpha_up: float = 0.75,
+        rfi_max_drop: float = 0.20,
         max_rfi_updates: int | None = None,
         verbose: bool = False,
         _stop_flag=None,
@@ -2754,11 +2754,10 @@ class Calibrator:
 
         Parameters are always returned in full-sky format.
 
-        RFI weighting uses a DoF-conservative spectral-inconsistency criterion:
-        only downweight channels that contain high out-of-subspace residual power
-        (inconsistent with the smooth spectral model) AND have low leverage
-        (the model doesn't depend on them). This avoids aggressively downweighting
-        high-leverage channels that are genuinely needed to fit the model.
+        RFI weighting detects local chi-squared outliers in log space and
+        downweights exponentially. A median+Gaussian filter estimates the local
+        chi² trend; channels with chi² > threshold_ratio * local_trend are
+        downweighted exponentially as w = exp(-gamma * log_excess).
 
         Parameters
         ----------
@@ -2807,25 +2806,24 @@ class Calibrator:
             (Deprecated; kept for backward compatibility.)
         rfi_regularization_power : float, default 2.0
             (Deprecated; kept for backward compatibility.)
-        rfi_min_weight : float, default 0.25
-            Minimum allowed channel weight (conservative default).
+        rfi_min_weight : float, default 0.05
+            Minimum allowed channel weight.
         rfi_max_weight : float, default 1.0
             Maximum allowed channel weight.
         rfi_flagged_weight : float, default 0.05
             Weight assigned to initially flagged channels.
-        rfi_threshold : float, default 3.0
-            DoF-normalized statistic threshold for downweighting. Only channels with
-            z > threshold are downweighted. Default 3.0 is conservative (~5-sigma).
-        rfi_softness : float, default 3.0
-            Steepness of logistic transition (larger = gentler downweighting).
-        rfi_leverage_floor : float, default 0.05
-            Minimum effective residual DoF per channel (prevents division by zero).
-        rfi_alpha_down : float, default 0.10
-            Asymmetric smoothing: slow downweighting (requires repeated evidence).
-        rfi_alpha_up : float, default 0.70
-            Asymmetric smoothing: fast upweighting/recovery.
-        rfi_max_drop : float, default 0.10
-            Maximum weight drop allowed in a single update.
+        rfi_smooth_width_chans : int, default 17
+            Width of median+Gaussian filter for local chi² baseline (must be odd).
+        rfi_threshold_ratio : float, default 3.0
+            Threshold chi² ratio above which downweighting begins.
+        rfi_gamma : float, default 0.75
+            Exponential decay rate: w = exp(-gamma * log_excess).
+        rfi_alpha_down : float, default 0.20
+            Asymmetric smoothing: slower downweighting (requires repeated evidence).
+        rfi_alpha_up : float, default 0.75
+            Asymmetric smoothing: faster upweighting/recovery.
+        rfi_max_drop : float, default 0.20
+            Maximum weight drop allowed in a single RFI update.
         max_rfi_updates : int, optional
             Maximum number of RFI weight updates to perform. If None, updates
             continue throughout the fit. Consider ``max_rfi_updates=5`` to stop
@@ -2853,9 +2851,9 @@ class Calibrator:
             rfi_min_weight=rfi_min_weight,
             rfi_max_weight=rfi_max_weight,
             rfi_flagged_weight=rfi_flagged_weight,
-            rfi_threshold=rfi_threshold,
-            rfi_softness=rfi_softness,
-            rfi_leverage_floor=rfi_leverage_floor,
+            rfi_smooth_width_chans=rfi_smooth_width_chans,
+            rfi_threshold_ratio=rfi_threshold_ratio,
+            rfi_gamma=rfi_gamma,
             rfi_alpha_down=rfi_alpha_down,
             rfi_alpha_up=rfi_alpha_up,
             rfi_max_drop=rfi_max_drop,
