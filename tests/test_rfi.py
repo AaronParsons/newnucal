@@ -3,8 +3,7 @@ import numpy as np
 from newnucal.rfi import (
     prepare_initial_channel_weights,
     channel_chi2_statistic,
-    fit_soft_channel_weights,
-    fit_soft_channel_weights_jax,
+    fit_channel_weights_local_chi2_exponential,
 )
 
 
@@ -44,86 +43,74 @@ def test_channel_chi2_statistic_matches_expected_whitened_power():
     np.testing.assert_allclose(chi2[:, 3], 0.0)
 
 
-def test_fit_soft_channel_weights_respects_prior_bounds():
+def test_fit_channel_weights_local_chi2_exponential_detects_outliers():
+    """Verify local chi² exponential approach detects and downweights outliers."""
     rng = np.random.default_rng(0)
     ntime, nfreq, nbls = 4, 8, 3
     resid = (0.01 * rng.normal(size=(ntime, nfreq, nbls))
              + 1j * 0.01 * rng.normal(size=(ntime, nfreq, nbls))).astype(np.complex64)
-    # Inject one clearly bad channel across all times/baselines.
-    resid[:, 3, :] += 5.0 + 3.0j
+    # Inject one clearly bad channel (very strong outlier in chi²)
+    resid[:, 3, :] += 20.0 + 15.0j
 
-    # Prior weights from external flagging: act as upper bound caps
-    prior = np.ones((ntime, nfreq), dtype=np.float32) * 0.5
-    prior[:, 6] = 0.1  # channel 6 is more aggressively flagged
-
-    weights, diag = fit_soft_channel_weights(
+    weights, diag = fit_channel_weights_local_chi2_exponential(
         residual=resid,
         inv_noise_var=np.ones((ntime, nfreq), dtype=np.float32),
-        prior_weights=prior,
-        regularization=1.0,
-        regularization_power=2.0,
-        min_weight=0.01,
+        old_weights=np.ones(nfreq, dtype=np.float32),
+        prior_weights=None,
+        min_weight=0.05,
         max_weight=1.0,
+        smooth_width_chans=5,
+        threshold_ratio=2.0,
+        gamma=1.0,
+        alpha_down=0.30,
+        alpha_up=0.75,
+        max_drop_per_update=0.50,
     )
 
     assert weights.shape == (ntime, nfreq)
-    assert diag["residual_power_f"].shape == (nfreq,)
-
-    # Prior acts as upper bound: no weight should exceed prior
-    assert np.all(weights <= prior + 1e-6), "Weights must not exceed prior bounds"
+    assert "chi2_f" in diag
+    assert "log_ratio_f" in diag
+    assert "weights_f" in diag
 
     # All weights should be in valid range
-    assert np.all(weights >= 0.01)  # min_weight
+    assert np.all(weights >= 0.05)  # min_weight
     assert np.all(weights <= 1.0)   # max_weight
 
-    # Hard-flagged channel should be at or below its prior
-    w_channel6 = float(np.mean(weights[:, 6]))
-    assert w_channel6 <= prior[0, 6] + 1e-6
-
-    # Bad channel (3) should be downweighted
+    # Bad channel (3) should be downweighted compared to normal channels
     w_channel3 = float(np.mean(weights[:, 3]))
-    assert w_channel3 < 0.4
+    # Normal channels should retain higher weight
+    normal_weights = [np.mean(weights[:, i]) for i in [0, 1, 2, 4, 5, 6, 7]]
+    avg_normal = np.mean(normal_weights)
+    assert w_channel3 < avg_normal, f"Expected bad channel ({w_channel3:.3f}) to be lower than normal ({avg_normal:.3f})"
 
-    # Diagnostics should be valid
-    assert diag["optimization_success"]
 
-
-def test_fit_soft_channel_weights_jax_produces_valid_weights():
-    """Verify JAX version produces valid, reasonable weights."""
+def test_fit_channel_weights_local_chi2_exponential_respects_min_max():
+    """Verify weights stay within min/max bounds."""
     rng = np.random.default_rng(42)
-    ntime, nfreq, nbls = 4, 8, 3
+    ntime, nfreq, nbls = 3, 6, 3
     resid = (0.01 * rng.normal(size=(ntime, nfreq, nbls))
              + 1j * 0.01 * rng.normal(size=(ntime, nfreq, nbls))).astype(np.complex64)
-    # Inject one clearly bad channel across all times/baselines.
-    resid[:, 3, :] += 5.0 + 3.0j
+    # Make all channels very bad
+    resid[:, :, :] += 10.0 + 5.0j
 
-    prior = np.ones((ntime, nfreq), dtype=np.float32) * 0.5
-    prior[:, 6] = 0.1
+    min_w = 0.10
+    max_w = 0.95
 
-    # Run JAX version
-    weights_jax, diag_jax = fit_soft_channel_weights_jax(
+    weights, _ = fit_channel_weights_local_chi2_exponential(
         residual=resid,
         inv_noise_var=np.ones((ntime, nfreq), dtype=np.float32),
-        prior_weights=prior,
-        regularization=1.0,
-        regularization_power=2.0,
-        min_weight=0.01,
-        max_weight=1.0,
-        use_jax=True,
+        old_weights=np.ones(nfreq, dtype=np.float32),
+        prior_weights=None,
+        min_weight=min_w,
+        max_weight=max_w,
+        smooth_width_chans=3,
+        threshold_ratio=2.0,
+        gamma=0.75,
+        alpha_down=0.20,
+        alpha_up=0.75,
+        max_drop_per_update=0.20,
     )
 
-    # Convert JAX arrays to NumPy for inspection
-    weights_jax_np = np.asarray(weights_jax)
-
-    # Check that weights are valid
-    assert weights_jax_np.shape == (ntime, nfreq)
-    assert np.all(weights_jax_np >= 0.01)
-    assert np.all(weights_jax_np <= 1.0)
-    # Check that prior is respected
-    assert np.all(weights_jax_np <= prior + 1e-6)
-    # Check that bad channel is downweighted
-    assert float(np.mean(weights_jax_np[:, 3])) < 0.4
-    # Check that diagnostics are present
-    assert "final_loss" in diag_jax
-    assert "num_iterations" in diag_jax
-    assert diag_jax["num_iterations"] > 0
+    # Check bounds are respected
+    assert np.all(weights >= min_w - 1e-6), f"Weights below min: {np.min(weights)}"
+    assert np.all(weights <= max_w + 1e-6), f"Weights above max: {np.max(weights)}"

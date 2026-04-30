@@ -165,12 +165,14 @@ class TestRFIWeightedCalibrator:
         data[:, 2, :] += 50.0 + 0.0j
         cal.data = jnp.array(data, dtype=jnp.complex64)
 
-        cal.set_channel_weights(np.ones((cal.ntime, cal.nfreq), dtype=np.float32))
+        # set_channel_weights now expects log-space values (0 = no downweighting)
+        cal.set_channel_weights(np.zeros((cal.ntime, cal.nfreq), dtype=np.float32))
         loss_full = cal.calc_loss(params)
 
-        weights = np.ones((cal.ntime, cal.nfreq), dtype=np.float32)
-        weights[:, 2] = 0.01
-        cal.set_channel_weights(weights)
+        # Create weights in log-space: weight 0.01 = log(0.01) ≈ -4.605
+        log_weights = np.zeros((cal.ntime, cal.nfreq), dtype=np.float32)
+        log_weights[:, 2] = np.log(0.01)
+        cal.set_channel_weights(log_weights)
         loss_downweighted = cal.calc_loss(params)
 
         assert loss_downweighted < 0.05 * loss_full
@@ -200,75 +202,41 @@ class TestRFIWeightedCalibrator:
         red_chi2 = cal.calc_reduced_chi2(params, explicit_beam=True)
         assert 0.7 < red_chi2 < 1.3, f"Expected reduced chi2 near 1, got {red_chi2:.3f}"
 
-    def test_fit_with_rfi_reweighting_updates_weights_and_tracks_history(self, calibrator_rfi_setup, monkeypatch):
-        cal, params = calibrator_rfi_setup
-        data = np.array(cal.data)
-        # Inject narrowband contamination in one channel across all baselines/times.
-        data[:, 1, :] += 20.0 + 10.0j
-        cal.data = jnp.array(data, dtype=jnp.complex64)
-
-        # Dummy fitter: keep parameters fixed and return the current weighted loss.
-        def _dummy_fit(p, **kwargs):
-            return p, cal.calc_loss(p, explicit_beam=True)
-
-        monkeypatch.setattr(cal, 'dummy_fit', _dummy_fit, raising=False)
-
-        init_w = np.ones((cal.ntime, cal.nfreq), dtype=np.float32)
-
-        params_out, state = cal.fit_with_rfi_reweighting(
-            params,
-            initial_channel_weights=init_w,
-            inv_noise_var=np.ones((cal.ntime, cal.nfreq), dtype=np.float32),
-            n_rounds=2,
-            fit_method='dummy_fit',
-            fit_kwargs={},
-            flagged_weight=0.05,
-            regularization=1.0,
-            regularization_power=2.0,
-            min_weight=0.01,
-            max_weight=1.0,
-            verbose=False,
-        )
-
-        assert params_out.keys() == params.keys()
-        assert 'channel_weights' in state
-        assert 'history' in state
-        assert len(state['history']) == 2
-        assert state['channel_weights'].shape == (cal.ntime, cal.nfreq)
-        # The contaminated channel should be strongly downweighted.
-        assert float(np.mean(state['channel_weights'][:, 1])) < 0.2
-        # Calibrator should retain the final weights internally too.
-        np.testing.assert_allclose(np.asarray(cal.channel_weights), state['channel_weights'])
-
     def test_fit_joint_sky_beam_dirty_with_rfi_reweighting(self, calibrator_rfi_setup):
         cal, params = calibrator_rfi_setup
         data = np.array(cal.data)
         data[:, 2, :] += 50.0 + 0.0j
         cal.data = jnp.array(data, dtype=jnp.complex64)
 
-        # Start with prior weights that allow downweighting
+        # Start with prior weights (in direct space) and convert to log-space
         init_w = np.ones((cal.ntime, cal.nfreq), dtype=np.float32) * 0.5
+        log_init_w = np.log(np.clip(init_w, 1e-30, 1.0))
+        
         params_out, loss_out = cal.fit_joint_sky_beam_dirty(
             params,
             n_iter=5,
             solve_every={'gains': 1, 'rfi': 2},
-            initial_channel_weights=init_w,
+            log_ch_weights=log_init_w,
             rfi_regularization=1.0,
             rfi_regularization_power=2.0,
-            rfi_min_weight=0.01,
-            rfi_max_weight=1.0,
+            rfi_log_min_weight=np.log(0.01),
+            rfi_log_max_weight=0.0,
             max_rfi_updates=2,
             verbose=False,
         )
 
-        assert params_out.keys() == params.keys()
+        # params_out now includes 'log_ch_weights' which is tracked in the fit
+        expected_keys = set(params.keys()) | {'log_ch_weights'}
+        assert set(params_out.keys()) == expected_keys
         assert loss_out < float(cal.calc_loss(params))
-        # Weights should have been updated
-        assert cal.channel_weights is not None
-        assert cal.channel_weights.shape == (cal.ntime, cal.nfreq)
-        # Weights should be in valid range
-        assert np.all(cal.channel_weights >= 0.01)
-        assert np.all(cal.channel_weights <= 1.0)
+        # Weights should have been updated and are in params_out
+        assert 'log_ch_weights' in params_out
+        log_ch_weights = np.asarray(params_out['log_ch_weights'])
+        assert log_ch_weights.shape == (cal.ntime, cal.nfreq)
+        # Weights should be in valid range (in direct space)
+        ch_weights = np.exp(log_ch_weights)
+        assert np.all(ch_weights >= 0.01)
+        assert np.all(ch_weights <= 1.0)
 
 
 @pytest.fixture
