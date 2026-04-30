@@ -493,6 +493,9 @@ class Calibrator:
         # Beam coeffs are never masked (pass through as-is)
         out['beam_coeffs'] = params_active.get('beam_coeffs')
 
+        # Log-space channel weights (pass through as-is)
+        out['log_ch_weights'] = params_active.get('log_ch_weights')
+
         for key in self._GAIN_PARAM_KEYS:
             out[key] = params_active.get(key)
         return out
