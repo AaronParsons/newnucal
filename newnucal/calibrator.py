@@ -1878,19 +1878,17 @@ class Calibrator:
         reduced_chi2_check_every: int = 1,
         check_every: int = 1,
         log_ch_weights: np.ndarray | None = None,
-        initial_channel_weights: np.ndarray | None = None,
-        initial_flags: np.ndarray | None = None,
         rfi_regularization: float = 1.0,
         rfi_regularization_power: float = 2.0,
-        rfi_min_weight: float = 0.05,
-        rfi_max_weight: float = 1.0,
-        rfi_flagged_weight: float = 0.05,
+        rfi_log_min_weight: float = np.log(0.05),
+        rfi_log_max_weight: float = 0.0,
+        rfi_log_flagged_weight: float = np.log(0.05),
         rfi_smooth_width_chans: int = 17,
-        rfi_threshold_ratio: float = 3.0,
+        rfi_log_threshold: float = np.log(3.0),
         rfi_gamma: float = 0.75,
         rfi_alpha_down: float = 0.20,
         rfi_alpha_up: float = 0.75,
-        rfi_max_drop: float = 0.20,
+        rfi_log_max_drop: float = np.log(0.8),
         max_rfi_updates: int | None = None,
     ):
         """Create a persistent state for resumable joint sky/beam dirty fits.
@@ -1904,17 +1902,10 @@ class Calibrator:
             Compare Anderson acceleration vs plain step every N iterations.
             Set to >1 to skip AA evaluation on non-checkpoint steps for speed,
             using the same decision from the last checkpoint.
-        channel_weights : array_like, optional
-            Per-frequency soft channel weights, shape ``(nfreq,)`` or ``(ntime, nfreq)``.
-            If supplied, overrides initial_channel_weights and initial_flags.
-            If not supplied and neither initial_channel_weights nor initial_flags are
-            provided, defaults to unity weighting.
-        initial_channel_weights : array_like, optional
-            External soft weights, shape ``(nfreq,)`` or ``(ntime, nfreq)``.
-            Ignored if channel_weights is provided.
-        initial_flags : array_like of bool, optional
-            External hard flags, shape ``(nfreq,)`` or ``(ntime, nfreq)``.
-            Ignored if channel_weights is provided.
+        log_ch_weights : array_like, optional
+            Per-frequency soft channel weights in log space, shape ``(nfreq,)`` or
+            ``(ntime, nfreq)``. If supplied, overrides any log_ch_weights in params dict.
+            If not supplied and not in params, defaults to zero log-space (unity weighting).
         rfi_regularization : float, default 1.0
             (Deprecated; kept for backward compatibility.)
         rfi_regularization_power : float, default 2.0
@@ -1947,26 +1938,11 @@ class Calibrator:
         params_active = self._params_to_active_space(params)
 
         # Initialize log-space channel weights: priority is log_ch_weights parameter,
-        # then params['log_ch_weights'], then initial_channel_weights/initial_flags,
-        # then default to zero log-space (weight 1.0)
+        # then params['log_ch_weights'], then default to zero log-space (weight 1.0)
         if log_ch_weights is not None:
             log_ch_weights_init = np.asarray(log_ch_weights, dtype=DTYPE_R_NPY)
         elif 'log_ch_weights' in params_active:
             log_ch_weights_init = np.asarray(params_active['log_ch_weights'], dtype=DTYPE_R_NPY)
-        elif initial_channel_weights is not None or initial_flags is not None:
-            cfg_tmp = {
-                'flagged_weight': rfi_flagged_weight,
-            }
-            # prepare_initial_channel_weights returns direct-space weights (0 to 1)
-            direct_weights = prepare_initial_channel_weights(
-                ntime=self.ntime,
-                nfreq=self.nfreq,
-                initial_weights=initial_channel_weights,
-                initial_flags=initial_flags,
-                flagged_weight=cfg_tmp['flagged_weight'],
-            )
-            # Convert to log space
-            log_ch_weights_init = np.log(np.clip(direct_weights, 1e-30, 1.0)).astype(DTYPE_R_NPY)
         else:
             # Default to zero log-space (exp(0) = 1.0)
             log_ch_weights_init = np.zeros((self.ntime, self.nfreq), dtype=DTYPE_R_NPY)
@@ -1991,15 +1967,15 @@ class Calibrator:
                 rfi_config={
                     'regularization': rfi_regularization,
                     'regularization_power': rfi_regularization_power,
-                    'min_weight': rfi_min_weight,
-                    'max_weight': rfi_max_weight,
-                    'flagged_weight': rfi_flagged_weight,
+                    'log_min_weight': rfi_log_min_weight,
+                    'log_max_weight': rfi_log_max_weight,
+                    'log_flagged_weight': rfi_log_flagged_weight,
                     'smooth_width_chans': rfi_smooth_width_chans,
-                    'threshold_ratio': rfi_threshold_ratio,
+                    'log_threshold': rfi_log_threshold,
                     'gamma': rfi_gamma,
                     'alpha_down': rfi_alpha_down,
                     'alpha_up': rfi_alpha_up,
-                    'max_drop': rfi_max_drop,
+                    'log_max_drop': rfi_log_max_drop,
                 },
                 max_rfi_updates=max_rfi_updates,
             ),
@@ -2597,19 +2573,28 @@ class Calibrator:
             old_log_weights_tf = np.asarray(state.params['log_ch_weights'])
             old_weights_f = np.exp(old_log_weights_tf[0, :] if old_log_weights_tf.ndim > 1 else old_log_weights_tf)
 
+            # Convert log-space config to direct space for fitter
+            min_weight_direct = np.exp(cfg.get('log_min_weight', np.log(0.05)))
+            max_weight_direct = np.exp(cfg.get('log_max_weight', 0.0))
+            log_threshold = cfg.get('log_threshold', np.log(3.0))
+            threshold_ratio_direct = np.exp(log_threshold)  # convert log-ratio back to ratio
+            log_max_drop = cfg.get('log_max_drop', np.log(0.8))
+            # max_drop in direct space: 0.8 in log space means exp(-0.223) ≈ 0.8 retention
+            max_drop_direct = 1.0 - np.exp(log_max_drop)
+
             new_weights_direct, diag = fit_channel_weights_local_chi2_exponential(
                 residual=resid,
                 inv_noise_var=inv_var,
                 old_weights=old_weights_f,
                 prior_weights=None,
-                min_weight=cfg.get('min_weight', 0.05),
-                max_weight=cfg['max_weight'],
+                min_weight=min_weight_direct,
+                max_weight=max_weight_direct,
                 smooth_width_chans=cfg.get('smooth_width_chans', 17),
-                threshold_ratio=cfg.get('threshold_ratio', 3.0),
+                threshold_ratio=threshold_ratio_direct,
                 gamma=cfg.get('gamma', 0.75),
                 alpha_down=cfg.get('alpha_down', 0.20),
                 alpha_up=cfg.get('alpha_up', 0.75),
-                max_drop_per_update=cfg.get('max_drop', 0.20),
+                max_drop_per_update=max_drop_direct,
             )
 
             # Convert direct space (0 to 1) weights back to log space (-inf to 0)
@@ -2770,19 +2755,17 @@ class Calibrator:
         subtract_static_sky: bool = False,
         check_every: int = 1,
         log_ch_weights: np.ndarray | None = None,
-        initial_channel_weights: np.ndarray | None = None,
-        initial_flags: np.ndarray | None = None,
         rfi_regularization: float = 1.0,
         rfi_regularization_power: float = 2.0,
-        rfi_min_weight: float = 0.05,
-        rfi_max_weight: float = 1.0,
-        rfi_flagged_weight: float = 0.05,
+        rfi_log_min_weight: float = np.log(0.05),
+        rfi_log_max_weight: float = 0.0,
+        rfi_log_flagged_weight: float = np.log(0.05),
         rfi_smooth_width_chans: int = 17,
-        rfi_threshold_ratio: float = 3.0,
+        rfi_log_threshold: float = np.log(3.0),
         rfi_gamma: float = 0.75,
         rfi_alpha_down: float = 0.20,
         rfi_alpha_up: float = 0.75,
-        rfi_max_drop: float = 0.20,
+        rfi_log_max_drop: float = np.log(0.8),
         max_rfi_updates: int | None = None,
         verbose: bool = False,
         _stop_flag=None,
@@ -2840,17 +2823,10 @@ class Calibrator:
             Compare Anderson acceleration vs plain step every N iterations.
             Set to >1 to skip AA evaluation on non-checkpoint steps for speed,
             using the same decision from the last checkpoint.
-        channel_weights : array_like, optional
-            Per-frequency soft channel weights from params, shape ``(nfreq,)`` or
-            ``(ntime, nfreq)``. If supplied in params dict, overrides initial_channel_weights
-            and initial_flags. If not in params and neither initial_channel_weights nor
-            initial_flags is provided, defaults to unity weighting.
-        initial_channel_weights : array_like, optional
-            External soft weights, shape ``(nfreq,)`` or ``(ntime, nfreq)``.
-            Ignored if channel_weights is in params dict.
-        initial_flags : array_like of bool, optional
-            External hard flags, shape ``(nfreq,)`` or ``(ntime, nfreq)``.
-            Ignored if channel_weights is in params dict.
+        log_ch_weights : array_like, optional
+            Per-frequency soft channel weights in log space, shape ``(nfreq,)`` or
+            ``(ntime, nfreq)``. If supplied, overrides any log_ch_weights in params dict.
+            If not supplied and not in params, defaults to zero log-space (unity weighting).
         rfi_regularization : float, default 1.0
             (Deprecated; kept for backward compatibility.)
         rfi_regularization_power : float, default 2.0
@@ -2894,19 +2870,17 @@ class Calibrator:
             reduced_chi2_check_every=reduced_chi2_check_every,
             check_every=check_every,
             log_ch_weights=log_ch_weights,
-            initial_channel_weights=initial_channel_weights,
-            initial_flags=initial_flags,
             rfi_regularization=rfi_regularization,
             rfi_regularization_power=rfi_regularization_power,
-            rfi_min_weight=rfi_min_weight,
-            rfi_max_weight=rfi_max_weight,
-            rfi_flagged_weight=rfi_flagged_weight,
+            rfi_log_min_weight=rfi_log_min_weight,
+            rfi_log_max_weight=rfi_log_max_weight,
+            rfi_log_flagged_weight=rfi_log_flagged_weight,
             rfi_smooth_width_chans=rfi_smooth_width_chans,
-            rfi_threshold_ratio=rfi_threshold_ratio,
+            rfi_log_threshold=rfi_log_threshold,
             rfi_gamma=rfi_gamma,
             rfi_alpha_down=rfi_alpha_down,
             rfi_alpha_up=rfi_alpha_up,
-            rfi_max_drop=rfi_max_drop,
+            rfi_log_max_drop=rfi_log_max_drop,
             max_rfi_updates=max_rfi_updates,
         )
         state.subtract_static_sky = subtract_static_sky
