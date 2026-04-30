@@ -24,60 +24,6 @@ from .rfi import (
 from .utils import DTYPE_R_JAX, DTYPE_R_NPY, DTYPE_C_JAX
 
 
-def smooth_channel_weights(
-    old_w: np.ndarray,
-    target_w: np.ndarray,
-    *,
-    alpha_down: float = 0.15,
-    alpha_up: float = 0.75,
-    max_drop: float = 0.15,
-    min_weight: float = 0.10,
-    max_weight: float = 1.0,
-) -> np.ndarray:
-    """Asymmetric smoothing of channel weight updates.
-
-    Applies slower downweighting and faster upweighting to avoid single bad
-    residual snapshots permanently downweighting a channel. Downweighting
-    requires repeated evidence; upweighting happens quickly once the channel
-    residual becomes normal again.
-
-    Parameters
-    ----------
-    old_w : np.ndarray
-        Current channel weights, shape (nfreq,).
-    target_w : np.ndarray
-        Target weights from RFI fitting, shape (nfreq,).
-    alpha_down : float, default 0.15
-        Mixing weight for downweighting: w = (1 - alpha) * old_w + alpha * target_w.
-        Smaller values = slower downweighting (more conservative).
-    alpha_up : float, default 0.75
-        Mixing weight for upweighting (recovery). Larger values = faster recovery.
-    max_drop : float, default 0.15
-        Maximum weight drop allowed in a single update. Prevents overshooting.
-        If (old_w - new_w) > max_drop, clamp to old_w - max_drop.
-    min_weight : float, default 0.10
-        Minimum allowed weight.
-    max_weight : float, default 1.0
-        Maximum allowed weight.
-
-    Returns
-    -------
-    np.ndarray
-        Smoothed weights, shape (nfreq,), clipped to [min_weight, max_weight].
-    """
-    old_w = np.asarray(old_w, dtype=DTYPE_R_NPY)
-    target_w = np.asarray(target_w, dtype=DTYPE_R_NPY)
-
-    # Choose alpha based on direction of change
-    alpha = np.where(target_w < old_w, alpha_down, alpha_up)
-    w = (1.0 - alpha) * old_w + alpha * target_w
-
-    # Limit how far a channel can fall in one update
-    w = np.maximum(w, old_w - max_drop)
-
-    return np.clip(w, min_weight, max_weight).astype(DTYPE_R_NPY)
-
-
 class _StopFitFlag:
     def __init__(self):
         self.stop = False
@@ -310,7 +256,6 @@ class JointSkyBeamDirtyFitState:
 
     stop_reason: str | None = None
     subtract_static_sky: bool = False
-    channel_weights: np.ndarray | None = None
     rfi_history: list | None = None
 
 
@@ -1775,7 +1720,7 @@ class Calibrator:
         rfi_gamma: float = 0.75,
         rfi_alpha_down: float = 0.20,
         rfi_alpha_up: float = 0.75,
-        rfi_log_max_drop: float = np.log(0.8),
+        rfi_min_retention_per_update: float = 0.8,
         max_rfi_updates: int | None = None,
     ):
         """Create a persistent state for resumable joint sky/beam dirty fits.
@@ -1797,24 +1742,26 @@ class Calibrator:
             (Deprecated; kept for backward compatibility.)
         rfi_regularization_power : float, default 2.0
             (Deprecated; kept for backward compatibility.)
-        rfi_min_weight : float, default 0.05
-            Minimum allowed channel weight.
-        rfi_max_weight : float, default 1.0
-            Maximum allowed channel weight.
-        rfi_flagged_weight : float, default 0.05
-            Weight assigned to initially flagged channels.
+        rfi_log_min_weight : float, default log(0.05)
+            Minimum allowed channel weight in log space.
+        rfi_log_max_weight : float, default 0.0
+            Maximum allowed channel weight in log space (0 = weight 1.0).
+        rfi_log_flagged_weight : float, default log(0.05)
+            Weight assigned to initially flagged channels in log space.
         rfi_smooth_width_chans : int, default 17
-            Width of local chi² baseline filter.
-        rfi_threshold_ratio : float, default 3.0
-            Threshold chi² ratio for downweighting.
+            Width of local chi² baseline filter (median + Gaussian).
+        rfi_log_threshold : float, default log(3.0)
+            Threshold for RFI detection in log space: ``log(threshold_ratio)``.
+            Channels with log(chi²) > local_baseline + rfi_log_threshold are downweighted.
         rfi_gamma : float, default 0.75
-            Exponential decay rate for downweighting.
+            Exponential decay rate: w = exp(-gamma * log_excess).
         rfi_alpha_down : float, default 0.20
-            Asymmetric smoothing: slow downweighting.
+            Asymmetric smoothing: slow downweighting (requires repeated evidence).
         rfi_alpha_up : float, default 0.75
             Asymmetric smoothing: fast upweighting/recovery.
-        rfi_max_drop : float, default 0.20
-            Maximum weight drop per update.
+        rfi_min_retention_per_update : float, default 0.8
+            Minimum retention fraction per update (direct space, 0–1).
+            Prevents a single RFI update from dropping a channel by more than ``1 - 0.8 = 0.2``.
         max_rfi_updates : int, optional
             Maximum number of RFI weight updates to perform. If None, updates
             continue throughout the fit.
@@ -1833,6 +1780,11 @@ class Calibrator:
         else:
             # Default to zero log-space (exp(0) = 1.0)
             log_ch_weights_init = np.zeros((self.ntime, self.nfreq), dtype=DTYPE_R_NPY)
+
+        # Apply weights to calibrator instance BEFORE state creation so effective_weights() is correct
+        self.set_channel_weights(log_ch_weights_init)
+        # Sync back the broadcasted (ntime, nfreq) form so state.params and self.log_ch_weights always agree
+        log_ch_weights_init = np.asarray(jax.device_get(self.log_ch_weights), dtype=DTYPE_R_NPY)
 
         state = JointSkyBeamDirtyFitState(
             params={
@@ -1862,7 +1814,7 @@ class Calibrator:
                     'gamma': rfi_gamma,
                     'alpha_down': rfi_alpha_down,
                     'alpha_up': rfi_alpha_up,
-                    'log_max_drop': rfi_log_max_drop,
+                    'min_retention_per_update': rfi_min_retention_per_update,
                 },
                 max_rfi_updates=max_rfi_updates,
             ),
@@ -1873,9 +1825,6 @@ class Calibrator:
             ),
             rfi_history=[],
         )
-
-        # Sync channel weights to the calibrator instance
-        self.set_channel_weights(state.params['log_ch_weights'])
 
         # Store full input params for later expansion to full-sky
         state.settings['params_input_full'] = params
@@ -2465,9 +2414,9 @@ class Calibrator:
             max_weight_direct = np.exp(cfg.get('log_max_weight', 0.0))
             log_threshold = cfg.get('log_threshold', np.log(3.0))
             threshold_ratio_direct = np.exp(log_threshold)  # convert log-ratio back to ratio
-            log_max_drop = cfg.get('log_max_drop', np.log(0.8))
-            # max_drop: exp(log_max_drop) gives retention fraction; drop = 1 - retention
-            max_drop_direct = 1.0 - np.exp(log_max_drop)
+            min_retention = cfg.get('min_retention_per_update', 0.8)
+            # max_drop: 1 - retention fraction
+            max_drop_direct = 1.0 - min_retention
 
             new_weights_direct, diag = fit_channel_weights_local_chi2_exponential(
                 residual=resid,
@@ -2652,7 +2601,7 @@ class Calibrator:
         rfi_gamma: float = 0.75,
         rfi_alpha_down: float = 0.20,
         rfi_alpha_up: float = 0.75,
-        rfi_log_max_drop: float = np.log(0.8),
+        rfi_min_retention_per_update: float = 0.8,
         max_rfi_updates: int | None = None,
         verbose: bool = False,
         _stop_flag=None,
@@ -2718,24 +2667,26 @@ class Calibrator:
             (Deprecated; kept for backward compatibility.)
         rfi_regularization_power : float, default 2.0
             (Deprecated; kept for backward compatibility.)
-        rfi_min_weight : float, default 0.05
-            Minimum allowed channel weight.
-        rfi_max_weight : float, default 1.0
-            Maximum allowed channel weight.
-        rfi_flagged_weight : float, default 0.05
-            Weight assigned to initially flagged channels.
+        rfi_log_min_weight : float, default log(0.05)
+            Minimum allowed channel weight in log space.
+        rfi_log_max_weight : float, default 0.0
+            Maximum allowed channel weight in log space (0 = weight 1.0).
+        rfi_log_flagged_weight : float, default log(0.05)
+            Weight assigned to initially flagged channels in log space.
         rfi_smooth_width_chans : int, default 17
-            Width of median+Gaussian filter for local chi² baseline (must be odd).
-        rfi_threshold_ratio : float, default 3.0
-            Threshold chi² ratio above which downweighting begins.
+            Width of local chi² baseline filter (median + Gaussian).
+        rfi_log_threshold : float, default log(3.0)
+            Threshold for RFI detection in log space: ``log(threshold_ratio)``.
+            Channels with log(chi²) > local_baseline + rfi_log_threshold are downweighted.
         rfi_gamma : float, default 0.75
             Exponential decay rate: w = exp(-gamma * log_excess).
         rfi_alpha_down : float, default 0.20
-            Asymmetric smoothing: slower downweighting (requires repeated evidence).
+            Asymmetric smoothing: slow downweighting (requires repeated evidence).
         rfi_alpha_up : float, default 0.75
-            Asymmetric smoothing: faster upweighting/recovery.
-        rfi_max_drop : float, default 0.20
-            Maximum weight drop allowed in a single RFI update.
+            Asymmetric smoothing: fast upweighting/recovery.
+        rfi_min_retention_per_update : float, default 0.8
+            Minimum retention fraction per update (direct space, 0–1).
+            Prevents a single RFI update from dropping a channel by more than ``1 - 0.8 = 0.2``.
         max_rfi_updates : int, optional
             Maximum number of RFI weight updates to perform. If None, updates
             continue throughout the fit. Consider ``max_rfi_updates=5`` to stop
@@ -2767,7 +2718,7 @@ class Calibrator:
             rfi_gamma=rfi_gamma,
             rfi_alpha_down=rfi_alpha_down,
             rfi_alpha_up=rfi_alpha_up,
-            rfi_log_max_drop=rfi_log_max_drop,
+            rfi_min_retention_per_update=rfi_min_retention_per_update,
             max_rfi_updates=max_rfi_updates,
         )
         state.subtract_static_sky = subtract_static_sky
