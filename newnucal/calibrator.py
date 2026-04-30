@@ -2574,7 +2574,7 @@ class Calibrator:
             log_threshold = cfg.get('log_threshold', np.log(3.0))
             threshold_ratio_direct = np.exp(log_threshold)  # convert log-ratio back to ratio
             log_max_drop = cfg.get('log_max_drop', np.log(0.8))
-            # max_drop in direct space: 0.8 in log space means exp(-0.223) ≈ 0.8 retention
+            # max_drop: exp(log_max_drop) gives retention fraction; drop = 1 - retention
             max_drop_direct = 1.0 - np.exp(log_max_drop)
 
             new_weights_direct, diag = fit_channel_weights_local_chi2_exponential(
