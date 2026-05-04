@@ -1772,11 +1772,13 @@ class Calibrator:
         params_active = self._params_to_active_space(params)
 
         # Initialize log-space channel weights: priority is log_ch_weights parameter,
-        # then params['log_ch_weights'], then default to zero log-space (weight 1.0)
+        # then params['log_ch_weights'], then default to zero log-space (weight 1.0).
+        # Note: extract from original params, not params_active, since _params_to_active_space
+        # doesn't handle log_ch_weights (it's not affected by masking).
         if log_ch_weights is not None:
             log_ch_weights_init = np.asarray(log_ch_weights, dtype=DTYPE_R_NPY)
-        elif 'log_ch_weights' in params_active:
-            log_ch_weights_init = np.asarray(params_active['log_ch_weights'], dtype=DTYPE_R_NPY)
+        elif 'log_ch_weights' in params:
+            log_ch_weights_init = np.asarray(params['log_ch_weights'], dtype=DTYPE_R_NPY)
         else:
             # Default to zero log-space (exp(0) = 1.0)
             log_ch_weights_init = np.zeros((self.ntime, self.nfreq), dtype=DTYPE_R_NPY)
