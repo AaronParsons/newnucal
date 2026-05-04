@@ -238,6 +238,69 @@ class TestRFIWeightedCalibrator:
         assert np.all(ch_weights >= 0.01)
         assert np.all(ch_weights <= 1.0)
 
+    def test_successive_fits_preserve_weights_and_params(self, calibrator_rfi_setup):
+        """Verify that successive calls to fit_* properly apply and update weights."""
+        cal, params = calibrator_rfi_setup
+        data = np.array(cal.data)
+        data[:, 1, :] += 30.0 + 0.0j  # Inject RFI into channel 1
+        cal.data = jnp.array(data, dtype=jnp.complex64)
+
+        # ===== FIRST FIT =====
+        params1, loss1 = cal.fit_joint_sky_beam_dirty(
+            params,
+            n_iter=4,
+            solve_every={'gains': 1, 'rfi': 2},
+            rfi_log_min_weight=np.log(0.05),
+            max_rfi_updates=1,
+            verbose=False,
+        )
+
+        # Verify first fit improved loss and found downweighted channel
+        assert loss1 < float(cal.calc_loss(params)), "First fit should improve loss"
+        assert 'log_ch_weights' in params1, "First fit should return log_ch_weights"
+        log_w1 = np.asarray(params1['log_ch_weights'])
+
+        # Channel 1 should be downweighted (negative log-weight)
+        # Use median to handle any time variation
+        ch1_median_weight = float(np.median(np.exp(log_w1[:, 1])))
+        assert ch1_median_weight < 0.9, f"RFI channel should be downweighted, got {ch1_median_weight:.3f}"
+
+        # ===== SECOND FIT (reusing same calibrator, passing updated params) =====
+        # This tests that weights and parameters from the first fit are properly applied
+        params2, loss2 = cal.fit_joint_sky_beam_dirty(
+            params1,  # Pass updated parameters including downweighted channel
+            n_iter=4,
+            solve_every={'gains': 1, 'rfi': 2},
+            rfi_log_min_weight=np.log(0.05),
+            max_rfi_updates=1,
+            verbose=False,
+        )
+
+        # Second fit should:
+        # 1. Continue improving loss (or at least not regress significantly)
+        assert loss2 < loss1 * 1.01, (
+            f"Second fit should continue improving loss or maintain it. "
+            f"First: {loss1:.4e}, Second: {loss2:.4e}"
+        )
+
+        # 2. Return updated parameters
+        assert set(params2.keys()) == set(params1.keys()), "Second fit should return same parameter keys"
+
+        # 3. Keep the downweighted channel downweighted (or more)
+        log_w2 = np.asarray(params2['log_ch_weights'])
+        ch1_median_weight_2 = float(np.median(np.exp(log_w2[:, 1])))
+        assert ch1_median_weight_2 <= ch1_median_weight * 1.01, (
+            f"RFI channel weight should be preserved or decreased. "
+            f"First: {ch1_median_weight:.3f}, Second: {ch1_median_weight_2:.3f}"
+        )
+
+        # 4. Channel 0 (far from RFI) should remain near unity
+        # (channels near RFI may be affected by local baseline estimation)
+        ch0_weight = float(np.median(np.exp(log_w2[:, 0])))
+        assert 0.9 < ch0_weight <= 1.0, (
+            f"Non-RFI channel 0 should have weight near 1.0, got {ch0_weight:.3f}"
+        )
+
 
 @pytest.fixture
 def calibrator_noisy_setup(array, beam_model, freqs, rot_matrices, forward_model,
