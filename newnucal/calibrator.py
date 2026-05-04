@@ -1722,7 +1722,6 @@ class Calibrator:
         rfi_alpha_up: float = 0.75,
         rfi_min_retention_per_update: float = 0.8,
         max_rfi_updates: int | None = None,
-        min_rfi_every: int = 3,
     ):
         """Create a persistent state for resumable joint sky/beam dirty fits.
 
@@ -1812,7 +1811,6 @@ class Calibrator:
                     'min_retention_per_update': rfi_min_retention_per_update,
                 },
                 max_rfi_updates=max_rfi_updates,
-                min_rfi_every=min_rfi_every,
             ),
             joint_acc=AndersonAccelerator(
                 joint_anderson_history, joint_aa_start, joint_aa_damping,
@@ -2382,39 +2380,22 @@ class Calibrator:
         state.loss = float(loss)
         state.step += 1
 
-        # Handle RFI weight updates with adaptive scheduling based on efficiency tracking
+        # Handle RFI weight updates with efficiency tracking (same pattern as gains/joint)
         # Note: RFI computations use NumPy (np.median, rolling statistics) which don't have
         # JAX equivalents, so device transfer via jax.device_get() is necessary. Since this
         # is a one-time computation per update (not part of the differentiable optimization),
         # the overhead is acceptable.
-        rfi_enabled = s['solve_every'].get('rfi', 0) != 0
+        rfi_max_every = s['solve_every'].get('rfi', 0)
+        rfi_enabled = (rfi_max_every != 0)
         max_rfi = s.get('max_rfi_updates')
         rfi_quota_exhausted = (max_rfi is not None and state.n_rfi >= max_rfi)
 
-        # Adaptive scheduling: do RFI if efficiency tracking suggests high improvement potential
-        # or if it's the first RFI update (state.eff_rfi is None)
-        min_rfi_every = s.get('min_rfi_every', 3)  # Minimum updates between RFI attempts
-        do_rfi = False
-        if rfi_enabled and not rfi_quota_exhausted:
-            if state.eff_rfi is None:
-                # First RFI update: always try to establish baseline efficiency
-                do_rfi = state.n_since_rfi >= min_rfi_every
-            else:
-                # Subsequent updates: only do RFI if it's likely to have significant improvement
-                # Schedule when estimated to beat the minimum of other step efficiencies
-                min_other_eff = float('inf')
-                if state.eff_gains is not None:
-                    min_other_eff = min(min_other_eff, state.eff_gains)
-                if state.eff_joint is not None:
-                    min_other_eff = min(min_other_eff, state.eff_joint)
+        # Fixed schedule with efficiency tracking (same pattern as gains)
+        overdue_rfi = False
+        if rfi_enabled and rfi_max_every > 0 and state.n_since_rfi >= rfi_max_every:
+            overdue_rfi = True
 
-                # Do RFI if: (1) minimum spacing met, and (2) RFI efficiency beats other steps
-                if state.n_since_rfi >= min_rfi_every:
-                    # Heuristic: do RFI if we have no min_other_eff or if RFI was competitive
-                    # Use conservative threshold (0.5x) to allow diverse step types
-                    eff_threshold = 0.5 * min_other_eff if min_other_eff != float('inf') else 1e-4
-                    if state.eff_rfi > eff_threshold:
-                        do_rfi = True
+        do_rfi = (overdue_rfi or (state.eff_rfi is None and rfi_enabled)) and not rfi_quota_exhausted
 
         if do_rfi:
             t_rfi_start = _time.perf_counter()
@@ -2643,7 +2624,6 @@ class Calibrator:
         rfi_alpha_up: float = 0.75,
         rfi_min_retention_per_update: float = 0.8,
         max_rfi_updates: int | None = None,
-        min_rfi_every: int = 3,
         verbose: bool = False,
         _stop_flag=None,
     ):
@@ -2684,11 +2664,10 @@ class Calibrator:
             Factor for adaptive step scaling; step_gain is multiplied by this when
             iterations stall or boosted when they succeed.
         solve_every : dict, optional
-            Cadence control: ``{'gains': n}`` solves gains every n steps.
-            Default ``{'gains': 1}`` (solve gains every step). RFI reweighting is
-            now adaptive: if ``'rfi'`` is not set or is 0, RFI is disabled; if set,
-            RFI updates are scheduled based on efficiency tracking.
-            See ``min_rfi_every`` for minimum spacing between RFI updates.
+            Cadence control: ``{'gains': n, 'rfi': m}`` solves gains every n steps,
+            updates RFI weights every m steps. Default ``{'gains': 1}`` (solve gains
+            every step). If ``'rfi'`` is not set or is 0, RFI reweighting is disabled.
+            Recommended: ``{'gains': 1, 'rfi': 5}`` (RFI every 5 steps).
         eff_alpha : float, default 0.4
             EMA factor for efficiency tracking.
         target_reduced_chi2 : float, optional
@@ -2729,10 +2708,6 @@ class Calibrator:
             Maximum number of RFI weight updates to perform. If None, updates
             continue throughout the fit. Consider ``max_rfi_updates=5`` to stop
             once the model stabilizes.
-        min_rfi_every : int, optional (in solve_every dict)
-            Minimum number of steps between RFI updates when using adaptive scheduling.
-            Default 3. Used to avoid excessive RFI evaluations while allowing
-            efficiency-based scheduling to determine actual RFI timing.
         verbose : bool
         """
         state = self.init_joint_sky_beam_dirty_state(
@@ -2761,7 +2736,6 @@ class Calibrator:
             rfi_alpha_up=rfi_alpha_up,
             rfi_min_retention_per_update=rfi_min_retention_per_update,
             max_rfi_updates=max_rfi_updates,
-            min_rfi_every=min_rfi_every,
         )
         state.subtract_static_sky = subtract_static_sky
         state = self.run_joint_sky_beam_dirty_state(state, n_iter=n_iter, verbose=verbose, _stop_flag=_stop_flag)

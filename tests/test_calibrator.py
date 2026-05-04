@@ -301,18 +301,17 @@ class TestRFIWeightedCalibrator:
             f"Non-RFI channel 0 should have weight near 1.0, got {ch0_weight:.3f}"
         )
 
-    def test_adaptive_rfi_scheduling_tracks_efficiency(self, calibrator_rfi_setup):
-        """Verify adaptive RFI scheduling tracks efficiency and performs RFI updates."""
+    def test_rfi_scheduling_tracks_efficiency(self, calibrator_rfi_setup):
+        """Verify RFI scheduling tracks efficiency and performs updates on fixed cadence."""
         cal, params = calibrator_rfi_setup
         data = np.array(cal.data)
         data[:, 2, :] += 50.0 + 0.0j  # Inject strong RFI into channel 2
         cal.data = jnp.array(data, dtype=jnp.complex64)
 
-        # Initialize state with adaptive RFI scheduling (enabled by setting 'rfi': 1 in solve_every)
+        # Initialize state with RFI scheduled every step (solve_every={'rfi': 1})
         state = cal.init_joint_sky_beam_dirty_state(
             params,
-            solve_every={'gains': 1, 'rfi': 1},  # RFI enabled
-            min_rfi_every=1,  # Allow RFI every step
+            solve_every={'gains': 1, 'rfi': 1},  # RFI every step
             rfi_log_min_weight=np.log(0.05),
             max_rfi_updates=3,
         )
@@ -321,11 +320,11 @@ class TestRFIWeightedCalibrator:
         for _ in range(6):
             cal._joint_sky_beam_dirty_step_from_state(state, verbose=False)
 
-        # Verify eff_rfi was tracked
+        # Verify eff_rfi was tracked with EMA smoothing
         assert state.eff_rfi is not None, "eff_rfi should be tracked after RFI updates"
         assert state.eff_rfi > 0.0, "eff_rfi should be positive (loss improvement per unit time)"
 
-        # Verify RFI updates occurred
+        # Verify RFI updates occurred on schedule
         assert state.n_rfi > 0, "At least one RFI update should have occurred"
         assert state.rfi_history is not None and len(state.rfi_history) > 0, "RFI history should be populated"
 
