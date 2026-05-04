@@ -1709,7 +1709,6 @@ class Calibrator:
         target_reduced_chi2: float | None = None,
         reduced_chi2_check_every: int = 1,
         check_every: int = 1,
-        log_ch_weights: np.ndarray | None = None,
         rfi_regularization: float = 1.0,
         rfi_regularization_power: float = 2.0,
         rfi_log_min_weight: float = np.log(0.05),
@@ -1734,10 +1733,6 @@ class Calibrator:
             Compare Anderson acceleration vs plain step every N iterations.
             Set to >1 to skip AA evaluation on non-checkpoint steps for speed,
             using the same decision from the last checkpoint.
-        log_ch_weights : array_like, optional
-            Per-frequency soft channel weights in log space, shape ``(nfreq,)`` or
-            ``(ntime, nfreq)``. If supplied, overrides any log_ch_weights in params dict.
-            If not supplied and not in params, defaults to zero log-space (unity weighting).
         rfi_regularization : float, default 1.0
             (Deprecated; kept for backward compatibility.)
         rfi_regularization_power : float, default 2.0
@@ -1771,16 +1766,12 @@ class Calibrator:
 
         params_active = self._params_to_active_space(params)
 
-        # Initialize log-space channel weights: priority is log_ch_weights parameter,
-        # then params['log_ch_weights'], then default to zero log-space (weight 1.0).
-        # Note: extract from original params, not params_active, since _params_to_active_space
+        # Initialize log-space channel weights from params, default to zero log-space (weight 1.0).
+        # Extract from original params, not params_active, since _params_to_active_space
         # doesn't handle log_ch_weights (it's not affected by masking).
-        if log_ch_weights is not None:
-            log_ch_weights_init = np.asarray(log_ch_weights, dtype=DTYPE_R_NPY)
-        elif 'log_ch_weights' in params:
+        if 'log_ch_weights' in params:
             log_ch_weights_init = np.asarray(params['log_ch_weights'], dtype=DTYPE_R_NPY)
         else:
-            # Default to zero log-space (exp(0) = 1.0)
             log_ch_weights_init = np.zeros((self.ntime, self.nfreq), dtype=DTYPE_R_NPY)
 
         # Apply weights to calibrator instance BEFORE state creation so effective_weights() is correct
@@ -2592,7 +2583,6 @@ class Calibrator:
         reduced_chi2_check_every: int = 1,
         subtract_static_sky: bool = False,
         check_every: int = 1,
-        log_ch_weights: np.ndarray | None = None,
         rfi_regularization: float = 1.0,
         rfi_regularization_power: float = 2.0,
         rfi_log_min_weight: float = np.log(0.05),
@@ -2661,10 +2651,6 @@ class Calibrator:
             Compare Anderson acceleration vs plain step every N iterations.
             Set to >1 to skip AA evaluation on non-checkpoint steps for speed,
             using the same decision from the last checkpoint.
-        log_ch_weights : array_like, optional
-            Per-frequency soft channel weights in log space, shape ``(nfreq,)`` or
-            ``(ntime, nfreq)``. If supplied, overrides any log_ch_weights in params dict.
-            If not supplied and not in params, defaults to zero log-space (unity weighting).
         rfi_regularization : float, default 1.0
             (Deprecated; kept for backward compatibility.)
         rfi_regularization_power : float, default 2.0
@@ -2709,7 +2695,6 @@ class Calibrator:
             target_reduced_chi2=target_reduced_chi2,
             reduced_chi2_check_every=reduced_chi2_check_every,
             check_every=check_every,
-            log_ch_weights=log_ch_weights,
             rfi_regularization=rfi_regularization,
             rfi_regularization_power=rfi_regularization_power,
             rfi_log_min_weight=rfi_log_min_weight,

@@ -211,12 +211,12 @@ class TestRFIWeightedCalibrator:
         # Start with prior weights (in direct space) and convert to log-space
         init_w = np.ones((cal.ntime, cal.nfreq), dtype=np.float32) * 0.5
         log_init_w = np.log(np.clip(init_w, 1e-30, 1.0))
-        
+        params['log_ch_weights'] = log_init_w
+
         params_out, loss_out = cal.fit_joint_sky_beam_dirty(
             params,
             n_iter=5,
             solve_every={'gains': 1, 'rfi': 2},
-            log_ch_weights=log_init_w,
             rfi_regularization=1.0,
             rfi_regularization_power=2.0,
             rfi_log_min_weight=np.log(0.01),
