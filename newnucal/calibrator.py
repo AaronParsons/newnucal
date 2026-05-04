@@ -245,6 +245,7 @@ class JointSkyBeamDirtyFitState:
 
     eff_joint: float | None = None
     eff_gains: float | None = None
+    eff_rfi: float | None = None
 
     n_joint: int = 0
     n_gains: int = 0
@@ -1721,6 +1722,7 @@ class Calibrator:
         rfi_alpha_up: float = 0.75,
         rfi_min_retention_per_update: float = 0.8,
         max_rfi_updates: int | None = None,
+        min_rfi_every: int = 3,
     ):
         """Create a persistent state for resumable joint sky/beam dirty fits.
 
@@ -1810,6 +1812,7 @@ class Calibrator:
                     'min_retention_per_update': rfi_min_retention_per_update,
                 },
                 max_rfi_updates=max_rfi_updates,
+                min_rfi_every=min_rfi_every,
             ),
             joint_acc=AndersonAccelerator(
                 joint_anderson_history, joint_aa_start, joint_aa_damping,
@@ -2379,17 +2382,44 @@ class Calibrator:
         state.loss = float(loss)
         state.step += 1
 
-        # Handle RFI weight updates
+        # Handle RFI weight updates with adaptive scheduling based on efficiency tracking
         # Note: RFI computations use NumPy (np.median, rolling statistics) which don't have
         # JAX equivalents, so device transfer via jax.device_get() is necessary. Since this
         # is a one-time computation per update (not part of the differentiable optimization),
         # the overhead is acceptable.
-        rfi_max_every = s['solve_every'].get('rfi', 0)
-        rfi_enabled = (rfi_max_every != 0)
+        rfi_enabled = s['solve_every'].get('rfi', 0) != 0
         max_rfi = s.get('max_rfi_updates')
         rfi_quota_exhausted = (max_rfi is not None and state.n_rfi >= max_rfi)
 
-        if rfi_enabled and not rfi_quota_exhausted and state.n_since_rfi >= rfi_max_every:
+        # Adaptive scheduling: do RFI if efficiency tracking suggests high improvement potential
+        # or if it's the first RFI update (state.eff_rfi is None)
+        min_rfi_every = s.get('min_rfi_every', 3)  # Minimum updates between RFI attempts
+        do_rfi = False
+        if rfi_enabled and not rfi_quota_exhausted:
+            if state.eff_rfi is None:
+                # First RFI update: always try to establish baseline efficiency
+                do_rfi = state.n_since_rfi >= min_rfi_every
+            else:
+                # Subsequent updates: only do RFI if it's likely to have significant improvement
+                # Schedule when estimated to beat the minimum of other step efficiencies
+                min_other_eff = float('inf')
+                if state.eff_gains is not None:
+                    min_other_eff = min(min_other_eff, state.eff_gains)
+                if state.eff_joint is not None:
+                    min_other_eff = min(min_other_eff, state.eff_joint)
+
+                # Do RFI if: (1) minimum spacing met, and (2) RFI efficiency beats other steps
+                if state.n_since_rfi >= min_rfi_every:
+                    # Heuristic: do RFI if we have no min_other_eff or if RFI was competitive
+                    # Use conservative threshold (0.5x) to allow diverse step types
+                    eff_threshold = 0.5 * min_other_eff if min_other_eff != float('inf') else 1e-4
+                    if state.eff_rfi > eff_threshold:
+                        do_rfi = True
+
+        if do_rfi:
+            t_rfi_start = _time.perf_counter()
+            loss_pre_rfi = float(state.loss)
+
             cfg = s['rfi_config']
             resid_jax = self.calibrated_residual_variable_beam_unweighted(state.params)
             resid = np.asarray(jax.device_get(resid_jax))
@@ -2430,10 +2460,27 @@ class Calibrator:
             new_log_weights = np.log(np.clip(new_weights_direct, 1e-30, 1.0))
             state.params['log_ch_weights'] = new_log_weights
             self.set_channel_weights(new_log_weights)
+
+            # Compute loss after RFI weight update to track efficiency
+            loss_post_rfi_jax = self._jit_loss_variable_beam(state.params, self._effective_weights())
+            loss_post_rfi = float(loss_post_rfi_jax)
+            dt_rfi = max(_time.perf_counter() - t_rfi_start, 1e-3)
+            dloss_rfi = max(0.0, loss_pre_rfi - loss_post_rfi)
+            eff_rfi = dloss_rfi / (max(loss_pre_rfi, 1e-30) * dt_rfi)
+
+            # Update efficiency with EMA smoothing
+            if state.eff_rfi is None:
+                state.eff_rfi = eff_rfi
+            else:
+                ema = s['eff_alpha'] * eff_rfi + (1.0 - s['eff_alpha']) * state.eff_rfi
+                state.eff_rfi = min(ema, eff_rfi)  # Keep pessimistic (min) like gains/joint
+
             state.n_rfi += 1
             state.n_since_rfi = 0
             state.n_since_joint += 1
             state.n_since_gains += 1
+            state.loss = loss_post_rfi
+
             if state.rfi_history is None:
                 state.rfi_history = []
             state.rfi_history.append({
@@ -2445,7 +2492,7 @@ class Calibrator:
             })
             if verbose:
                 flagged_frac = float(np.mean(new_weights_direct < 0.5))
-                print(f"    [rfi {state.n_rfi - 1:03d}]: frac(w<0.5)={flagged_frac:.3f}")
+                print(f"    [rfi {state.n_rfi - 1:03d}]: frac(w<0.5)={flagged_frac:.3f}  eff={eff_rfi:.2e} frac_Δloss/s")
         else:
             state.n_since_rfi += 1
 
@@ -2464,9 +2511,10 @@ class Calibrator:
             elapsed = _time.perf_counter() - state.settings.setdefault('_t0', _time.perf_counter())
             eff_j = f'{state.eff_joint:.2e}' if state.eff_joint is not None else ' N/A  '
             eff_g = f'{state.eff_gains:.2e}' if state.eff_gains is not None else ' N/A  '
+            eff_r = f'{state.eff_rfi:.2e}' if state.eff_rfi is not None else ' N/A  '
             step_type = 'gains' if do_gains else 'joint'
             msg = (f"  step {state.step - 1:04d} [{step_type:<11}]: chi2={state.loss:.4e}"
-                   f"  eff[joint={eff_j} gains={eff_g}]"
+                   f"  eff[joint={eff_j} gains={eff_g} rfi={eff_r}]"
                    f"  t={elapsed:.1f}s")
             if state.reduced_chi2 is not None:
                 msg += f"  red_chi2={state.reduced_chi2:.4f}"
@@ -2595,6 +2643,7 @@ class Calibrator:
         rfi_alpha_up: float = 0.75,
         rfi_min_retention_per_update: float = 0.8,
         max_rfi_updates: int | None = None,
+        min_rfi_every: int = 3,
         verbose: bool = False,
         _stop_flag=None,
     ):
@@ -2635,10 +2684,11 @@ class Calibrator:
             Factor for adaptive step scaling; step_gain is multiplied by this when
             iterations stall or boosted when they succeed.
         solve_every : dict, optional
-            Cadence control: ``{'gains': n, 'rfi': m}`` solves gains every n steps,
-            updates RFI weights every m steps. Default ``{'gains': 1}`` (solve gains
-            every step). If ``'rfi'`` is not set or is 0, RFI reweighting is disabled.
-            Recommended: ``{'gains': 1, 'rfi': 5}`` (RFI every 5 steps, not every step).
+            Cadence control: ``{'gains': n}`` solves gains every n steps.
+            Default ``{'gains': 1}`` (solve gains every step). RFI reweighting is
+            now adaptive: if ``'rfi'`` is not set or is 0, RFI is disabled; if set,
+            RFI updates are scheduled based on efficiency tracking.
+            See ``min_rfi_every`` for minimum spacing between RFI updates.
         eff_alpha : float, default 0.4
             EMA factor for efficiency tracking.
         target_reduced_chi2 : float, optional
@@ -2679,6 +2729,10 @@ class Calibrator:
             Maximum number of RFI weight updates to perform. If None, updates
             continue throughout the fit. Consider ``max_rfi_updates=5`` to stop
             once the model stabilizes.
+        min_rfi_every : int, optional (in solve_every dict)
+            Minimum number of steps between RFI updates when using adaptive scheduling.
+            Default 3. Used to avoid excessive RFI evaluations while allowing
+            efficiency-based scheduling to determine actual RFI timing.
         verbose : bool
         """
         state = self.init_joint_sky_beam_dirty_state(
@@ -2707,6 +2761,7 @@ class Calibrator:
             rfi_alpha_up=rfi_alpha_up,
             rfi_min_retention_per_update=rfi_min_retention_per_update,
             max_rfi_updates=max_rfi_updates,
+            min_rfi_every=min_rfi_every,
         )
         state.subtract_static_sky = subtract_static_sky
         state = self.run_joint_sky_beam_dirty_state(state, n_iter=n_iter, verbose=verbose, _stop_flag=_stop_flag)
