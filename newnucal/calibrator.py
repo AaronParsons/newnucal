@@ -89,6 +89,7 @@ class AndersonAccelerator:
         self._min_step_gain = min_step_gain
         self._step_gain_factor = step_gain_factor
         self.step_gain = 1.0
+        self.last_push_boosted = False
         self._hist_g: deque[np.ndarray] = deque(maxlen=history)
         self._hist_f: deque[np.ndarray] = deque(maxlen=history)
         self._step = 0
@@ -113,8 +114,10 @@ class AndersonAccelerator:
             coefficients fail validity checks (non-finite beta values).
         """
         if self.history == 0:
+            self.last_push_boosted = False
             return None
 
+        self.last_push_boosted = False
         f_flat = g_flat - x_flat
         self._hist_g.append(g_flat.copy())
         self._hist_f.append(f_flat.copy())
@@ -129,6 +132,7 @@ class AndersonAccelerator:
             else:
                 # Gram ill-conditioned or non-finite beta: boost step_gain and clear history
                 self.step_gain = min(self.step_gain * self._step_gain_factor, self._step_gain_max)
+                self.last_push_boosted = True
                 self.clear(reset_step_gain=False)
 
         self._step += 1
@@ -201,6 +205,48 @@ class AndersonAccelerator:
         rhs[-1] = 1.0
         sol = np.linalg.lstsq(kkt, rhs, rcond=None)[0]
         return sol[:n]
+
+
+def _joint_block_scales(
+    sky_current,
+    sky_plain,
+    beam_current,
+    beam_plain,
+    eps: float = 1e-12,
+) -> tuple[float, float]:
+    """RMS scales for balancing sky and beam blocks in joint AA."""
+    sky_delta = np.asarray(sky_plain, dtype=DTYPE_R_NPY) - np.asarray(sky_current, dtype=DTYPE_R_NPY)
+    beam_delta = np.asarray(beam_plain, dtype=DTYPE_R_NPY) - np.asarray(beam_current, dtype=DTYPE_R_NPY)
+
+    sky_scale = float(np.sqrt(np.mean(sky_delta * sky_delta))) if sky_delta.size else 1.0
+    beam_scale = float(np.sqrt(np.mean(beam_delta * beam_delta))) if beam_delta.size else 1.0
+
+    if not np.isfinite(sky_scale) or sky_scale < eps:
+        sky_arr = np.asarray(sky_current, dtype=DTYPE_R_NPY)
+        sky_scale = float(np.sqrt(np.mean(sky_arr * sky_arr))) if sky_arr.size else 1.0
+    if not np.isfinite(beam_scale) or beam_scale < eps:
+        beam_arr = np.asarray(beam_current, dtype=DTYPE_R_NPY)
+        beam_scale = float(np.sqrt(np.mean(beam_arr * beam_arr))) if beam_arr.size else 1.0
+
+    if not np.isfinite(sky_scale) or sky_scale < eps:
+        sky_scale = 1.0
+    if not np.isfinite(beam_scale) or beam_scale < eps:
+        beam_scale = 1.0
+    return sky_scale, beam_scale
+
+
+def _pack_joint_scaled(sky, beam, sky_scale: float, beam_scale: float) -> np.ndarray:
+    return np.concatenate([
+        (np.asarray(sky, dtype=DTYPE_R_NPY) / sky_scale).ravel(),
+        (np.asarray(beam, dtype=DTYPE_R_NPY) / beam_scale).ravel(),
+    ])
+
+
+def _unpack_joint_scaled(flat, sky_shape, beam_shape, sky_scale: float, beam_scale: float):
+    sky_size = int(np.prod(sky_shape))
+    sky = flat[:sky_size].reshape(sky_shape) * sky_scale
+    beam = flat[sky_size:].reshape(beam_shape) * beam_scale
+    return sky, beam
 
 
 @dataclass
@@ -1340,16 +1386,12 @@ class Calibrator:
         verbose: bool = False,
         subtract_static_sky: bool = False,
     ):
-        """Dirty-map sky and beam update from shared adjoint.
+        """Compatibility wrapper for joint dirty-map sky and beam updates.
 
-        Simultaneously updates sky coefficients and beam coefficients by computing
-        the dirty apparent sky map once per iteration and deriving both corrections
-        from it. More efficient than calling :meth:`fit_sky_dirty` and
-        :meth:`fit_beam_dirty` separately when both are needed.
-
-        Anderson acceleration can be applied to the joint (sky, beam) parameter
-        vector to accelerate convergence. This respects the coupling between
-        sky and beam updates inherent in the shared adjoint.
+        This delegates to :meth:`fit_joint_sky_beam_dirty` so the joint solver
+        has a single implementation.  Independent sky-only and beam-only update
+        paths remain available via :meth:`fit_sky_dirty`, :meth:`fit_beam_dirty`,
+        and :meth:`compute_adjoint_updates`.
 
         Parameters
         ----------
@@ -1380,118 +1422,20 @@ class Calibrator:
         best_loss : float
             Best loss achieved.
         """
-        if subtract_static_sky:
-            if not self._static_sky_cached:
-                raise RuntimeError("Static sky not cached. Call cache_static_sky_coeffs() first.")
-            orig_data = self.data
-            self.data = self.data - self._cached_static_vis
-        else:
-            orig_data = None
-
-        try:
-            params_input = params
-            params = self._params_to_active_space(params)
-
-            sky_coeffs = params['sky_coeffs']
-            gain_params = {k: params[k] for k in self._GAIN_PARAM_KEYS}
-            beam_coeffs = params['beam_coeffs']
-
-            # Initialize joint Anderson accelerator for (sky, beam) pair
-            aa = AndersonAccelerator(
-                anderson_history, start=2, damping=anderson_damping,
-                ridge=anderson_ridge
-            ) if anderson_history > 0 else None
-
-            best_sky = sky_coeffs
-            best_bc = beam_coeffs
-            _w = self._effective_weights()
-            best_loss_jax = self._jit_loss_variable_beam(
-                {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params}, _w
-            )
-            current_sky = sky_coeffs
-            current_bc = beam_coeffs
-
-            for i in range(n_iter):
-                resid = self.calibrated_residual_variable_beam(
-                    {'sky_coeffs': current_sky, 'beam_coeffs': current_bc, **gain_params}
-                )
-                updates = self.compute_adjoint_updates(
-                    current_sky, resid, update_mode='both',
-                    sky_step_size=sky_step_size,
-                    beam_step_size=beam_step_size,
-                    beam_reg=beam_reg,
-                    sky_reg=sky_reg,
-                )
-                delta_sky = updates['sky']
-                delta_bc = updates['beam']
-                trial_sky = current_sky + delta_sky
-                trial_bc = current_bc + delta_bc
-
-                # Apply Anderson acceleration to joint (sky, beam) pair if enabled
-                if aa is not None:
-                    # Flatten both sky and beam to 1D arrays for AA (DTYPE_R_NPY to avoid precision bloat)
-                    current_flat = np.concatenate([
-                        np.asarray(current_sky, dtype=DTYPE_R_NPY).ravel(),
-                        np.asarray(current_bc, dtype=DTYPE_R_NPY).ravel(),
-                    ])
-                    trial_flat = np.concatenate([
-                        np.asarray(trial_sky, dtype=DTYPE_R_NPY).ravel(),
-                        np.asarray(trial_bc, dtype=DTYPE_R_NPY).ravel(),
-                    ])
-
-                    # Try AA proposal
-                    aa_candidate_flat = aa.push(current_flat, trial_flat)
-                    if aa_candidate_flat is not None:
-                        # Unflatten the candidate
-                        sky_shape = current_sky.shape
-                        bc_shape = current_bc.shape
-                        sky_size = int(np.prod(sky_shape))
-                        sky_cand = jnp.array(
-                            aa_candidate_flat[:sky_size].reshape(sky_shape),
-                            dtype=DTYPE_R_JAX
-                        )
-                        bc_cand = jnp.array(
-                            aa_candidate_flat[sky_size:].reshape(bc_shape),
-                            dtype=DTYPE_R_JAX
-                        )
-                        loss_cand = self._jit_loss_variable_beam(
-                            {'sky_coeffs': sky_cand, 'beam_coeffs': bc_cand, **gain_params}, _w
-                        )
-                        # Use AA candidate if better than plain step
-                        improved_aa = loss_cand < self._jit_loss_variable_beam(
-                            {'sky_coeffs': trial_sky, 'beam_coeffs': trial_bc, **gain_params}, _w
-                        )
-                        if improved_aa:
-                            trial_sky = sky_cand
-                            trial_bc = bc_cand
-
-                loss_jax = self._jit_loss_variable_beam(
-                    {'sky_coeffs': trial_sky, 'beam_coeffs': trial_bc, **gain_params}, _w
-                )
-
-                # Use JAX operations to conditionally update (no blocking)
-                improved = loss_jax < best_loss_jax
-                best_loss_jax = jnp.where(improved, loss_jax, best_loss_jax)
-                best_sky = jnp.where(improved, trial_sky, best_sky)
-                best_bc = jnp.where(improved, trial_bc, best_bc)
-                current_sky = jnp.where(improved, trial_sky, current_sky)
-                current_bc = jnp.where(improved, trial_bc, current_bc)
-
-                # Only materialize for verbose output (unavoidable if verbose)
-                if verbose:
-                    loss_val = float(loss_jax)
-                    print(f'    dirty sky+beam iter {i:03d}: loss={loss_val:.4e}')
-
-            # Synchronize cached beam once at the end.
-            self.fwd.update_beam_cache(best_bc)
-            self._recompile_jit()
-
-            params_out = {'sky_coeffs': best_sky, 'beam_coeffs': best_bc, **gain_params}
-            params_out_full = self._params_to_full_space(params_out, params_input)
-            return params_out_full, float(best_loss_jax)
-        finally:
-            if orig_data is not None:
-                self.data = orig_data
+        return self.fit_joint_sky_beam_dirty(
+            params,
+            n_iter=n_iter,
+            joint_sky_initial_step=sky_step_size,
+            joint_beam_initial_step=beam_step_size,
+            beam_reg=beam_reg,
+            sky_reg=sky_reg,
+            joint_anderson_history=anderson_history,
+            joint_aa_damping=anderson_damping,
+            joint_aa_ridge=anderson_ridge,
+            solve_every={'gains': 0},
+            subtract_static_sky=subtract_static_sky,
+            verbose=verbose,
+        )
 
     def get_sky_beam_weighting(self):
         """Return design matrix normal (Gram) diagonal for all sky pixels.
@@ -1741,7 +1685,11 @@ class Calibrator:
         joint_aa_damping: float = 0.5,
         joint_aa_ridge: float = 1e-8,
         joint_initial_step: float | list = 1.0,
+        joint_sky_initial_step: float | list | None = None,
+        joint_beam_initial_step: float | list | None = None,
         joint_step_gain_factor: float = 2.0,
+        beam_reg: float | None = None,
+        sky_reg: float | None = None,
         solve_every: dict | None = None,
         eff_alpha: float = 0.4,
         target_reduced_chi2: float | None = None,
@@ -1830,6 +1778,10 @@ class Calibrator:
             settings=dict(
                 sky_beam_reg=sky_beam_reg,
                 joint_initial_step=joint_initial_step,
+                joint_sky_initial_step=joint_sky_initial_step,
+                joint_beam_initial_step=joint_beam_initial_step,
+                joint_beam_reg=sky_beam_reg if beam_reg is None else beam_reg,
+                joint_sky_reg=sky_beam_reg if sky_reg is None else sky_reg,
                 solve_every=dict(solve_every),
                 eff_alpha=eff_alpha,
                 target_reduced_chi2=target_reduced_chi2,
@@ -2239,7 +2191,8 @@ class Calibrator:
             updates = self.compute_adjoint_updates(
                 sky_coeffs, resid, update_mode='both',
                 sky_step_size=1.0, beam_step_size=1.0,
-                beam_reg=s['sky_beam_reg'], sky_reg=s['sky_beam_reg']
+                beam_reg=s.get('joint_beam_reg', s['sky_beam_reg']),
+                sky_reg=s.get('joint_sky_reg', s['sky_beam_reg']),
             )
             delta_sky_base = updates['sky']
             delta_beam_base = updates['beam']
@@ -2247,33 +2200,57 @@ class Calibrator:
             joint_sky_trial = sky_coeffs
             joint_beam_trial = beam_coeffs
             joint_loss_trial = loss
+            joint_resid_trial = resid
             eff_gain = 0.0
             initial_step = s.get('joint_initial_step', 1.0)
+            sky_initial_step = s.get('joint_sky_initial_step')
+            beam_initial_step = s.get('joint_beam_initial_step')
+            if sky_initial_step is None:
+                sky_initial_step = initial_step
+            if beam_initial_step is None:
+                beam_initial_step = initial_step
             check_every = s.get('check_every', 1)
             is_check_step = (state.n_joint + 1) % check_every == 0
 
-            if isinstance(initial_step, (list, tuple)) and len(state.joint_acc._hist_f) == 0 and state.joint_acc.step_gain == 1.0:
+            list_line_search = (
+                isinstance(sky_initial_step, (list, tuple))
+                or isinstance(beam_initial_step, (list, tuple))
+            )
+            if list_line_search and len(state.joint_acc._hist_f) == 0 and state.joint_acc.step_gain == 1.0:
                 # Line search on first iteration if initial_step is a list
-                selected_step = 1.0
-                for candidate_step in initial_step:
-                    joint_sky_step = (sky_coeffs + candidate_step * delta_sky_base).astype(DTYPE_R_JAX)
-                    joint_beam_step = (beam_coeffs + candidate_step * delta_beam_base).astype(DTYPE_R_JAX)
-                    trial_resid, trial_loss_jax = self._jit_residual_and_loss_variable_beam(
-                        {'sky_coeffs': joint_sky_step, 'beam_coeffs': joint_beam_step, **gain_params},
-                        weights
-                    )
-                    joint_loss_step = float(trial_loss_jax)
-                    if joint_loss_step < joint_loss_trial:
-                        joint_sky_trial = joint_sky_step
-                        joint_beam_trial = joint_beam_step
-                        joint_loss_trial = joint_loss_step
-                        joint_resid_trial = trial_resid
-                        selected_step = candidate_step
-                # Save the best step as a scalar for future use
+                sky_steps = sky_initial_step if isinstance(sky_initial_step, (list, tuple)) else [sky_initial_step]
+                beam_steps = beam_initial_step if isinstance(beam_initial_step, (list, tuple)) else [beam_initial_step]
+                selected_sky_step = float(sky_steps[0])
+                selected_beam_step = float(beam_steps[0])
+                for candidate_sky_step in sky_steps:
+                    for candidate_beam_step in beam_steps:
+                        joint_sky_step = (sky_coeffs + candidate_sky_step * delta_sky_base).astype(DTYPE_R_JAX)
+                        joint_beam_step = (beam_coeffs + candidate_beam_step * delta_beam_base).astype(DTYPE_R_JAX)
+                        trial_resid, trial_loss_jax = self._jit_residual_and_loss_variable_beam(
+                            {'sky_coeffs': joint_sky_step, 'beam_coeffs': joint_beam_step, **gain_params},
+                            weights
+                        )
+                        joint_loss_step = float(trial_loss_jax)
+                        if joint_loss_step < joint_loss_trial:
+                            joint_sky_trial = joint_sky_step
+                            joint_beam_trial = joint_beam_step
+                            joint_loss_trial = joint_loss_step
+                            joint_resid_trial = trial_resid
+                            selected_sky_step = float(candidate_sky_step)
+                            selected_beam_step = float(candidate_beam_step)
+                # Save the best steps as scalars for future use
                 if joint_loss_trial < loss:
-                    s['joint_initial_step'] = selected_step
+                    s['joint_sky_initial_step'] = selected_sky_step
+                    s['joint_beam_initial_step'] = selected_beam_step
+                    # Preserve legacy setting when the user supplied only joint_initial_step.
+                    if not isinstance(s.get('joint_initial_step'), (list, tuple)):
+                        s['joint_initial_step'] = selected_sky_step
                     if verbose:
-                        print(f"      [initial line search: selected joint_initial_step={selected_step:.2f}]")
+                        print(
+                            "      [initial line search: selected "
+                            f"joint_sky_initial_step={selected_sky_step:.2f}, "
+                            f"joint_beam_initial_step={selected_beam_step:.2f}]"
+                        )
                 eff_gain = 1.0  # Return 1.0 so report_step_gain keeps step_gain=1.0
                 joint_sky_plain = joint_sky_trial
                 joint_beam_plain = joint_beam_trial
@@ -2282,9 +2259,11 @@ class Calibrator:
                 # Normal retry loop: try current step_gain, then halve if unsuccessful
                 gain_to_try = state.joint_acc.step_gain
                 joint_resid_trial = resid
+                sky_step_scalar = float(sky_initial_step)
+                beam_step_scalar = float(beam_initial_step)
                 while gain_to_try >= state.joint_acc._min_step_gain:
-                    joint_sky_step = (sky_coeffs + gain_to_try * initial_step * delta_sky_base).astype(DTYPE_R_JAX)
-                    joint_beam_step = (beam_coeffs + gain_to_try * initial_step * delta_beam_base).astype(DTYPE_R_JAX)
+                    joint_sky_step = (sky_coeffs + gain_to_try * sky_step_scalar * delta_sky_base).astype(DTYPE_R_JAX)
+                    joint_beam_step = (beam_coeffs + gain_to_try * beam_step_scalar * delta_beam_base).astype(DTYPE_R_JAX)
                     trial_resid, trial_loss_jax = self._jit_residual_and_loss_variable_beam(
                         {'sky_coeffs': joint_sky_step, 'beam_coeffs': joint_beam_step, **gain_params},
                         weights
@@ -2310,40 +2289,35 @@ class Calibrator:
                 joint_resid_trial, joint_loss_plain
             )
 
-            state.joint_acc.report_step_gain(eff_gain)
-
             joint_sky_next = joint_sky_plain
             joint_beam_next = joint_beam_plain
             joint_loss_next = joint_loss_plain
             used_aa = False
+            aa_boosted = False
 
             # Apply Anderson acceleration to joint (sky, beam) pair
             if state.joint_acc is not None:
-                current_flat = np.concatenate([
-                    np.asarray(sky_coeffs, dtype=DTYPE_R_NPY).ravel(),
-                    np.asarray(beam_coeffs, dtype=DTYPE_R_NPY).ravel(),
-                ])
-                plain_flat = np.concatenate([
-                    np.asarray(joint_sky_plain, dtype=DTYPE_R_NPY).ravel(),
-                    np.asarray(joint_beam_plain, dtype=DTYPE_R_NPY).ravel(),
-                ])
+                sky_scale, beam_scale = _joint_block_scales(
+                    sky_coeffs, joint_sky_plain, beam_coeffs, joint_beam_plain
+                )
+                state.settings['_joint_aa_sky_scale'] = sky_scale
+                state.settings['_joint_aa_beam_scale'] = beam_scale
+                current_flat = _pack_joint_scaled(sky_coeffs, beam_coeffs, sky_scale, beam_scale)
+                plain_flat = _pack_joint_scaled(joint_sky_plain, joint_beam_plain, sky_scale, beam_scale)
 
                 aa_candidate_flat = state.joint_acc.push(current_flat, plain_flat)
+                aa_boosted = state.joint_acc.last_push_boosted
 
                 if is_check_step:
                     # Evaluate both plain and AA candidate; decide which to use
                     if aa_candidate_flat is not None:
                         sky_shape = sky_coeffs.shape
                         beam_shape = beam_coeffs.shape
-                        sky_size = int(np.prod(sky_shape))
-                        joint_sky_cand = jnp.array(
-                            aa_candidate_flat[:sky_size].reshape(sky_shape),
-                            dtype=DTYPE_R_JAX
+                        sky_cand_np, beam_cand_np = _unpack_joint_scaled(
+                            aa_candidate_flat, sky_shape, beam_shape, sky_scale, beam_scale
                         )
-                        joint_beam_cand = jnp.array(
-                            aa_candidate_flat[sky_size:].reshape(beam_shape),
-                            dtype=DTYPE_R_JAX
-                        )
+                        joint_sky_cand = jnp.array(sky_cand_np, dtype=DTYPE_R_JAX)
+                        joint_beam_cand = jnp.array(beam_cand_np, dtype=DTYPE_R_JAX)
                         joint_resid_cand, joint_loss_cand_jax = self._jit_residual_and_loss_variable_beam(
                             {'sky_coeffs': joint_sky_cand, 'beam_coeffs': joint_beam_cand, **gain_params},
                             weights
@@ -2367,15 +2341,11 @@ class Calibrator:
                     if state.settings.get('_joint_use_aa', False) and aa_candidate_flat is not None:
                         sky_shape = sky_coeffs.shape
                         beam_shape = beam_coeffs.shape
-                        sky_size = int(np.prod(sky_shape))
-                        joint_sky_cand = jnp.array(
-                            aa_candidate_flat[:sky_size].reshape(sky_shape),
-                            dtype=DTYPE_R_JAX
+                        sky_cand_np, beam_cand_np = _unpack_joint_scaled(
+                            aa_candidate_flat, sky_shape, beam_shape, sky_scale, beam_scale
                         )
-                        joint_beam_cand = jnp.array(
-                            aa_candidate_flat[sky_size:].reshape(beam_shape),
-                            dtype=DTYPE_R_JAX
-                        )
+                        joint_sky_cand = jnp.array(sky_cand_np, dtype=DTYPE_R_JAX)
+                        joint_beam_cand = jnp.array(beam_cand_np, dtype=DTYPE_R_JAX)
                         joint_sky_next = joint_sky_cand
                         joint_beam_next = joint_beam_cand
                         joint_resid_cand, joint_loss_cand_jax = self._jit_residual_and_loss_variable_beam(
@@ -2389,6 +2359,9 @@ class Calibrator:
                             gain_params['log_amp'], gain_params['phase'], gain_params['phi'],
                             joint_resid_cand, joint_loss_next
                         )
+
+            if not aa_boosted:
+                state.joint_acc.report_step_gain(eff_gain)
 
             sky_coeffs = joint_sky_next
             beam_coeffs = joint_beam_next
@@ -2406,6 +2379,8 @@ class Calibrator:
                 line = f"    [joint {tag} {state.n_joint - 1:03d}]: loss={loss:.4e}  eff={eff:.2e} frac_Δloss/s  step_gain={state.joint_acc.step_gain:.2f}"
                 if used_aa and is_check_step:
                     line += f"  [AA improved: cand={joint_loss_cand:.4e} vs plain={joint_loss_plain:.4e}]"
+                elif aa_boosted:
+                    line += f"  [AA skipped: collinear history, step_gain->{state.joint_acc.step_gain:.2f}]"
                 print(line)
 
         # Preserve log_ch_weights when updating params
@@ -2643,7 +2618,11 @@ class Calibrator:
         joint_aa_damping: float = 0.5,
         joint_aa_ridge: float = 1e-8,
         joint_initial_step: float | list = 1.0,
+        joint_sky_initial_step: float | list | None = None,
+        joint_beam_initial_step: float | list | None = None,
         joint_step_gain_factor: float = 2.0,
+        beam_reg: float | None = None,
+        sky_reg: float | None = None,
         solve_every: dict | None = None,
         eff_alpha: float = 0.4,
         target_reduced_chi2: float | None = None,
@@ -2698,9 +2677,16 @@ class Calibrator:
         joint_initial_step : float or list, default 1.0
             Step size for plain joint step. If a list, performs one-time line search
             on first iteration to select the best value.
+        joint_sky_initial_step, joint_beam_initial_step : float or list, optional
+            Separate sky and beam step sizes. If either is a list, the first joint
+            iteration tries the Cartesian product of candidate sky/beam scales and
+            keeps the best accepted pair. Defaults to ``joint_initial_step``.
         joint_step_gain_factor : float, default 2.0
             Factor for adaptive step scaling; step_gain is multiplied by this when
             iterations stall or boosted when they succeed.
+        beam_reg, sky_reg : float, optional
+            Separate regularisation values for sky and beam divisions in the shared
+            adjoint update. Defaults to ``sky_beam_reg`` for both.
         solve_every : dict, optional
             Cadence control: ``{'gains': n, 'rfi': m}`` solves gains every n steps,
             updates RFI weights every m steps. Default ``{'gains': 1}`` (solve gains
@@ -2757,7 +2743,11 @@ class Calibrator:
             joint_aa_damping=joint_aa_damping,
             joint_aa_ridge=joint_aa_ridge,
             joint_initial_step=joint_initial_step,
+            joint_sky_initial_step=joint_sky_initial_step,
+            joint_beam_initial_step=joint_beam_initial_step,
             joint_step_gain_factor=joint_step_gain_factor,
+            beam_reg=beam_reg,
+            sky_reg=sky_reg,
             solve_every=solve_every,
             eff_alpha=eff_alpha,
             target_reduced_chi2=target_reduced_chi2,
