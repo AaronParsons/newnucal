@@ -388,6 +388,28 @@ class Calibrator:
                 f"full {self._npix_full} or active {self._active_size}"
             )
 
+    def _beam_coeffs_full(self, beam_coeffs):
+        """Return full-beam coefficients, expanding masked input if needed."""
+        if beam_coeffs is None:
+            return None
+
+        npix_full = healpy.nside2npix(self.beam_model.nside)
+        if np.shape(beam_coeffs)[0] == npix_full:
+            return beam_coeffs
+
+        bc = jnp.array(beam_coeffs, dtype=DTYPE_R_JAX)
+        if self.beam_mask is not None and bc.shape[0] == int(self.beam_mask.sum()):
+            full = jnp.array(self.fwd._beam_coeffs_full, dtype=DTYPE_R_JAX)
+            return full.at[self.fwd._beam_indices].set(bc)
+
+        raise ValueError(
+            f"beam_coeffs size {bc.shape[0]} doesn't match full beam {npix_full}"
+            + (
+                f" or active beam {int(self.beam_mask.sum())}"
+                if self.beam_mask is not None else ""
+            )
+        )
+
     def _params_to_active_space(self, params):
         """Convert parameter dict from full-sky to active pixels if masked.
 
@@ -399,8 +421,9 @@ class Calibrator:
         else:
             out['sky_coeffs'] = params.get('sky_coeffs')
 
-        # Beam coeffs are never masked (independent of sky pixel mask)
-        out['beam_coeffs'] = params.get('beam_coeffs')
+        # Beam coeffs are exposed as full-size parameters. For backward
+        # compatibility, masked beam input is expanded against the current cache.
+        out['beam_coeffs'] = self._beam_coeffs_full(params.get('beam_coeffs'))
 
         for key in self._GAIN_PARAM_KEYS:
             out[key] = params.get(key)
@@ -431,8 +454,8 @@ class Calibrator:
         else:
             out['sky_coeffs'] = params_active.get('sky_coeffs')
 
-        # Beam coeffs are never masked (pass through as-is)
-        out['beam_coeffs'] = params_active.get('beam_coeffs')
+        # Beam coeffs are exposed as full-size parameters.
+        out['beam_coeffs'] = self._beam_coeffs_full(params_active.get('beam_coeffs'))
 
         # Log-space channel weights (pass through as-is)
         out['log_ch_weights'] = params_active.get('log_ch_weights')
@@ -503,7 +526,12 @@ class Calibrator:
 
         return weighted_resid_for_adjoint, loss
 
-    def calc_loss(self, params, explicit_beam: bool = False):
+    def calc_loss(self, params, explicit_beam: bool | None = None):
+        if explicit_beam is None:
+            explicit_beam = params.get('beam_coeffs') is not None
+        if explicit_beam and params.get('beam_coeffs') is not None:
+            params = dict(params)
+            params['beam_coeffs'] = self._beam_coeffs_full(params['beam_coeffs'])
         # Fast path: return the loss already computed by fit_gains_linear when
         # called immediately after with the same (sky_coeffs, gain_params) arrays.
         # Object-identity checks are safe because JAX arrays are immutable.
@@ -532,7 +560,7 @@ class Calibrator:
             return float(self._jit_loss_variable_beam(params, w))
         return float(self._jit_loss(params, w))
 
-    def calc_chi2(self, params, explicit_beam: bool = False):
+    def calc_chi2(self, params, explicit_beam: bool | None = None):
         return self.calc_loss(params, explicit_beam=explicit_beam)
 
     def estimate_num_params(self, params=None):
@@ -610,7 +638,7 @@ class Calibrator:
         arr = jnp.clip(arr, 1e-20, jnp.inf)
         self.inv_noise_var = (1.0 / (arr ** 2)).astype(DTYPE_R_JAX)
 
-    def calc_reduced_chi2(self, params, explicit_beam: bool = False, subtract_params=0):
+    def calc_reduced_chi2(self, params, explicit_beam: bool | None = None, subtract_params=0):
         """Approximate reduced chi-squared under the current weights/noise model.
 
         The denominator is the effective number of data points (sum of channel
@@ -634,7 +662,7 @@ class Calibrator:
         nmodes_sky = self.A_sky.shape[1]
         return {
             'sky_coeffs':  jnp.zeros((npix_sky, nmodes_sky), dtype=DTYPE_R_JAX),
-            'beam_coeffs': jnp.array(self.fwd.beam_coeffs),
+            'beam_coeffs': jnp.array(self.fwd._beam_coeffs_full),
             'log_ch_weights': jnp.zeros((self.ntime, self.nfreq), dtype=DTYPE_R_JAX),
             **init_gain_params(self.ntime, self.nfreq),
         }
@@ -659,8 +687,9 @@ class Calibrator:
         """
         sky_coeffs = self._ensure_sky_is_active(params['sky_coeffs'])
         if 'beam_coeffs' in params:
+            beam_coeffs = self._beam_coeffs_full(params['beam_coeffs'])
             vis_model = self._jit_simulate_variable_beam(
-                sky_coeffs, params['beam_coeffs'], self.rot_matrices
+                sky_coeffs, beam_coeffs, self.rot_matrices
             )
         else:
             vis_model = self._sim_fn(sky_coeffs, self.rot_matrices)
@@ -888,20 +917,27 @@ class Calibrator:
                 f"sky_coeffs shape {sky_coeffs.shape[0]} != npix_full {self._npix_full}"
             )
 
-        # Extract static pixels (unmasked) in masked coordinate system
         static_mask_full = ~self.pixel_mask
-        # Create array with shape matching the masked forward model
-        static_sky = np.zeros((len(self._pixel_indices), sky_coeffs.shape[1]), dtype=DTYPE_R_NPY)
+        if not np.any(static_mask_full):
+            self._cached_static_vis = jnp.zeros_like(self.data)
+            self._static_sky_cached = True
+            return
 
-        # Find which masked pixels are static pixels
-        for i, full_idx in enumerate(self._pixel_indices):
-            if static_mask_full[full_idx]:
-                static_sky[i] = sky_coeffs[full_idx]
+        solve_mask = self.pixel_mask.copy()
+        static_sky = sky_coeffs[static_mask_full]
 
-        # Simulate and cache
-        self._cached_static_vis = self._sim_fn(
-            jnp.array(static_sky, dtype=DTYPE_R_JAX), self.rot_matrices
-        )
+        # Temporarily point the forward model at the static pixels so their
+        # visibility contribution can be simulated with the same operator.
+        self.fwd.apply_sky_mask(static_mask_full)
+        self.fwd.precompute_time_geometry(self.rot_matrices)
+        try:
+            self._cached_static_vis = self._sim_fn(
+                jnp.array(static_sky, dtype=DTYPE_R_JAX), self.rot_matrices
+            )
+        finally:
+            self.fwd.apply_sky_mask(solve_mask)
+            self.fwd.precompute_time_geometry(self.rot_matrices)
+            self._recompile_jit()
         self._static_sky_cached = True
 
     def expand_sky_to_full(self, sky_coeffs_masked):
@@ -1040,6 +1076,7 @@ class Calibrator:
             data_for_fit = self.data
 
         sky_active = self._ensure_sky_is_active(sky_coeffs)
+        beam_coeffs = self._beam_coeffs_full(beam_coeffs)
         vis_model = self._jit_simulate_variable_beam(sky_active, beam_coeffs, self.rot_matrices)
 
         # Solve for gains and compute loss directly from vis_model (avoids redundant simulation)
@@ -1732,8 +1769,9 @@ class Calibrator:
         ----------
         check_every : int, default 1
             Compare Anderson acceleration vs plain step every N iterations.
-            Set to >1 to skip AA evaluation on non-checkpoint steps for speed,
-            using the same decision from the last checkpoint.
+            Set to >1 to reuse the previous AA/plain decision without checking
+            the loss on intervening steps. This saves evaluations, but those
+            intervening speculative AA steps are not guaranteed to be monotonic.
         rfi_regularization : float, default 1.0
             (Deprecated; kept for backward compatibility.)
         rfi_regularization_power : float, default 2.0
@@ -2678,8 +2716,9 @@ class Calibrator:
             Subtract cached static sky contribution from data before fitting.
         check_every : int, default 1
             Compare Anderson acceleration vs plain step every N iterations.
-            Set to >1 to skip AA evaluation on non-checkpoint steps for speed,
-            using the same decision from the last checkpoint.
+            Set to >1 to reuse the previous AA/plain decision without checking
+            the loss on intervening steps. This saves evaluations, but those
+            intervening speculative AA steps are not guaranteed to be monotonic.
         rfi_regularization : float, default 1.0
             (Deprecated; kept for backward compatibility.)
         rfi_regularization_power : float, default 2.0

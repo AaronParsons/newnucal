@@ -118,6 +118,24 @@ class TestFitGainsLinear:
             f"Returned loss {loss_returned:.3e} vs calc_loss {loss_recalc:.3e}"
         )
 
+    def test_calc_loss_auto_uses_explicit_beam(self, calibrator_gains_setup, sky_coeffs_true):
+        """calc_loss should match simulate by using beam_coeffs when present."""
+        cal, gain_params = calibrator_gains_setup
+        beam_coeffs = jnp.array(cal.fwd._beam_coeffs_full)
+        beam_perturbed = beam_coeffs * 0.5
+        params = {
+            'sky_coeffs': sky_coeffs_true,
+            'beam_coeffs': beam_perturbed,
+            **gain_params,
+        }
+
+        loss_auto = cal.calc_loss(params)
+        loss_explicit = cal.calc_loss(params, explicit_beam=True)
+        loss_fixed = cal.calc_loss(params, explicit_beam=False)
+
+        assert np.isclose(loss_auto, loss_explicit, rtol=1e-6, atol=1e-6)
+        assert not np.isclose(loss_auto, loss_fixed, rtol=1e-3, atol=1e-6)
+
     def test_output_shapes(self, calibrator_gains_setup, sky_coeffs_true):
         """Gain arrays must have the correct shapes."""
         cal, _ = calibrator_gains_setup
@@ -651,6 +669,20 @@ class TestBeamMasking:
         assert cal.fwd.npix_beam == int(mask.sum())
         assert cal.fwd.beam_coeffs.shape[0] == int(mask.sum())
 
+    def test_init_params_after_beam_mask_returns_full_beam(self, calibrator_gains_setup):
+        """External parameter dicts should keep full-sized beam coefficients."""
+        cal, _ = calibrator_gains_setup
+        npix_beam_full = healpy.nside2npix(cal.beam_model.nside)
+        mask = np.ones(npix_beam_full, dtype=bool)
+        mask[::2] = False
+        cal.apply_beam_mask(mask)
+
+        params = cal.init_params()
+
+        assert params['beam_coeffs'].shape[0] == npix_beam_full
+        assert np.isfinite(cal.calc_loss(params))
+        assert cal.simulate(params).shape == cal.data.shape
+
     def test_apply_ever_illuminated_beam_mask(self, calibrator_gains_setup):
         """build_beam_mask_altitude should produce mask for above-horizon pixels."""
         cal, _ = calibrator_gains_setup
@@ -771,6 +803,33 @@ class TestStaticSkySubtraction:
         assert cal._static_sky_cached
         assert cal._cached_static_vis is not None
         assert cal._cached_static_vis.shape == cal.data.shape
+        assert float(jnp.linalg.norm(cal._cached_static_vis)) > 0.0
+
+    def test_cache_static_sky_coeffs_matches_dropped_pixels(self, calibrator_gains_setup, sky_coeffs_true):
+        """Static cache should equal the visibility from pixels outside the solve mask."""
+        cal, _ = calibrator_gains_setup
+        npix_full = cal._npix_full
+        pixel_mask = np.zeros(npix_full, dtype=bool)
+        pixel_mask[:3*npix_full//4] = True
+        static_mask = ~pixel_mask
+        cal.apply_sky_mask(pixel_mask)
+
+        cal.cache_static_sky_coeffs(sky_coeffs_true)
+        cached = cal._cached_static_vis
+
+        cal.fwd.apply_sky_mask(static_mask)
+        cal.fwd.precompute_time_geometry(cal.rot_matrices)
+        try:
+            expected = cal.fwd.simulate(
+                jnp.array(np.asarray(sky_coeffs_true)[static_mask], dtype=jnp.float32),
+                cal.rot_matrices,
+            )
+        finally:
+            cal.fwd.apply_sky_mask(pixel_mask)
+            cal.fwd.precompute_time_geometry(cal.rot_matrices)
+            cal._recompile_jit()
+
+        assert jnp.allclose(cached, expected, rtol=1e-5, atol=1e-5)
 
     def test_fit_gains_linear_subtract_static_sky_requires_cache(self, calibrator_gains_setup, sky_coeffs_true):
         """fit_gains_linear with subtract_static_sky should raise if cache doesn't exist."""
@@ -1089,4 +1148,3 @@ class TestBeamSkyMaskingReverse:
         # And the perturbed beam loss should be higher
         assert loss_perturbed > loss_var, \
             "Perturbed beam should give worse loss"
-
