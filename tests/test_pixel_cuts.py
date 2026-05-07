@@ -404,31 +404,3 @@ class TestAndersonAccelerator:
         assert acc.step_gain == 2.0
         assert len(acc._hist_g) == 0
         assert len(acc._hist_f) == 0
-
-    def test_joint_block_scaling_balances_sky_and_beam(self):
-        from newnucal.calibrator import (
-            _joint_block_scales,
-            _pack_joint_scaled,
-            _unpack_joint_scaled,
-        )
-
-        sky = np.zeros((4, 2), dtype=np.float32)
-        beam = np.zeros((3, 2), dtype=np.float32)
-        sky_plain = sky + 1e-3
-        beam_plain = beam + 10.0
-
-        sky_scale, beam_scale = _joint_block_scales(sky, sky_plain, beam, beam_plain)
-        current_flat = _pack_joint_scaled(sky, beam, sky_scale, beam_scale)
-        plain_flat = _pack_joint_scaled(sky_plain, beam_plain, sky_scale, beam_scale)
-        delta = plain_flat - current_flat
-
-        sky_delta = delta[:sky.size]
-        beam_delta = delta[sky.size:]
-        assert np.isclose(np.sqrt(np.mean(sky_delta**2)), 1.0, rtol=1e-5)
-        assert np.isclose(np.sqrt(np.mean(beam_delta**2)), 1.0, rtol=1e-5)
-
-        sky_roundtrip, beam_roundtrip = _unpack_joint_scaled(
-            plain_flat, sky.shape, beam.shape, sky_scale, beam_scale
-        )
-        np.testing.assert_allclose(sky_roundtrip, sky_plain)
-        np.testing.assert_allclose(beam_roundtrip, beam_plain)

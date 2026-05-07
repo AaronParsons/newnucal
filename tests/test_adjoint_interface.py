@@ -500,6 +500,29 @@ class TestFitJointSkyBeamDirtyWithUnifiedInterface:
         assert state.settings['joint_sky_reg'] == 2e-3
         assert np.isfinite(state.loss)
 
+    def test_joint_aa_history_persists_across_gain_step(self, calibrator, sky_coeffs_test):
+        """Gain solves should not discard useful joint AA history."""
+        params = {
+            'sky_coeffs': sky_coeffs_test,
+            'beam_coeffs': calibrator.fwd.beam_coeffs,
+            **init_gain_params(calibrator.ntime, calibrator.nfreq)
+        }
+
+        state = calibrator.init_joint_sky_beam_dirty_state(
+            params,
+            joint_anderson_history=3,
+            solve_every={'gains': 0, 'rfi': 0},
+        )
+        state = calibrator.run_joint_sky_beam_dirty_state(state, n_iter=2)
+        hist_len = len(state.joint_acc._hist_f)
+        state.settings['solve_every']['gains'] = 1
+        state.n_since_gains = 1
+        state.eff_gains = 0.0
+        state = calibrator.run_joint_sky_beam_dirty_state(state, n_iter=1)
+
+        assert state.n_gains == 1
+        assert len(state.joint_acc._hist_f) == hist_len
+
     def test_fit_joint_sky_beam_dirty_with_step_gain_factor(self, calibrator, sky_coeffs_test):
         """fit_joint_sky_beam_dirty should support step_gain_factor for adaptive scaling."""
         params = {

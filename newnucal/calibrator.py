@@ -207,48 +207,6 @@ class AndersonAccelerator:
         return sol[:n]
 
 
-def _joint_block_scales(
-    sky_current,
-    sky_plain,
-    beam_current,
-    beam_plain,
-    eps: float = 1e-12,
-) -> tuple[float, float]:
-    """RMS scales for balancing sky and beam blocks in joint AA."""
-    sky_delta = np.asarray(sky_plain, dtype=DTYPE_R_NPY) - np.asarray(sky_current, dtype=DTYPE_R_NPY)
-    beam_delta = np.asarray(beam_plain, dtype=DTYPE_R_NPY) - np.asarray(beam_current, dtype=DTYPE_R_NPY)
-
-    sky_scale = float(np.sqrt(np.mean(sky_delta * sky_delta))) if sky_delta.size else 1.0
-    beam_scale = float(np.sqrt(np.mean(beam_delta * beam_delta))) if beam_delta.size else 1.0
-
-    if not np.isfinite(sky_scale) or sky_scale < eps:
-        sky_arr = np.asarray(sky_current, dtype=DTYPE_R_NPY)
-        sky_scale = float(np.sqrt(np.mean(sky_arr * sky_arr))) if sky_arr.size else 1.0
-    if not np.isfinite(beam_scale) or beam_scale < eps:
-        beam_arr = np.asarray(beam_current, dtype=DTYPE_R_NPY)
-        beam_scale = float(np.sqrt(np.mean(beam_arr * beam_arr))) if beam_arr.size else 1.0
-
-    if not np.isfinite(sky_scale) or sky_scale < eps:
-        sky_scale = 1.0
-    if not np.isfinite(beam_scale) or beam_scale < eps:
-        beam_scale = 1.0
-    return sky_scale, beam_scale
-
-
-def _pack_joint_scaled(sky, beam, sky_scale: float, beam_scale: float) -> np.ndarray:
-    return np.concatenate([
-        (np.asarray(sky, dtype=DTYPE_R_NPY) / sky_scale).ravel(),
-        (np.asarray(beam, dtype=DTYPE_R_NPY) / beam_scale).ravel(),
-    ])
-
-
-def _unpack_joint_scaled(flat, sky_shape, beam_shape, sky_scale: float, beam_scale: float):
-    sky_size = int(np.prod(sky_shape))
-    sky = flat[:sky_size].reshape(sky_shape) * sky_scale
-    beam = flat[sky_size:].reshape(beam_shape) * beam_scale
-    return sky, beam
-
-
 @dataclass
 class AlternatingDirtyFitState:
     """Persistent state for resumable fit_alternating_dirty runs."""
@@ -2294,28 +2252,38 @@ class Calibrator:
             joint_loss_next = joint_loss_plain
             used_aa = False
             aa_boosted = False
+            aa_proposed = False
+            aa_warming = False
 
             # Apply Anderson acceleration to joint (sky, beam) pair
             if state.joint_acc is not None:
-                sky_scale, beam_scale = _joint_block_scales(
-                    sky_coeffs, joint_sky_plain, beam_coeffs, joint_beam_plain
-                )
-                state.settings['_joint_aa_sky_scale'] = sky_scale
-                state.settings['_joint_aa_beam_scale'] = beam_scale
-                current_flat = _pack_joint_scaled(sky_coeffs, beam_coeffs, sky_scale, beam_scale)
-                plain_flat = _pack_joint_scaled(joint_sky_plain, joint_beam_plain, sky_scale, beam_scale)
+                current_flat = np.concatenate([
+                    np.asarray(sky_coeffs, dtype=DTYPE_R_NPY).ravel(),
+                    np.asarray(beam_coeffs, dtype=DTYPE_R_NPY).ravel(),
+                ])
+                plain_flat = np.concatenate([
+                    np.asarray(joint_sky_plain, dtype=DTYPE_R_NPY).ravel(),
+                    np.asarray(joint_beam_plain, dtype=DTYPE_R_NPY).ravel(),
+                ])
 
                 aa_candidate_flat = state.joint_acc.push(current_flat, plain_flat)
                 aa_boosted = state.joint_acc.last_push_boosted
+                aa_proposed = aa_candidate_flat is not None
+                aa_warming = (
+                    not aa_proposed
+                    and not aa_boosted
+                    and state.joint_acc.history > 0
+                    and len(state.joint_acc._hist_f) < 2
+                )
 
                 if is_check_step:
                     # Evaluate both plain and AA candidate; decide which to use
                     if aa_candidate_flat is not None:
                         sky_shape = sky_coeffs.shape
                         beam_shape = beam_coeffs.shape
-                        sky_cand_np, beam_cand_np = _unpack_joint_scaled(
-                            aa_candidate_flat, sky_shape, beam_shape, sky_scale, beam_scale
-                        )
+                        sky_size = int(np.prod(sky_shape))
+                        sky_cand_np = aa_candidate_flat[:sky_size].reshape(sky_shape)
+                        beam_cand_np = aa_candidate_flat[sky_size:].reshape(beam_shape)
                         joint_sky_cand = jnp.array(sky_cand_np, dtype=DTYPE_R_JAX)
                         joint_beam_cand = jnp.array(beam_cand_np, dtype=DTYPE_R_JAX)
                         joint_resid_cand, joint_loss_cand_jax = self._jit_residual_and_loss_variable_beam(
@@ -2341,9 +2309,9 @@ class Calibrator:
                     if state.settings.get('_joint_use_aa', False) and aa_candidate_flat is not None:
                         sky_shape = sky_coeffs.shape
                         beam_shape = beam_coeffs.shape
-                        sky_cand_np, beam_cand_np = _unpack_joint_scaled(
-                            aa_candidate_flat, sky_shape, beam_shape, sky_scale, beam_scale
-                        )
+                        sky_size = int(np.prod(sky_shape))
+                        sky_cand_np = aa_candidate_flat[:sky_size].reshape(sky_shape)
+                        beam_cand_np = aa_candidate_flat[sky_size:].reshape(beam_shape)
                         joint_sky_cand = jnp.array(sky_cand_np, dtype=DTYPE_R_JAX)
                         joint_beam_cand = jnp.array(beam_cand_np, dtype=DTYPE_R_JAX)
                         joint_sky_next = joint_sky_cand
@@ -2379,8 +2347,14 @@ class Calibrator:
                 line = f"    [joint {tag} {state.n_joint - 1:03d}]: loss={loss:.4e}  eff={eff:.2e} frac_Δloss/s  step_gain={state.joint_acc.step_gain:.2f}"
                 if used_aa and is_check_step:
                     line += f"  [AA improved: cand={joint_loss_cand:.4e} vs plain={joint_loss_plain:.4e}]"
+                elif aa_proposed and is_check_step:
+                    line += f"  [AA rejected: cand={joint_loss_cand:.4e} vs plain={joint_loss_plain:.4e}]"
+                elif aa_proposed and not is_check_step and not state.settings.get('_joint_use_aa', False):
+                    line += "  [AA candidate skipped: reuse previous plain decision]"
                 elif aa_boosted:
                     line += f"  [AA skipped: collinear history, step_gain->{state.joint_acc.step_gain:.2f}]"
+                elif aa_warming:
+                    line += f"  [AA warming: hist={len(state.joint_acc._hist_f)}/{state.joint_acc.history}]"
                 print(line)
 
         # Preserve log_ch_weights when updating params
