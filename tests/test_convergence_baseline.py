@@ -13,7 +13,7 @@ import pytest
 
 from newnucal.basis import basis_project
 from newnucal.calibrator import Calibrator
-from newnucal.gains import init_gain_params
+from newnucal.gains import apply_gains, init_gain_params
 from newnucal.simulate import ForwardModel
 
 
@@ -35,10 +35,40 @@ DEFAULT_BENCHMARK_JOINT_SETTINGS = dict(
     OLD_BASELINE_JOINT_SETTINGS,
     sky_beam_reg=3e-3,
     joint_initial_step=1.2,
+    solve_every={'gains': 4, 'rfi': 2},
 )
 
 
-def _make_closed_loop_case(array, beam_model, freqs, rot_matrices, sky_model):
+def _smooth_gain_params(ntime, nfreq):
+    f_norm = np.linspace(0, 1, nfreq, endpoint=False)[None, :]
+    t_norm = np.linspace(0, 1, ntime)[:, None]
+    log_amp = (
+        0.05 * np.cos(2 * np.pi * f_norm)
+        + 0.02 * np.sin(2 * np.pi * t_norm)
+    ).astype(np.float32)
+    phase = (
+        0.15 * np.sin(2 * np.pi * f_norm)
+        + 0.05 * np.cos(2 * np.pi * t_norm)
+    ).astype(np.float32)
+    phi = np.zeros((ntime, 2, nfreq), dtype=np.float32)
+    phi[:, 0, :] = (
+        1e-4 * np.cos(2 * np.pi * f_norm)
+        + 3e-5 * np.sin(2 * np.pi * t_norm)
+    )
+    phi[:, 1, :] = (
+        5e-5 * np.sin(2 * np.pi * f_norm)
+        + 2e-5 * np.cos(2 * np.pi * t_norm)
+    )
+    return {
+        'log_amp': jnp.array(log_amp),
+        'phase': jnp.array(phase),
+        'phi': jnp.array(phi),
+    }
+
+
+def _make_closed_loop_case(
+    array, beam_model, freqs, rot_matrices, sky_model, *, apply_true_gains=False
+):
     fwd = ForwardModel(array, sky_model, beam_model, freqs)
     fwd.precompute_time_geometry(rot_matrices)
 
@@ -50,6 +80,12 @@ def _make_closed_loop_case(array, beam_model, freqs, rot_matrices, sky_model):
         dtype=jnp.float32,
     )
     vis_model = fwd.simulate_3d(true_sky, jnp.array(rot_matrices))
+    if apply_true_gains:
+        vis_model = apply_gains(
+            vis_model,
+            **_smooth_gain_params(rot_matrices.shape[0], len(freqs)),
+            bls=jnp.array(array.bls, dtype=jnp.float32),
+        )
 
     rng = np.random.default_rng(123)
     noise = (
@@ -88,9 +124,15 @@ def _joint_loss_trace(
     joint_anderson_history,
     n_steps=12,
     settings_overrides=None,
+    apply_true_gains=False,
 ):
     cal, params = _make_closed_loop_case(
-        array, beam_model, freqs, rot_matrices, sky_model
+        array,
+        beam_model,
+        freqs,
+        rot_matrices,
+        sky_model,
+        apply_true_gains=apply_true_gains,
     )
     settings = dict(DEFAULT_BENCHMARK_JOINT_SETTINGS)
     if settings_overrides is not None:
@@ -129,15 +171,15 @@ def test_closed_loop_default_joint_convergence_baseline(
     )
 
     assert aa_state.step == 12
-    assert aa_state.n_joint == 10
-    assert aa_state.n_gains == 2
-    assert aa_state.n_rfi == 3
+    assert aa_state.n_joint == 9
+    assert aa_state.n_gains == 3
+    assert aa_state.n_rfi == 4
     assert plain_state.step == aa_state.step
 
     assert np.all(np.diff(aa_losses) <= 1e-6)
     assert aa_losses[4] < 0.72
     assert aa_losses[8] < 0.46
-    assert aa_losses[12] < 0.15
+    assert aa_losses[12] < 0.03
 
     assert aa_losses[12] < 0.96 * plain_losses[12]
 
@@ -165,6 +207,29 @@ def test_closed_loop_default_parameters_beat_old_baseline(
     )
 
     assert default_state.step == old_state.step == 12
-    assert default_state.n_joint == old_state.n_joint == 10
+    assert default_state.n_joint == 9
+    assert old_state.n_joint == 10
     assert np.all(np.diff(default_losses) <= 1e-6)
     assert default_losses[12] < 0.60 * old_losses[12]
+
+
+@pytest.mark.convergence
+def test_closed_loop_default_joint_convergence_with_nonunity_gains(
+    array, beam_model, freqs, rot_matrices, sky_model
+):
+    losses, state = _joint_loss_trace(
+        array,
+        beam_model,
+        freqs,
+        rot_matrices,
+        sky_model,
+        joint_anderson_history=2,
+        apply_true_gains=True,
+    )
+
+    assert state.step == 12
+    assert np.all(np.isfinite(losses))
+    assert state.n_joint == 9
+    assert state.n_gains == 3
+    assert state.n_rfi == 4
+    assert losses[12] < 0.07
