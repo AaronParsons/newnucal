@@ -1330,71 +1330,6 @@ class Calibrator:
         params_out_full = self._params_to_full_space(params_out, params_input)
         return params_out_full, float(best_loss_jax)
 
-    def fit_sky_and_beam_dirty(
-        self,
-        params,
-        n_iter: int = 3,
-        sky_step_size: float = 0.5,
-        beam_step_size: float = 0.5,
-        beam_reg: float = 1e-3,
-        sky_reg: float = 1e-3,
-        anderson_history: int = 0,
-        anderson_damping: float = 0.5,
-        anderson_ridge: float = 1e-8,
-        verbose: bool = False,
-        subtract_static_sky: bool = False,
-    ):
-        """Compatibility wrapper for joint dirty-map sky and beam updates.
-
-        This delegates to :meth:`fit_joint_sky_beam_dirty` so the joint solver
-        has a single implementation.  Independent sky-only and beam-only update
-        paths remain available via :meth:`fit_sky_dirty`, :meth:`fit_beam_dirty`,
-        and :meth:`compute_adjoint_updates`.
-
-        Parameters
-        ----------
-        params : dict
-            Parameter dict with 'sky_coeffs' and 'beam_coeffs'.
-        n_iter : int
-        sky_step_size : float
-        beam_step_size : float
-        beam_reg : float
-            Beam regularisation
-        sky_reg : float
-            Sky regularisation
-        anderson_history : int, default 0
-            Number of past iterates to keep for Anderson acceleration. 0 disables AA.
-        anderson_damping : float, default 0.5
-            Mixing weight for AA proposal: ``(1-damping)*plain + damping*aa``.
-        anderson_ridge : float, default 1e-8
-            Tikhonov regularisation for AA least-squares.
-        verbose : bool
-        subtract_static_sky : bool, optional
-            If True, subtract cached static sky contribution from data before fitting.
-            Requires cache_static_sky_coeffs() to be called first.
-
-        Returns
-        -------
-        params_out : dict
-            Updated parameters in full-sky format.
-        best_loss : float
-            Best loss achieved.
-        """
-        return self.fit_joint_sky_beam_dirty(
-            params,
-            n_iter=n_iter,
-            joint_sky_initial_step=sky_step_size,
-            joint_beam_initial_step=beam_step_size,
-            beam_reg=beam_reg,
-            sky_reg=sky_reg,
-            joint_anderson_history=anderson_history,
-            joint_aa_damping=anderson_damping,
-            joint_aa_ridge=anderson_ridge,
-            solve_every={'gains': 0},
-            subtract_static_sky=subtract_static_sky,
-            verbose=verbose,
-        )
-
     def get_sky_beam_weighting(self):
         """Return design matrix normal (Gram) diagonal for all sky pixels.
 
@@ -2618,12 +2553,17 @@ class Calibrator:
         verbose: bool = False,
         _stop_flag=None,
     ):
-        """Joint sky+beam dirty-map minimisation with optional gain and RFI weight updates.
+        """Canonical joint sky+beam dirty-map fit.
 
         Simultaneously updates sky and beam coefficients from a shared adjoint,
         with optional periodic gain solves and RFI channel weight updates via
-        the ``solve_every`` dict. Provides the same resumable state-machine
-        interface as :meth:`fit_alternating_dirty`.
+        the ``solve_every`` dict. This is the only public joint dirty-map fit;
+        use :meth:`init_joint_sky_beam_dirty_state`,
+        :meth:`run_joint_sky_beam_dirty_state`, or
+        :meth:`iter_joint_sky_beam_dirty` for resumable execution.
+
+        For independent one-block updates, use :meth:`fit_sky_dirty`,
+        :meth:`fit_beam_dirty`, or :meth:`compute_adjoint_updates`.
 
         Parameters are always returned in full-sky format.
 
@@ -2637,9 +2577,9 @@ class Calibrator:
         params : dict
             Parameter dict with 'sky_coeffs' and 'beam_coeffs' (full-sky or masked).
         n_iter : int
-        sky_beam_reg : float, default 1e-3
+        sky_beam_reg : float, default 1e-5
             Regularisation for sky and beam divisions.
-        anderson_history : int, default 0
+        joint_anderson_history : int, default 0
             Number of past iterates for Anderson acceleration on joint (sky, beam) vector.
             0 disables AA.
         joint_aa_start : int, default 2
@@ -2663,9 +2603,10 @@ class Calibrator:
             adjoint update. Defaults to ``sky_beam_reg`` for both.
         solve_every : dict, optional
             Cadence control: ``{'gains': n, 'rfi': m}`` solves gains every n steps,
-            updates RFI weights every m steps. Default ``{'gains': 1}`` (solve gains
-            every step). If ``'rfi'`` is not set or is 0, RFI reweighting is disabled.
-            Recommended: ``{'gains': 1, 'rfi': 5}`` (RFI every 5 steps).
+            updates RFI weights every m steps. If omitted, no gain or RFI updates
+            are scheduled. If ``'rfi'`` is not set or is 0, RFI reweighting is
+            disabled. Closed-loop fits commonly use
+            ``{'gains': 8, 'rfi': 3}``.
         eff_alpha : float, default 0.4
             EMA factor for efficiency tracking.
         target_reduced_chi2 : float, optional
