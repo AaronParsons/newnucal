@@ -1436,6 +1436,32 @@ class ForwardModel:
         vis_flat = jax.vmap(self._kernel_nufft2d_flat)(W_flat, self._2d_x_flat, self._2d_y_flat)
         return vis_flat.reshape(ntime, self.nfreq, self.nbls)
 
+    def beam_spec_horizon_from_coeffs_2d(self, beam_coeffs, rot_matrices):
+        """Return beam spectra on sky pixels for explicit coefficients via the 2D path."""
+        if (
+            (not self._geom_ready)
+            or self._topo_all.shape[0] != rot_matrices.shape[0]
+        ):
+            self.precompute_time_geometry(rot_matrices)
+        interp_px_all = jnp.array(self._interp_px_all)
+        interp_wgt_all = jnp.array(self._interp_wgt_all)
+        beam_coeffs_jax = jnp.array(beam_coeffs, dtype=DTYPE_R_JAX)
+        beam_interp = beam_coeffs_jax[interp_px_all]
+        bi_all = jnp.sum(interp_wgt_all[:, :, :, None] * beam_interp, axis=1)
+        return (bi_all @ jnp.array(self.A_beam, dtype=DTYPE_R_JAX).T) * self._horizon_all[:, :, None]
+
+    def simulate_2d_with_beam_spec_horizon(self, sky_coeffs, beam_spec_h_all):
+        """Simulate all times with precomputed beam spectra on sky pixels."""
+        ntime = beam_spec_h_all.shape[0]
+        sky_spec = (sky_coeffs @ self.A_sky.T).astype(DTYPE_C_JAX)
+        W_flat = (
+            (sky_spec[None, :, :] * beam_spec_h_all)
+            .transpose(0, 2, 1)
+            .reshape(ntime * self.nfreq, self.npix_sky)
+        )
+        vis_flat = jax.vmap(self._kernel_nufft2d_flat)(W_flat, self._2d_x_flat, self._2d_y_flat)
+        return vis_flat.reshape(ntime, self.nfreq, self.nbls)
+
     # ------------------------------------------------------------------
     # 2D hex-rect NUFFT path — adjoint / dirty-map helpers
     # ------------------------------------------------------------------

@@ -19,6 +19,7 @@ from newnucal.simulate import ForwardModel
 
 OLD_BASELINE_JOINT_SETTINGS = dict(
     sky_beam_reg=1e-3,
+    joint_initial_step=1.0,
     solve_every={'gains': 8, 'rfi': 3},
     rfi_smooth_width_chans=5,
     rfi_log_threshold=np.log(3.0),

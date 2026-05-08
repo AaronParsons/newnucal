@@ -341,6 +341,7 @@ class Calibrator:
         self._jit_loss_variable_beam = jax.jit(self._loss_variable_beam)
         self._jit_residual_variable_beam = jax.jit(self._residual_variable_beam)
         self._jit_residual_and_loss_variable_beam = jax.jit(self._residual_and_loss_variable_beam)
+        self._jit_residual_and_loss_beam_spec_horizon = jax.jit(self._residual_and_loss_beam_spec_horizon)
         self._jit_simulate = jax.jit(self._sim_fn)
         self._jit_simulate_variable_beam = jax.jit(self._var_beam_sim_fn)
         self._jit_gain_solve_and_loss = jax.jit(self._gain_solve_and_loss_from_vis)
@@ -529,6 +530,48 @@ class Calibrator:
         weighted_resid_for_adjoint = (data_cal - vis_model) * weights[:, :, None].astype(DTYPE_C_JAX)
 
         return weighted_resid_for_adjoint, loss
+
+    def _residual_and_loss_beam_spec_horizon(self, params, beam_spec_h_all, weights):
+        """Compute variable-beam residual/loss from precomputed beam spectra."""
+        sky_coeffs = self._ensure_sky_is_active(params['sky_coeffs'])
+        vis_model = self.fwd.simulate_2d_with_beam_spec_horizon(
+            sky_coeffs, beam_spec_h_all
+        )
+        vis_cal = apply_gains(vis_model, params['log_amp'], params['phase'], params['phi'], self.bls)
+        loss = jnp.sum(weights[:, :, None] * (jnp.abs(self.data - vis_cal) ** 2))
+
+        data_cal = apply_gains(
+            self.data, -params['log_amp'], -params['phase'], -params['phi'], self.bls
+        )
+        weighted_resid_for_adjoint = (data_cal - vis_model) * weights[:, :, None].astype(DTYPE_C_JAX)
+        return weighted_resid_for_adjoint, loss
+
+    def _eval_joint_candidate(
+        self,
+        sky_coeffs,
+        beam_coeffs,
+        gain_params,
+        weights,
+        *,
+        beam_spec_h_all=None,
+        delta_beam_spec_h_all=None,
+        beam_alpha=None,
+    ):
+        """Evaluate a joint candidate, reusing linearly parameterized beam spectra if available."""
+        if (
+            beam_spec_h_all is not None
+            and delta_beam_spec_h_all is not None
+            and beam_alpha is not None
+            and self.method == '2d'
+        ):
+            candidate_spec_h = beam_spec_h_all + beam_alpha * delta_beam_spec_h_all
+            return self._jit_residual_and_loss_beam_spec_horizon(
+                {'sky_coeffs': sky_coeffs, **gain_params}, candidate_spec_h, weights
+            )
+        return self._jit_residual_and_loss_variable_beam(
+            {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs, **gain_params},
+            weights,
+        )
 
     def calc_loss(self, params, explicit_beam: bool | None = None):
         if explicit_beam is None:
@@ -1169,6 +1212,7 @@ class Calibrator:
         self._jit_loss_variable_beam = jax.jit(self._loss_variable_beam)
         self._jit_residual_variable_beam = jax.jit(self._residual_variable_beam)
         self._jit_residual_and_loss_variable_beam = jax.jit(self._residual_and_loss_variable_beam)
+        self._jit_residual_and_loss_beam_spec_horizon = jax.jit(self._residual_and_loss_beam_spec_horizon)
         self._jit_simulate = jax.jit(self._sim_fn)
         self._jit_simulate_variable_beam = jax.jit(self._var_beam_sim_fn)
         self._jit_gain_solve_and_loss = jax.jit(self._gain_solve_and_loss_from_vis)
@@ -2089,6 +2133,15 @@ class Calibrator:
             )
             delta_sky_base = updates['sky']
             delta_beam_base = updates['beam']
+            beam_spec_h_all = None
+            delta_beam_spec_h_all = None
+            if self.method == '2d':
+                beam_spec_h_all = self.fwd.beam_spec_horizon_from_coeffs_2d(
+                    beam_coeffs, self.rot_matrices
+                )
+                delta_beam_spec_h_all = self.fwd.beam_spec_horizon_from_coeffs_2d(
+                    delta_beam_base, self.rot_matrices
+                )
 
             joint_sky_trial = sky_coeffs
             joint_beam_trial = beam_coeffs
@@ -2119,9 +2172,11 @@ class Calibrator:
                     for candidate_beam_step in beam_steps:
                         joint_sky_step = (sky_coeffs + candidate_sky_step * delta_sky_base).astype(DTYPE_R_JAX)
                         joint_beam_step = (beam_coeffs + candidate_beam_step * delta_beam_base).astype(DTYPE_R_JAX)
-                        trial_resid, trial_loss_jax = self._jit_residual_and_loss_variable_beam(
-                            {'sky_coeffs': joint_sky_step, 'beam_coeffs': joint_beam_step, **gain_params},
-                            weights
+                        trial_resid, trial_loss_jax = self._eval_joint_candidate(
+                            joint_sky_step, joint_beam_step, gain_params, weights,
+                            beam_spec_h_all=beam_spec_h_all,
+                            delta_beam_spec_h_all=delta_beam_spec_h_all,
+                            beam_alpha=float(candidate_beam_step),
                         )
                         joint_loss_step = float(trial_loss_jax)
                         if joint_loss_step < joint_loss_trial:
@@ -2157,9 +2212,11 @@ class Calibrator:
                 while gain_to_try >= state.joint_acc._min_step_gain:
                     joint_sky_step = (sky_coeffs + gain_to_try * sky_step_scalar * delta_sky_base).astype(DTYPE_R_JAX)
                     joint_beam_step = (beam_coeffs + gain_to_try * beam_step_scalar * delta_beam_base).astype(DTYPE_R_JAX)
-                    trial_resid, trial_loss_jax = self._jit_residual_and_loss_variable_beam(
-                        {'sky_coeffs': joint_sky_step, 'beam_coeffs': joint_beam_step, **gain_params},
-                        weights
+                    trial_resid, trial_loss_jax = self._eval_joint_candidate(
+                        joint_sky_step, joint_beam_step, gain_params, weights,
+                        beam_spec_h_all=beam_spec_h_all,
+                        delta_beam_spec_h_all=delta_beam_spec_h_all,
+                        beam_alpha=float(gain_to_try * beam_step_scalar),
                     )
                     joint_loss_step = float(trial_loss_jax)
                     if joint_loss_step < joint_loss_trial:
@@ -2221,9 +2278,8 @@ class Calibrator:
                         beam_cand_np = aa_candidate_flat[sky_size:].reshape(beam_shape)
                         joint_sky_cand = jnp.array(sky_cand_np, dtype=DTYPE_R_JAX)
                         joint_beam_cand = jnp.array(beam_cand_np, dtype=DTYPE_R_JAX)
-                        joint_resid_cand, joint_loss_cand_jax = self._jit_residual_and_loss_variable_beam(
-                            {'sky_coeffs': joint_sky_cand, 'beam_coeffs': joint_beam_cand, **gain_params},
-                            weights
+                        joint_resid_cand, joint_loss_cand_jax = self._eval_joint_candidate(
+                            joint_sky_cand, joint_beam_cand, gain_params, weights
                         )
                         joint_loss_cand = float(joint_loss_cand_jax)
                         if joint_loss_cand < joint_loss_plain:
@@ -2251,9 +2307,8 @@ class Calibrator:
                         joint_beam_cand = jnp.array(beam_cand_np, dtype=DTYPE_R_JAX)
                         joint_sky_next = joint_sky_cand
                         joint_beam_next = joint_beam_cand
-                        joint_resid_cand, joint_loss_cand_jax = self._jit_residual_and_loss_variable_beam(
-                            {'sky_coeffs': joint_sky_next, 'beam_coeffs': joint_beam_next, **gain_params},
-                            weights,
+                        joint_resid_cand, joint_loss_cand_jax = self._eval_joint_candidate(
+                            joint_sky_next, joint_beam_next, gain_params, weights
                         )
                         joint_loss_next = float(joint_loss_cand_jax)
                         used_aa = True

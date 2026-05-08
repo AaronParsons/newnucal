@@ -100,6 +100,60 @@ class TestResidualAndLossFunction:
         assert jnp.allclose(resid_combined, resid_separate, rtol=1e-5, atol=1e-8), \
             "Combined residual does not match separate residual"
 
+    def test_precomputed_beam_spectrum_matches_variable_beam(self, calibrator_gains_setup, sky_coeffs_true):
+        """Precomputed beam spectra should reproduce the explicit beam residual/loss path."""
+        cal, true_gains = calibrator_gains_setup
+        weights = cal._effective_weights()
+        beam_coeffs = jnp.array(cal.fwd.beam_coeffs)
+        params = {
+            'sky_coeffs': sky_coeffs_true,
+            'beam_coeffs': beam_coeffs,
+            **true_gains,
+        }
+
+        resid_variable, loss_variable = cal._jit_residual_and_loss_variable_beam(params, weights)
+        beam_spec_h = cal.fwd.beam_spec_horizon_from_coeffs_2d(beam_coeffs, cal.rot_matrices)
+        resid_precomp, loss_precomp = cal._jit_residual_and_loss_beam_spec_horizon(
+            {'sky_coeffs': sky_coeffs_true, **true_gains},
+            beam_spec_h,
+            weights,
+        )
+
+        np.testing.assert_allclose(loss_precomp, loss_variable, rtol=1e-5, atol=1e-8)
+        np.testing.assert_allclose(resid_precomp, resid_variable, rtol=1e-5, atol=1e-6)
+
+    def test_linear_beam_spectrum_candidate_matches_variable_beam(self, calibrator_gains_setup, sky_coeffs_true):
+        """Linearly formed candidate spectra should match candidate beam coefficients."""
+        cal, true_gains = calibrator_gains_setup
+        weights = cal._effective_weights()
+        beam_coeffs = jnp.array(cal.fwd.beam_coeffs)
+        delta_beam = jnp.ones_like(beam_coeffs) * 0.01
+        alpha = 1.7
+        beam_candidate = beam_coeffs + alpha * delta_beam
+
+        resid_variable, loss_variable = cal._jit_residual_and_loss_variable_beam(
+            {
+                'sky_coeffs': sky_coeffs_true,
+                'beam_coeffs': beam_candidate,
+                **true_gains,
+            },
+            weights,
+        )
+        beam_spec_h = cal.fwd.beam_spec_horizon_from_coeffs_2d(beam_coeffs, cal.rot_matrices)
+        delta_spec_h = cal.fwd.beam_spec_horizon_from_coeffs_2d(delta_beam, cal.rot_matrices)
+        resid_cached, loss_cached = cal._eval_joint_candidate(
+            sky_coeffs_true,
+            beam_candidate,
+            true_gains,
+            weights,
+            beam_spec_h_all=beam_spec_h,
+            delta_beam_spec_h_all=delta_spec_h,
+            beam_alpha=alpha,
+        )
+
+        np.testing.assert_allclose(loss_cached, loss_variable, rtol=1e-5, atol=1e-8)
+        np.testing.assert_allclose(resid_cached, resid_variable, rtol=1e-5, atol=1e-6)
+
 
 class TestResidualCache:
     """Test Level 1 cache: accepted trial residual for next adjoint."""
