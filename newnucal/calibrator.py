@@ -1572,12 +1572,12 @@ class Calibrator:
         self,
         params,
         *,
-        sky_beam_reg: float = 1e-5,
+        sky_beam_reg: float = 3e-3,
         joint_anderson_history: int = 0,
         joint_aa_start: int = 2,
         joint_aa_damping: float = 0.5,
         joint_aa_ridge: float = 1e-8,
-        joint_initial_step: float | list = 1.0,
+        joint_initial_step: float | list = 1.2,
         joint_sky_initial_step: float | list | None = None,
         joint_beam_initial_step: float | list | None = None,
         joint_step_gain_factor: float = 2.0,
@@ -2521,12 +2521,12 @@ class Calibrator:
         self,
         params,
         n_iter: int = 30,
-        sky_beam_reg: float = 1e-5,
+        sky_beam_reg: float = 3e-3,
         joint_anderson_history: int = 0,
         joint_aa_start: int = 2,
         joint_aa_damping: float = 0.5,
         joint_aa_ridge: float = 1e-8,
-        joint_initial_step: float | list = 1.0,
+        joint_initial_step: float | list = 1.2,
         joint_sky_initial_step: float | list | None = None,
         joint_beam_initial_step: float | list | None = None,
         joint_step_gain_factor: float = 2.0,
@@ -2577,7 +2577,7 @@ class Calibrator:
         params : dict
             Parameter dict with 'sky_coeffs' and 'beam_coeffs' (full-sky or masked).
         n_iter : int
-        sky_beam_reg : float, default 1e-5
+        sky_beam_reg : float, default 3e-3
             Regularisation for sky and beam divisions.
         joint_anderson_history : int, default 0
             Number of past iterates for Anderson acceleration on joint (sky, beam) vector.
@@ -2588,7 +2588,7 @@ class Calibrator:
             AA mixing weight.
         joint_aa_ridge : float, default 1e-8
             AA Tikhonov regularisation.
-        joint_initial_step : float or list, default 1.0
+        joint_initial_step : float or list, default 1.2
             Step size for plain joint step. If a list, performs one-time line search
             on first iteration to select the best value.
         joint_sky_initial_step, joint_beam_initial_step : float or list, optional

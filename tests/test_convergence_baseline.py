@@ -2,7 +2,9 @@
 
 These tests are intentionally numerical regression tests rather than proof-style
 unit tests.  They keep a lightweight, deterministic version of the notebook
-workflow in CI so convergence changes have a baseline to beat.
+workflow in CI so convergence changes have a baseline to beat.  For proposals
+that add more per-step compute, such as BB or multi-candidate searches, compare
+loss reduction per wall time rather than loss at a fixed iteration count alone.
 """
 
 import numpy as np
@@ -15,7 +17,7 @@ from newnucal.gains import init_gain_params
 from newnucal.simulate import ForwardModel
 
 
-NOTEBOOK_LIKE_JOINT_SETTINGS = dict(
+OLD_BASELINE_JOINT_SETTINGS = dict(
     sky_beam_reg=1e-3,
     solve_every={'gains': 8, 'rfi': 3},
     rfi_smooth_width_chans=5,
@@ -26,6 +28,12 @@ NOTEBOOK_LIKE_JOINT_SETTINGS = dict(
     rfi_alpha_up=0.9,
     rfi_min_retention_per_update=0.5,
     max_rfi_updates=None,
+)
+
+DEFAULT_BENCHMARK_JOINT_SETTINGS = dict(
+    OLD_BASELINE_JOINT_SETTINGS,
+    sky_beam_reg=3e-3,
+    joint_initial_step=1.2,
 )
 
 
@@ -78,14 +86,18 @@ def _joint_loss_trace(
     *,
     joint_anderson_history,
     n_steps=12,
+    settings_overrides=None,
 ):
     cal, params = _make_closed_loop_case(
         array, beam_model, freqs, rot_matrices, sky_model
     )
+    settings = dict(DEFAULT_BENCHMARK_JOINT_SETTINGS)
+    if settings_overrides is not None:
+        settings.update(settings_overrides)
     state = cal.init_joint_sky_beam_dirty_state(
         params,
         joint_anderson_history=joint_anderson_history,
-        **NOTEBOOK_LIKE_JOINT_SETTINGS,
+        **settings,
     )
     losses = [float(state.loss)]
     for _ in range(n_steps):
@@ -95,7 +107,7 @@ def _joint_loss_trace(
 
 
 @pytest.mark.convergence
-def test_closed_loop_joint_convergence_baseline(
+def test_closed_loop_default_joint_convergence_baseline(
     array, beam_model, freqs, rot_matrices, sky_model
 ):
     aa_losses, aa_state = _joint_loss_trace(
@@ -124,6 +136,34 @@ def test_closed_loop_joint_convergence_baseline(
     assert np.all(np.diff(aa_losses) <= 1e-6)
     assert aa_losses[4] < 0.72
     assert aa_losses[8] < 0.46
-    assert aa_losses[12] < 0.24
+    assert aa_losses[12] < 0.15
 
     assert aa_losses[12] < 0.96 * plain_losses[12]
+
+
+@pytest.mark.convergence
+def test_closed_loop_default_parameters_beat_old_baseline(
+    array, beam_model, freqs, rot_matrices, sky_model
+):
+    old_losses, old_state = _joint_loss_trace(
+        array,
+        beam_model,
+        freqs,
+        rot_matrices,
+        sky_model,
+        joint_anderson_history=2,
+        settings_overrides=OLD_BASELINE_JOINT_SETTINGS,
+    )
+    default_losses, default_state = _joint_loss_trace(
+        array,
+        beam_model,
+        freqs,
+        rot_matrices,
+        sky_model,
+        joint_anderson_history=2,
+    )
+
+    assert default_state.step == old_state.step == 12
+    assert default_state.n_joint == old_state.n_joint == 10
+    assert np.all(np.diff(default_losses) <= 1e-6)
+    assert default_losses[12] < 0.60 * old_losses[12]
