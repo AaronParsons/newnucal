@@ -1,0 +1,129 @@
+"""Closed-loop convergence baselines for joint sky/beam fitting.
+
+These tests are intentionally numerical regression tests rather than proof-style
+unit tests.  They keep a lightweight, deterministic version of the notebook
+workflow in CI so convergence changes have a baseline to beat.
+"""
+
+import numpy as np
+import jax.numpy as jnp
+import pytest
+
+from newnucal.basis import basis_project
+from newnucal.calibrator import Calibrator
+from newnucal.gains import init_gain_params
+from newnucal.simulate import ForwardModel
+
+
+NOTEBOOK_LIKE_JOINT_SETTINGS = dict(
+    sky_beam_reg=1e-3,
+    solve_every={'gains': 8, 'rfi': 3},
+    rfi_smooth_width_chans=5,
+    rfi_log_threshold=np.log(3.0),
+    rfi_gamma=0.75,
+    rfi_log_min_weight=np.log(1e-5),
+    rfi_alpha_down=0.5,
+    rfi_alpha_up=0.9,
+    rfi_min_retention_per_update=0.5,
+    max_rfi_updates=None,
+)
+
+
+def _make_closed_loop_case(array, beam_model, freqs, rot_matrices, sky_model):
+    fwd = ForwardModel(array, sky_model, beam_model, freqs)
+    fwd.precompute_time_geometry(rot_matrices)
+
+    true_sky = jnp.array(
+        basis_project(
+            np.ones((fwd.npix_sky, len(freqs)), dtype=np.float32) * 0.1,
+            np.asarray(sky_model.A),
+        ),
+        dtype=jnp.float32,
+    )
+    vis_model = fwd.simulate_3d(true_sky, jnp.array(rot_matrices))
+
+    rng = np.random.default_rng(123)
+    noise = (
+        rng.normal(0, 0.01, vis_model.shape)
+        + 1j * rng.normal(0, 0.01, vis_model.shape)
+    )
+    cal = Calibrator(
+        array=array,
+        beam_model=beam_model,
+        sky_model=sky_model,
+        freqs=freqs,
+        rot_matrices=rot_matrices,
+        data=np.asarray(vis_model) + noise,
+    )
+
+    rng = np.random.default_rng(42)
+    sky_start = jnp.array(
+        rng.normal(0, 0.1, (fwd.npix_sky, sky_model.A.shape[1])),
+        dtype=jnp.float32,
+    )
+    params = {
+        'sky_coeffs': sky_start,
+        'beam_coeffs': cal.fwd.beam_coeffs,
+        **init_gain_params(cal.ntime, cal.nfreq),
+    }
+    return cal, params
+
+
+def _joint_loss_trace(
+    array,
+    beam_model,
+    freqs,
+    rot_matrices,
+    sky_model,
+    *,
+    joint_anderson_history,
+    n_steps=12,
+):
+    cal, params = _make_closed_loop_case(
+        array, beam_model, freqs, rot_matrices, sky_model
+    )
+    state = cal.init_joint_sky_beam_dirty_state(
+        params,
+        joint_anderson_history=joint_anderson_history,
+        **NOTEBOOK_LIKE_JOINT_SETTINGS,
+    )
+    losses = [float(state.loss)]
+    for _ in range(n_steps):
+        state = cal.run_joint_sky_beam_dirty_state(state, n_iter=1)
+        losses.append(float(state.loss))
+    return np.asarray(losses), state
+
+
+@pytest.mark.convergence
+def test_closed_loop_joint_convergence_baseline(
+    array, beam_model, freqs, rot_matrices, sky_model
+):
+    aa_losses, aa_state = _joint_loss_trace(
+        array,
+        beam_model,
+        freqs,
+        rot_matrices,
+        sky_model,
+        joint_anderson_history=2,
+    )
+    plain_losses, plain_state = _joint_loss_trace(
+        array,
+        beam_model,
+        freqs,
+        rot_matrices,
+        sky_model,
+        joint_anderson_history=0,
+    )
+
+    assert aa_state.step == 12
+    assert aa_state.n_joint == 10
+    assert aa_state.n_gains == 2
+    assert aa_state.n_rfi == 3
+    assert plain_state.step == aa_state.step
+
+    assert np.all(np.diff(aa_losses) <= 1e-6)
+    assert aa_losses[4] < 0.72
+    assert aa_losses[8] < 0.46
+    assert aa_losses[12] < 0.24
+
+    assert aa_losses[12] < 0.96 * plain_losses[12]

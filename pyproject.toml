@@ -30,3 +30,6 @@ include = ["newnucal*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "convergence: closed-loop convergence baselines for solver performance regressions",
+]
