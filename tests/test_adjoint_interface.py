@@ -441,6 +441,26 @@ class TestFitJointSkyBeamDirtyWithUnifiedInterface:
         assert state.settings['joint_sky_reg'] == 2e-3
         assert np.isfinite(state.loss)
 
+    def test_joint_state_accepts_one_sided_initial_step_list(self, calibrator, sky_coeffs_test):
+        """One-sided separate step searches should save scalar steps after first use."""
+        params = {
+            'sky_coeffs': sky_coeffs_test,
+            'beam_coeffs': calibrator.fwd.beam_coeffs,
+            **init_gain_params(calibrator.ntime, calibrator.nfreq)
+        }
+
+        state = calibrator.init_joint_sky_beam_dirty_state(
+            params,
+            joint_sky_initial_step=[0.6, 1.2],
+            joint_beam_initial_step=1.2,
+            solve_every={'gains': 0, 'rfi': 0},
+        )
+        state = calibrator.run_joint_sky_beam_dirty_state(state, n_iter=2)
+
+        assert isinstance(state.settings['joint_sky_initial_step'], float)
+        assert isinstance(state.settings['joint_beam_initial_step'], float)
+        assert np.isfinite(state.loss)
+
     def test_joint_aa_history_persists_across_gain_step(self, calibrator, sky_coeffs_test):
         """Gain solves should not discard useful joint AA history."""
         params = {

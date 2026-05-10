@@ -2194,13 +2194,15 @@ class Calibrator:
                             joint_resid_trial = trial_resid
                             selected_sky_step = float(candidate_sky_step)
                             selected_beam_step = float(candidate_beam_step)
-                # Save the best steps as scalars for future use
+                # Save scalar steps for future iterations, even if no candidate
+                # improves. Otherwise one-sided list searches would reach the
+                # normal retry loop with a list-valued step on the next pass.
+                s['joint_sky_initial_step'] = selected_sky_step
+                s['joint_beam_initial_step'] = selected_beam_step
+                # Preserve legacy setting when the user supplied only joint_initial_step.
+                if not isinstance(s.get('joint_initial_step'), (list, tuple)):
+                    s['joint_initial_step'] = selected_sky_step
                 if joint_loss_trial < loss:
-                    s['joint_sky_initial_step'] = selected_sky_step
-                    s['joint_beam_initial_step'] = selected_beam_step
-                    # Preserve legacy setting when the user supplied only joint_initial_step.
-                    if not isinstance(s.get('joint_initial_step'), (list, tuple)):
-                        s['joint_initial_step'] = selected_sky_step
                     if verbose:
                         print(
                             "      [initial line search: selected "
