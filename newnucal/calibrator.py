@@ -24,6 +24,9 @@ from .rfi import (
 from .utils import DTYPE_R_JAX, DTYPE_R_NPY, DTYPE_C_JAX
 
 
+DEFAULT_JOINT_SOLVE_EVERY = {'gains': 4, 'rfi': 2}
+
+
 class _StopFitFlag:
     def __init__(self):
         self.stop = False
@@ -266,6 +269,12 @@ class JointSkyBeamDirtyFitState:
 
 class Calibrator:
     _GAIN_PARAM_KEYS = ('log_amp', 'phase', 'phi')
+
+    @staticmethod
+    def _joint_solve_every_or_default(solve_every: dict | None) -> dict:
+        if solve_every is None:
+            return dict(DEFAULT_JOINT_SOLVE_EVERY)
+        return dict(solve_every)
 
     def __init__(
         self,
@@ -1685,8 +1694,7 @@ class Calibrator:
             Maximum number of RFI weight updates to perform. If None, updates
             continue throughout the fit.
         """
-        if solve_every is None:
-            solve_every = {}
+        solve_every = self._joint_solve_every_or_default(solve_every)
 
         params_active = self._params_to_active_space(params)
 
@@ -1719,7 +1727,7 @@ class Calibrator:
                 joint_beam_initial_step=joint_beam_initial_step,
                 joint_beam_reg=sky_beam_reg if beam_reg is None else beam_reg,
                 joint_sky_reg=sky_beam_reg if sky_reg is None else sky_reg,
-                solve_every=dict(solve_every),
+                solve_every=solve_every,
                 eff_alpha=eff_alpha,
                 target_reduced_chi2=target_reduced_chi2,
                 reduced_chi2_check_every=max(int(reduced_chi2_check_every), 1),
@@ -2658,10 +2666,9 @@ class Calibrator:
             adjoint update. Defaults to ``sky_beam_reg`` for both.
         solve_every : dict, optional
             Cadence control: ``{'gains': n, 'rfi': m}`` solves gains every n steps,
-            updates RFI weights every m steps. If omitted, no gain or RFI updates
-            are scheduled. If ``'rfi'`` is not set or is 0, RFI reweighting is
-            disabled. Closed-loop fits commonly use
-            ``{'gains': 8, 'rfi': 3}``.
+            updates RFI weights every m steps. If omitted, defaults to
+            ``{'gains': 4, 'rfi': 2}``. Set a cadence to 0 to disable that
+            update, for example ``{'gains': 0, 'rfi': 0}``.
         eff_alpha : float, default 0.4
             EMA factor for efficiency tracking.
         target_reduced_chi2 : float, optional

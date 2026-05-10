@@ -10,6 +10,7 @@ import numpy as np
 import jax.numpy as jnp
 import pytest
 
+from newnucal.calibrator import DEFAULT_JOINT_SOLVE_EVERY
 from newnucal.gains import init_gain_params
 
 
@@ -341,6 +342,24 @@ class TestFitJointSkyBeamDirtyWithUnifiedInterface:
         assert state.step == 0
         assert state.n_joint == 0
         assert state.n_gains == 0
+        assert state.settings['solve_every'] == DEFAULT_JOINT_SOLVE_EVERY
+        assert state.settings['solve_every'] is not DEFAULT_JOINT_SOLVE_EVERY
+
+    def test_init_joint_sky_beam_dirty_state_preserves_explicit_solve_every(
+        self, calibrator, sky_coeffs_test
+    ):
+        """Explicit solve_every should override the tuned default cadence."""
+        params = {
+            'sky_coeffs': sky_coeffs_test,
+            'beam_coeffs': calibrator.fwd.beam_coeffs,
+            **init_gain_params(calibrator.ntime, calibrator.nfreq)
+        }
+
+        state = calibrator.init_joint_sky_beam_dirty_state(
+            params, solve_every={'gains': 0}
+        )
+
+        assert state.settings['solve_every'] == {'gains': 0}
 
     def test_run_joint_sky_beam_dirty_state_advances(self, calibrator, sky_coeffs_test):
         """run_joint_sky_beam_dirty_state should advance the state."""

@@ -35,7 +35,7 @@ DEFAULT_BENCHMARK_JOINT_SETTINGS = dict(
     OLD_BASELINE_JOINT_SETTINGS,
     sky_beam_reg=3e-3,
     joint_initial_step=1.2,
-    solve_every={'gains': 4, 'rfi': 2},
+    solve_every=None,
 )
 
 
