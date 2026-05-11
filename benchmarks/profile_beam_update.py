@@ -1,106 +1,28 @@
-"""
-Benchmark and profile the beam update step to identify bottlenecks.
-
-Reproduces the closed_loop_test.ipynb scenario with sky masking active,
-then profiles a single beam dirty update iteration.
-"""
-
 import cProfile
 import pstats
-import numpy as np
-import jax.numpy as jnp
 from io import StringIO
 
-from newnucal import HERAArray, BeamModel, BeamBasis, SkyBasis, SkyModel, Calibrator, init_gain_params
-from newnucal.simulate import compute_rotation_matrices
-from astropy.time import Time
-from astropy.coordinates import EarthLocation
-import astropy.units as u
+from bench_utils import block_until_ready, setup_benchmark_calibrator, time_call
 
 
-def setup_calibrator():
-    """Set up the same scenario as closed_loop_test.ipynb with sky masking."""
-    # --- Array ---
-    array = HERAArray.from_hex(hexnum=5, sep=14.6)
-    print(f"Array: {array.nants} antennas, {array.nbls} baselines")
-
-    # --- Frequencies ---
-    nfreq = 32
-    freqs = np.linspace(50e6, 225e6, nfreq, dtype=np.float32)
-
-    # --- Times ---
-    hera_loc = EarthLocation(lat=-30.7215 * u.deg, lon=21.4283 * u.deg, height=1073.0 * u.m)
-    t0 = Time("2023-03-21T04:00:00", scale="utc")
-    ntime = 24
-    dt = 240 * u.min / (ntime + 1)
-    times = t0 + np.arange(ntime) * dt
-    rot_matrices = compute_rotation_matrices(times, hera_loc)
-
-    # --- Beam and sky models ---
-    sky_nside = 32
-    beam_basis = BeamBasis.from_dpss(freqs, eta_max=20e-9)
-    beam_model = BeamModel(nside=16, freqs=freqs, basis=beam_basis)
-
-    sky_basis = SkyBasis.from_dpss(freqs, eta_max=40e-9)
-    sky_model = SkyModel(nside=sky_nside, freqs=freqs, basis=sky_basis)
-
-    # --- Synthetic data ---
-    fwd_temp = __import__("newnucal").ForwardModel(array, sky_model, beam_model, freqs, eps=1e-5)
-
-    npix_sky = fwd_temp.npix_sky
-    ref_freq = 150e6
-    rng = np.random.default_rng(42)
-    spectral_indices = rng.normal(-0.7, 0.1, npix_sky).astype(np.float32)
-    ref_flux = rng.exponential(scale=1.0, size=npix_sky).astype(np.float32)
-    flux_true = ref_flux[:, None] * (freqs[None, :] / ref_freq) ** spectral_indices[:, None]
-    sky_coeffs_true = jnp.array(sky_basis.project(flux_true), dtype=jnp.float32)
-
-    vis_true = fwd_temp.simulate(sky_coeffs_true, jnp.array(rot_matrices))
-
-    # Smooth gains
-    t_norm = np.linspace(0, 1, ntime)[:, None]
-    f_norm = np.linspace(0, 1, nfreq)[None, :]
-    true_log_amp = (0.05 * np.cos(2 * np.pi * f_norm) + 0.02 * np.sin(2 * np.pi * t_norm)).astype(np.float32)
-    true_phase = (0.15 * np.sin(2 * np.pi * f_norm) + 0.05 * np.cos(2 * np.pi * t_norm)).astype(np.float32)
-    true_phi = np.zeros((ntime, 2, nfreq), dtype=np.float32)
-    true_phi[:, 0, :] = (1e-4 * np.cos(2 * np.pi * f_norm) + 3e-5 * np.sin(2 * np.pi * t_norm))
-    true_phi[:, 1, :] = (5e-5 * np.sin(2 * np.pi * f_norm) + 2e-5 * np.cos(2 * np.pi * t_norm))
-
-    from newnucal.gains import apply_gains
-    vis_data = apply_gains(vis_true, jnp.array(true_log_amp), jnp.array(true_phase),
-                           jnp.array(true_phi), jnp.array(array.bls, dtype=jnp.float32))
-
-    # --- Create calibrator ---
-    cal = Calibrator(array=array, sky_model=sky_model, beam_model=beam_model, freqs=freqs,
-                     rot_matrices=rot_matrices, data=vis_data, eps=1e-5)
-
-    # --- Apply sky masking (like in the notebook) ---
-    bm_wgts = cal.get_sky_beam_weighting()
-    threshold = bm_wgts.max() / 1000
-    mask = bm_wgts > threshold
-    cal.apply_sky_mask(mask)
-
-    npix_active = int(mask.sum())
-    print(f"Sky masking: {npix_active}/{npix_sky} pixels active")
-
-    # --- Perturbed parameters ---
-    rng2 = np.random.default_rng(99)
-    sky_coeffs_perturbed = sky_coeffs_true + 0.30 * jnp.array(
-        rng2.standard_normal(sky_coeffs_true.shape).astype(np.float32)
-    ) * float(jnp.abs(sky_coeffs_true).mean())
-
-    beam_coeffs_true = jnp.array(beam_model.coeffs, dtype=jnp.float32)
-    rng3 = np.random.default_rng(77)
-    beam_coeffs_perturbed = beam_coeffs_true + 0.30 * jnp.array(
-        rng3.standard_normal(beam_coeffs_true.shape).astype(np.float32)
-    ) * float(jnp.abs(beam_coeffs_true).mean())
-
-    params = {
-        "sky_coeffs": sky_coeffs_perturbed,
-        "beam_coeffs": beam_coeffs_perturbed,
-        **init_gain_params(ntime, nfreq),
-    }
-
+def setup_calibrator(*, apply_beam_mask=False):
+    """Set up a notebook-sized scenario with the shared benchmark helper."""
+    cal, params, info = setup_benchmark_calibrator(
+        hexnum=5,
+        nfreq=32,
+        ntime=24,
+        sky_nside=32,
+        beam_nside=16,
+        use_dpss_basis=True,
+        apply_masks="standard",
+    )
+    if apply_beam_mask:
+        beam_mask = cal.build_beam_mask_altitude(min_altitude_deg=0.0)
+        cal.apply_beam_mask(beam_mask)
+    print(
+        f"Array: {info['nants']} antennas, {info['nbls']} baselines; "
+        f"sky pixels={cal.fwd.npix_sky}, beam pixels={cal.fwd.npix_beam}"
+    )
     return cal, params
 
 
@@ -116,6 +38,7 @@ def profile_sky_update(cal, params):
     pr = cProfile.Profile()
     pr.enable()
     sky_out, loss = cal.fit_sky_dirty(sky_coeffs, gain_params, n_iter=1, verbose=True)
+    block_until_ready(sky_out)
     pr.disable()
 
     s = StringIO()
@@ -133,6 +56,7 @@ def profile_beam_update(cal, params):
     pr = cProfile.Profile()
     pr.enable()
     params_out, loss = cal.fit_beam_dirty(params, n_iter=1, verbose=True)
+    block_until_ready(params_out)
     pr.disable()
 
     s = StringIO()
@@ -142,11 +66,11 @@ def profile_beam_update(cal, params):
 
 
 if __name__ == "__main__":
-    cal, params = setup_calibrator()
+    cal, params = setup_calibrator(apply_beam_mask=False)
 
     # Warm up JIT
     print("\nWarming up JIT...")
-    _ = cal.calc_loss(params)
+    time_call("calc_loss warmup", lambda: cal.calc_loss(params), repeats=1)
 
     # Profile sky and beam updates WITHOUT beam masking
     print("\n" + "="*60)
@@ -159,12 +83,11 @@ if __name__ == "__main__":
     print("\n" + "="*60)
     print("WITH BEAM MASKING (ever-illuminated)")
     print("="*60)
-    cal2, params2 = setup_calibrator()
-    cal2.apply_ever_illuminated_beam_mask()
+    cal2, params2 = setup_calibrator(apply_beam_mask=True)
     print(f"\nBeam reduced from {cal.fwd.npix_beam} to {cal2.fwd.npix_beam} pixels")
 
     # Warm up JIT for masked version
-    _ = cal2.calc_loss(params2)
+    time_call("masked calc_loss warmup", lambda: cal2.calc_loss(params2), repeats=1)
 
     profile_sky_update(cal2, params2)
     profile_beam_update(cal2, params2)

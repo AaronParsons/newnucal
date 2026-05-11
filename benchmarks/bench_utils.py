@@ -3,6 +3,10 @@ import sys
 import time
 from pathlib import Path
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 import jax
 import numpy as np
 import jax.numpy as jnp
@@ -153,6 +157,9 @@ def setup_benchmark_calibrator(
     ref_freq=150e6,
     beam_file=None,
     sky_file=None,
+    use_dpss_basis=False,
+    sky_eta_max=40e-9,
+    beam_eta_max=20e-9,
     method='2d',
     eps=1e-5,
     sep=14.6,
@@ -183,14 +190,18 @@ def setup_benchmark_calibrator(
     rot_matrices, times = make_rot_matrices(ntime=ntime)
     array = HERAArray.from_hex(hexnum=hexnum, sep=sep)
 
-    beam_file = beam_file or str(_BENCH_DIR / 'beam_basis_airy.npz')
-    sky_file = sky_file or str(_BENCH_DIR / 'sky_basis_gsm_gleam.npz')
-    try:
-        beam_basis = BeamBasis.from_file(beam_file, new_freqs=freqs)
-        sky_basis = SkyBasis.from_file(sky_file, new_freqs=freqs)
-    except FileNotFoundError as e:
-        print(f"Error: Could not find basis files.\n  {e}")
-        sys.exit(1)
+    if use_dpss_basis:
+        beam_basis = BeamBasis.from_dpss(freqs, eta_max=beam_eta_max)
+        sky_basis = SkyBasis.from_dpss(freqs, eta_max=sky_eta_max)
+    else:
+        beam_file = beam_file or str(_BENCH_DIR / 'beam_basis_airy.npz')
+        sky_file = sky_file or str(_BENCH_DIR / 'sky_basis_gsm_gleam.npz')
+        try:
+            beam_basis = BeamBasis.from_file(beam_file, new_freqs=freqs)
+            sky_basis = SkyBasis.from_file(sky_file, new_freqs=freqs)
+        except FileNotFoundError as e:
+            print(f"Error: Could not find basis files.\n  {e}")
+            sys.exit(1)
 
     beam_model = BeamModel(nside=beam_nside, freqs=freqs, basis=beam_basis)
     sky_model = SkyModel(nside=sky_nside, freqs=freqs, basis=sky_basis)
