@@ -81,6 +81,34 @@ def test_resample_params_can_transfer_sky_or_beam(
     np.testing.assert_allclose(sky_only["log_ch_weights"], params_low["log_ch_weights"])
 
 
+def test_resample_params_accepts_full_sky_params_from_masked_calibrator(
+    array, freqs, rot_matrices, sky_basis, beam_basis
+):
+    low_sky = SkyModel(nside=2, freqs=freqs, basis=sky_basis)
+    high_sky = SkyModel(nside=4, freqs=freqs, basis=sky_basis)
+    low_beam = BeamModel(nside=2, freqs=freqs, basis=beam_basis)
+    high_beam = BeamModel(nside=4, freqs=freqs, basis=beam_basis)
+
+    data = np.zeros((len(rot_matrices), len(freqs), array.nbls), dtype=np.complex64)
+    cal_low = Calibrator(array, low_beam, low_sky, freqs, rot_matrices, data)
+    cal_high = Calibrator(array, high_beam, high_sky, freqs, rot_matrices, data)
+    mask = np.zeros(high_sky.npix, dtype=bool)
+    mask[::3] = True
+    cal_high.apply_sky_mask(mask)
+
+    params_high = {
+        "sky_coeffs": jnp.zeros((high_sky.npix, high_sky.nmodes), dtype=jnp.float32),
+        "beam_coeffs": jnp.array(high_beam.coeffs, dtype=jnp.float32),
+        "log_ch_weights": None,
+        **init_gain_params(cal_high.ntime, cal_high.nfreq),
+    }
+    params_low = resample_params(params_high, cal_high, cal_low, sky=True, beam=True)
+
+    assert params_low["sky_coeffs"].shape == (low_sky.npix, low_sky.nmodes)
+    assert params_low["beam_coeffs"].shape == (low_beam.npix, low_beam.nmodes)
+    assert "log_ch_weights" not in params_low
+
+
 def test_init_resampled_joint_state_runs_one_step(
     array, freqs, rot_matrices, sky_basis, beam_basis
 ):

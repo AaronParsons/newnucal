@@ -101,8 +101,10 @@ def resample_params(
     for key in cal_in._GAIN_PARAM_KEYS:
         if key in params_full:
             out[key] = params_full[key]
-    if "log_ch_weights" in params_full:
+    if params_full.get("log_ch_weights") is not None:
         out["log_ch_weights"] = np.asarray(params_full["log_ch_weights"], dtype=DTYPE_R_NPY)
+    else:
+        out.pop("log_ch_weights", None)
     return out
 
 

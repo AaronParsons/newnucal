@@ -477,14 +477,17 @@ class Calibrator:
         # Expand sky_coeffs to full-sky
         if 'sky_coeffs' in params_active and params_active['sky_coeffs'] is not None:
             val_active = np.asarray(params_active['sky_coeffs'])
-            nmodes = val_active.shape[1] if val_active.ndim > 1 else 1
-            val_full = np.zeros((self._npix_full, nmodes), dtype=val_active.dtype)
-            if params_input_full is not None and 'sky_coeffs' in params_input_full:
-                orig = params_input_full['sky_coeffs']
-                if orig is not None and orig.shape[0] == self._npix_full:
-                    val_full[:] = np.asarray(orig)
-            val_full[self._pixel_indices] = val_active
-            out['sky_coeffs'] = jnp.array(val_full, dtype=DTYPE_R_JAX)
+            if val_active.shape[0] == self._npix_full:
+                out['sky_coeffs'] = jnp.array(val_active, dtype=DTYPE_R_JAX)
+            else:
+                nmodes = val_active.shape[1] if val_active.ndim > 1 else 1
+                val_full = np.zeros((self._npix_full, nmodes), dtype=val_active.dtype)
+                if params_input_full is not None and 'sky_coeffs' in params_input_full:
+                    orig = params_input_full['sky_coeffs']
+                    if orig is not None and orig.shape[0] == self._npix_full:
+                        val_full[:] = np.asarray(orig)
+                val_full[self._pixel_indices] = val_active
+                out['sky_coeffs'] = jnp.array(val_full, dtype=DTYPE_R_JAX)
         else:
             out['sky_coeffs'] = params_active.get('sky_coeffs')
 
