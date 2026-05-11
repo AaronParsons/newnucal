@@ -351,6 +351,9 @@ class Calibrator:
         self._jit_residual_variable_beam = jax.jit(self._residual_variable_beam)
         self._jit_residual_and_loss_variable_beam = jax.jit(self._residual_and_loss_variable_beam)
         self._jit_residual_and_loss_beam_spec_horizon = jax.jit(self._residual_and_loss_beam_spec_horizon)
+        self._jit_rfi_residual_and_observed_power_variable_beam = jax.jit(
+            self._rfi_residual_and_observed_power_variable_beam
+        )
         self._jit_simulate = jax.jit(self._sim_fn)
         self._jit_simulate_variable_beam = jax.jit(self._var_beam_sim_fn)
         self._jit_gain_solve_and_loss = jax.jit(self._gain_solve_and_loss_from_vis)
@@ -798,6 +801,29 @@ class Calibrator:
         )
         return data_cal - vis_model
 
+    def _rfi_residual_and_observed_power_variable_beam(self, params):
+        """Return RFI residual and observed-domain loss power from one simulation.
+
+        The RFI detector uses the gain-calibrated residual, while the optimizer
+        loss is measured before gain inversion as ``data - gain(model)``.
+        Returning both avoids a second variable-beam forward model after an RFI
+        weight update.
+        """
+        sky_coeffs = self._ensure_sky_is_active(params['sky_coeffs'])
+        beam_coeffs = self._beam_coeffs_full(params['beam_coeffs'])
+        vis_model = self._var_beam_sim_fn(
+            sky_coeffs, beam_coeffs, self.rot_matrices
+        )
+        vis_cal = apply_gains(
+            vis_model, params['log_amp'], params['phase'], params['phi'], self.bls
+        )
+        data_cal = apply_gains(
+            self.data, -params['log_amp'], -params['phase'], -params['phi'], self.bls
+        )
+        rfi_resid = data_cal - vis_model
+        observed_power = jnp.sum(jnp.abs(self.data - vis_cal) ** 2, axis=2)
+        return rfi_resid, observed_power
+
     def _residual_variable_beam(self, params, weights):
         """Weighted residual function (variable beam) for adjoint computation.
 
@@ -1229,6 +1255,9 @@ class Calibrator:
         self._jit_residual_variable_beam = jax.jit(self._residual_variable_beam)
         self._jit_residual_and_loss_variable_beam = jax.jit(self._residual_and_loss_variable_beam)
         self._jit_residual_and_loss_beam_spec_horizon = jax.jit(self._residual_and_loss_beam_spec_horizon)
+        self._jit_rfi_residual_and_observed_power_variable_beam = jax.jit(
+            self._rfi_residual_and_observed_power_variable_beam
+        )
         self._jit_simulate = jax.jit(self._sim_fn)
         self._jit_simulate_variable_beam = jax.jit(self._var_beam_sim_fn)
         self._jit_gain_solve_and_loss = jax.jit(self._gain_solve_and_loss_from_vis)
@@ -2397,8 +2426,12 @@ class Calibrator:
             loss_pre_rfi = float(state.loss)
 
             cfg = s['rfi_config']
-            resid_jax = self.calibrated_residual_variable_beam_unweighted(state.params)
-            resid = np.asarray(jax.device_get(resid_jax))
+            resid_jax, observed_power_jax = self._jit_rfi_residual_and_observed_power_variable_beam(
+                state.params
+            )
+            resid, observed_power = jax.device_get((resid_jax, observed_power_jax))
+            resid = np.asarray(resid)
+            observed_power = np.asarray(observed_power)
             inv_var = np.asarray(jax.device_get(self.inv_noise_var))
 
             # Use local chi-squared exponential weighting: detect channels that are
@@ -2437,9 +2470,10 @@ class Calibrator:
             state.params['log_ch_weights'] = new_log_weights
             self.set_channel_weights(new_log_weights)
 
-            # Compute loss after RFI weight update to track efficiency
-            loss_post_rfi_jax = self._jit_loss_variable_beam(state.params, self._effective_weights())
-            loss_post_rfi = float(loss_post_rfi_jax)
+            # Compute post-RFI objective from the observed-domain residual
+            # power returned with the RFI residual. This matches
+            # _loss_variable_beam without a second variable-beam simulation.
+            loss_post_rfi = float(np.sum(new_weights_direct * inv_var * observed_power))
             dt_rfi = max(_time.perf_counter() - t_rfi_start, 1e-3)
             dloss_rfi = max(0.0, loss_pre_rfi - loss_post_rfi)
             eff_rfi = dloss_rfi / (max(loss_pre_rfi, 1e-30) * dt_rfi)

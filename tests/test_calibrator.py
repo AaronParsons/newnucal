@@ -197,6 +197,31 @@ class TestRFIWeightedCalibrator:
 
         assert loss_downweighted < 0.05 * loss_full
 
+    def test_rfi_observed_power_matches_variable_beam_loss(self, calibrator_rfi_setup):
+        """Fused RFI helper should reproduce the observed-domain objective."""
+        cal, params = calibrator_rfi_setup
+        ntime, nfreq = cal.ntime, cal.nfreq
+        params = dict(params)
+        params['log_amp'] = jnp.full((ntime, nfreq), 0.03, dtype=jnp.float32)
+        phase_f = jnp.linspace(-0.1, 0.1, nfreq, dtype=jnp.float32)
+        params['phase'] = phase_f[None, :] * jnp.ones((ntime, 1), dtype=jnp.float32)
+        params['phi'] = jnp.zeros((ntime, 2, nfreq), dtype=jnp.float32)
+
+        log_weights = np.zeros((ntime, nfreq), dtype=np.float32)
+        log_weights[:, 1::2] = np.log(0.25)
+        inv_noise_var = np.linspace(0.5, 1.5, nfreq, dtype=np.float32)[None, :]
+        inv_noise_var = np.repeat(inv_noise_var, ntime, axis=0)
+        cal.set_channel_weights(log_weights)
+        cal.set_inv_noise_var(inv_noise_var)
+
+        _, observed_power = cal._jit_rfi_residual_and_observed_power_variable_beam(params)
+        loss_from_power = float(
+            np.sum(np.exp(log_weights) * inv_noise_var * np.asarray(observed_power))
+        )
+        loss_recalc = cal.calc_loss(params, explicit_beam=True)
+
+        np.testing.assert_allclose(loss_from_power, loss_recalc, rtol=1e-5, atol=1e-5)
+
     def test_calc_reduced_chi2_near_unity_for_known_noise(self, array, beam_model, freqs, rot_matrices, forward_model, sky_coeffs_true, sky_model):
         from newnucal.calibrator import Calibrator
         rng = np.random.default_rng(123)
