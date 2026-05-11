@@ -319,6 +319,7 @@ class Calibrator:
         self.bls = jnp.array(array.bls, dtype=DTYPE_R_JAX)
         self.log_ch_weights = jnp.zeros(self.data.shape[:2], dtype=DTYPE_R_JAX)
         self.inv_noise_var = jnp.ones(self.data.shape[:2], dtype=DTYPE_R_JAX)
+        self._inv_noise_var_np = np.ones(self.data.shape[:2], dtype=DTYPE_R_NPY)
 
         self.A_sky = np.asarray(sky_model.A, dtype=DTYPE_R_NPY)  # (nfreq, nmodes)
         sky_nside  = sky_model.nside
@@ -680,6 +681,9 @@ class Calibrator:
                     f"or {(self.nfreq,)}, got {arr.shape}"
                 )
         self.inv_noise_var = jnp.clip(arr, 0.0, jnp.inf).astype(DTYPE_R_JAX)
+        self._inv_noise_var_np = np.asarray(
+            jax.device_get(self.inv_noise_var), dtype=DTYPE_R_NPY
+        )
 
     def set_noise_sigma(self, noise_sigma=None):
         """Set per-time/per-frequency noise sigma.
@@ -703,6 +707,9 @@ class Calibrator:
             )
         arr = jnp.clip(arr, 1e-20, jnp.inf)
         self.inv_noise_var = (1.0 / (arr ** 2)).astype(DTYPE_R_JAX)
+        self._inv_noise_var_np = np.asarray(
+            jax.device_get(self.inv_noise_var), dtype=DTYPE_R_NPY
+        )
 
     def calc_reduced_chi2(self, params, explicit_beam: bool | None = None, subtract_params=0):
         """Approximate reduced chi-squared under the current weights/noise model.
@@ -2432,7 +2439,7 @@ class Calibrator:
             resid, observed_power = jax.device_get((resid_jax, observed_power_jax))
             resid = np.asarray(resid)
             observed_power = np.asarray(observed_power)
-            inv_var = np.asarray(jax.device_get(self.inv_noise_var))
+            inv_var = self._inv_noise_var_np
 
             # Use local chi-squared exponential weighting: detect channels that are
             # outliers relative to their neighbors in chi² space (log scale).

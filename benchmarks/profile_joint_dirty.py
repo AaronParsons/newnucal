@@ -6,10 +6,13 @@ Uses cProfile to measure per-subroutine time and call counts during
 joint sky+beam dirty-map fitting.
 """
 import argparse
+from collections import Counter
+from contextlib import contextmanager
 import cProfile
 import os
 import pstats
 import time
+import traceback
 from io import StringIO
 
 os.environ['OMP_NUM_THREADS'] = '1'
@@ -18,6 +21,56 @@ import jax
 jax.config.update("jax_enable_x64", False)
 
 from bench_utils import block_until_ready, setup_benchmark_calibrator, time_call
+
+
+@contextmanager
+def _scalar_sync_tracer(enabled=False, top_n=12):
+    """Trace JAX scalar/array host conversions during benchmark windows."""
+    if not enabled:
+        yield None
+        return
+
+    array_cls = type(jax.numpy.array(1.0))
+    orig_float = array_cls.__float__
+    orig_array = array_cls.__array__
+    counts = Counter()
+
+    def _caller_key(kind):
+        stack = traceback.extract_stack()[:-2]
+        for frame in reversed(stack):
+            if frame.filename == __file__:
+                continue
+            if "site-packages/jax" in frame.filename:
+                continue
+            if "site-packages/jaxlib" in frame.filename:
+                continue
+            return (kind, frame.filename, frame.lineno, frame.name, frame.line or "")
+        frame = stack[-1]
+        return (kind, frame.filename, frame.lineno, frame.name, frame.line or "")
+
+    def traced_float(self):
+        counts[_caller_key("__float__")] += 1
+        return orig_float(self)
+
+    def traced_array(self, *args, **kwargs):
+        counts[_caller_key("__array__")] += 1
+        return orig_array(self, *args, **kwargs)
+
+    array_cls.__float__ = traced_float
+    array_cls.__array__ = traced_array
+    try:
+        yield counts
+    finally:
+        array_cls.__float__ = orig_float
+        array_cls.__array__ = orig_array
+        print("Scalar/array host conversion call sites:")
+        print("-" * 80)
+        for (kind, filename, lineno, name, line), count in counts.most_common(top_n):
+            file_short = filename.split("/")[-1]
+            print(f"{count:5d} {kind:<10} {file_short}:{lineno} {name}  {line}")
+        if not counts:
+            print("(none)")
+        print("=" * 80 + "\n")
 
 
 def _fit_kwargs(args):
@@ -83,21 +136,20 @@ def _profile_fit(args):
 
     pr = cProfile.Profile()
     t0 = time.perf_counter()
-    pr.enable()
-
-    params, loss_after = cal.fit_joint_sky_beam_dirty(
-        prms0,
-        n_iter=args.n_iter,
-        joint_anderson_history=args.aa_history,
-        joint_aa_start=2,
-        joint_aa_damping=0.5,
-        joint_aa_ridge=1e-8,
-        verbose=False,
-        **_fit_kwargs(args),
-    )
-    block_until_ready(params)
-
-    pr.disable()
+    with _scalar_sync_tracer(args.trace_scalar_syncs, args.top_n):
+        pr.enable()
+        params, loss_after = cal.fit_joint_sky_beam_dirty(
+            prms0,
+            n_iter=args.n_iter,
+            joint_anderson_history=args.aa_history,
+            joint_aa_start=2,
+            joint_aa_damping=0.5,
+            joint_aa_ridge=1e-8,
+            verbose=False,
+            **_fit_kwargs(args),
+        )
+        block_until_ready(params)
+        pr.disable()
     total_time = time.perf_counter() - t0
 
     _print_profile(pr, args)
@@ -147,10 +199,11 @@ def _profile_warmed_state(args):
 
     pr = cProfile.Profile()
     t0 = time.perf_counter()
-    pr.enable()
-    state = cal.run_joint_sky_beam_dirty_state(state, n_iter=args.n_iter, verbose=False)
-    block_until_ready(state.params)
-    pr.disable()
+    with _scalar_sync_tracer(args.trace_scalar_syncs, args.top_n):
+        pr.enable()
+        state = cal.run_joint_sky_beam_dirty_state(state, n_iter=args.n_iter, verbose=False)
+        block_until_ready(state.params)
+        pr.disable()
     total_time = time.perf_counter() - t0
     loss_after = float(state.loss)
 
@@ -213,6 +266,8 @@ if __name__ == "__main__":
                               "steps, or both (default: fit)"))
     parser.add_argument("--warmup-steps", type=int, default=2,
                         help="State-machine steps to run before warmed-state profiling")
+    parser.add_argument("--trace-scalar-syncs", action="store_true",
+                        help="Print call sites for JAX scalar/array host conversions")
     args = parser.parse_args()
     if args.apply_masks == "none":
         args.apply_masks = None
