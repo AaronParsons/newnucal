@@ -8,121 +8,23 @@ regression checks after changing masked scatter or dirty-map code.
 
 from __future__ import annotations
 
-import time
-
 import jax
 import jax.numpy as jnp
 import numpy as np
-from astropy.coordinates import EarthLocation
-from astropy.time import Time
 
-from newnucal.array import HERAArray
-from newnucal.basis import BeamBasis, SkyBasis
-from newnucal.beam import BeamModel
-from newnucal.calibrator import Calibrator
-from newnucal.gains import apply_gains, init_gain_params
-from newnucal.simulate import compute_rotation_matrices
-from newnucal.sky import SkyModel
-
-
-HERA_LOC = EarthLocation.from_geodetic(
-    lat=-30.72152612068926,
-    lon=21.42830382686301,
-    height=1051.69,
+from bench_utils import (
+    block_until_ready,
+    setup_lightweight_masked_joint_case,
+    time_call,
 )
 
 
 def _block(x):
-    return jax.tree_util.tree_map(
-        lambda y: y.block_until_ready() if hasattr(y, "block_until_ready") else y,
-        x,
-    )
-
-
-def _time_call(label, fn, repeats=5):
-    _block(fn())
-    samples = []
-    for _ in range(repeats):
-        t0 = time.perf_counter()
-        _block(fn())
-        samples.append(time.perf_counter() - t0)
-    mean = float(np.mean(samples))
-    print(f"{label:28s} mean={mean:.5f}s min={min(samples):.5f}s max={max(samples):.5f}s")
-    return mean
-
-
-def _make_masked_case():
-    nfreq = 16
-    ntimes = 2
-    freqs = np.linspace(100e6, 200e6, nfreq, endpoint=False, dtype=np.float32)
-    array = HERAArray.from_hex(hexnum=2)
-    sky_basis = SkyBasis.from_dpss(freqs, eta_max=40e-9)
-    beam_basis = BeamBasis.from_dpss(freqs, eta_max=20e-9)
-    sky_model = SkyModel(nside=8, freqs=freqs, basis=sky_basis)
-    beam_model = BeamModel(nside=8, freqs=freqs, basis=beam_basis)
-
-    t0 = Time("2018-08-31T04:02:30", format="isot", scale="utc")
-    times = Time(np.linspace(t0.jd, t0.jd + 1 / 24, ntimes), format="jd")
-    rot_matrices = compute_rotation_matrices(times, HERA_LOC)
-
-    true_sky = jnp.array(
-        sky_basis.project(
-            np.ones((sky_model.npix, nfreq), dtype=np.float32) * 0.1
-        ),
-        dtype=jnp.float32,
-    )
-    true_vis = Calibrator(
-        array, beam_model, sky_model, freqs, rot_matrices,
-        data=np.zeros((ntimes, nfreq, array.nbls), dtype=np.complex64),
-        method="2d",
-    ).fwd.simulate_2d(true_sky, jnp.array(rot_matrices))
-
-    t_norm = np.linspace(0, 1, ntimes)[:, None]
-    f_norm = np.linspace(0, 1, nfreq, endpoint=False)[None, :]
-    data = apply_gains(
-        true_vis,
-        jnp.array(0.05 * np.cos(2 * np.pi * f_norm) + 0.02 * np.sin(2 * np.pi * t_norm)),
-        jnp.array(0.15 * np.sin(2 * np.pi * f_norm) + 0.05 * np.cos(2 * np.pi * t_norm)),
-        jnp.zeros((ntimes, 2, nfreq), dtype=jnp.float32),
-        jnp.array(array.bls, dtype=jnp.float32),
-    )
-
-    cal = Calibrator(
-        array=array,
-        beam_model=beam_model,
-        sky_model=sky_model,
-        freqs=freqs,
-        rot_matrices=rot_matrices,
-        data=np.asarray(data),
-        method="2d",
-    )
-    beam_mask = cal.build_beam_mask_altitude(0)
-    sky_mask = cal.build_sky_mask_from_beam_pixels(beam_mask)
-    cal.apply_sky_mask(sky_mask)
-    cal.apply_beam_mask(beam_mask)
-
-    rng = np.random.default_rng(42)
-    params = {
-        "sky_coeffs": jnp.array(
-            rng.normal(0, 0.1, (sky_model.npix, sky_model.nmodes)),
-            dtype=jnp.float32,
-        ),
-        "beam_coeffs": cal.fwd._beam_coeffs_full,
-        **init_gain_params(ntimes, nfreq),
-    }
-    state = cal.init_joint_sky_beam_dirty_state(
-        params,
-        joint_anderson_history=2,
-        solve_every={"gains": 0, "rfi": 0},
-    )
-    weights = cal._effective_weights()
-    resid, _ = cal._jit_residual_and_loss_variable_beam(state.params, weights)
-    _block(resid)
-    return cal, state, resid
+    return block_until_ready(x)
 
 
 def main():
-    cal, state, resid = _make_masked_case()
+    cal, state, resid = setup_lightweight_masked_joint_case()
     fwd = cal.fwd
     sky_coeffs = state.params["sky_coeffs"]
     beam_reg = state.settings["joint_beam_reg"]
@@ -224,16 +126,16 @@ def main():
         )
 
     print("\nend-to-end adjoints")
-    t_dirty = _time_call("dirty apparent sky", dirty_all)
-    t_sky = _time_call(
+    t_dirty = time_call("dirty apparent sky", dirty_all)
+    t_sky = time_call(
         "sky-only adjoint",
         lambda: fwd.accumulate_equatorial_sky_update_2d(resid, step_size=1.0, beam_reg=beam_reg),
     )
-    t_beam = _time_call(
+    t_beam = time_call(
         "beam-only adjoint",
         lambda: fwd.accumulate_beam_update_2d(sky_coeffs, resid, step_size=1.0, sky_reg=sky_reg),
     )
-    t_combined = _time_call(
+    t_combined = time_call(
         "combined adjoint",
         lambda: fwd.accumulate_sky_and_beam_update_2d(
             sky_coeffs, resid, sky_step_size=1.0, beam_step_size=1.0,
@@ -242,14 +144,14 @@ def main():
     )
 
     print("\njit-wrapped end-to-end adjoints")
-    t_jit_sky = _time_call("jitted sky-only adjoint", lambda: jitted_sky_adjoint(resid))
-    t_jit_beam = _time_call("jitted beam-only adjoint", lambda: jitted_beam_adjoint(sky_coeffs, resid))
-    t_jit_combined = _time_call("jitted combined adjoint", lambda: jitted_combined_adjoint(sky_coeffs, resid))
+    t_jit_sky = time_call("jitted sky-only adjoint", lambda: jitted_sky_adjoint(resid))
+    t_jit_beam = time_call("jitted beam-only adjoint", lambda: jitted_beam_adjoint(sky_coeffs, resid))
+    t_jit_combined = time_call("jitted combined adjoint", lambda: jitted_combined_adjoint(sky_coeffs, resid))
 
     print("\nsubcomponents from precomputed dirty sky")
-    t_sky_acc = _time_call("sky accum/projection", lambda: sky_accum_from_dirty(dirty_pf_all))
-    t_beam_proj = _time_call("beam delta projection", lambda: beam_project_from_dirty(dirty_pf_all))
-    t_scatter = _time_call("masked beam scatter", lambda: masked_scatter_from_delta(delta_bi_all))
+    t_sky_acc = time_call("sky accum/projection", lambda: sky_accum_from_dirty(dirty_pf_all))
+    t_beam_proj = time_call("beam delta projection", lambda: beam_project_from_dirty(dirty_pf_all))
+    t_scatter = time_call("masked beam scatter", lambda: masked_scatter_from_delta(delta_bi_all))
 
     accounted = t_dirty + t_sky_acc + t_beam_proj + t_scatter
     print("\nsummary")
