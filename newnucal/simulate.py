@@ -1406,11 +1406,11 @@ class ForwardModel:
         ntime = self._topo_all.shape[0]
 
         # Precompute beam_spec_h_all from beam_coeffs for all times
-        interp_px_all = jnp.array(self._interp_px_all)  # (ntime, 4, npix_sky)
-        interp_wgt_all = jnp.array(self._interp_wgt_all)  # (ntime, 4, npix_sky)
+        interp_px_all = jnp.asarray(self._interp_px_all)  # (ntime, 4, npix_sky)
+        interp_wgt_all = jnp.asarray(self._interp_wgt_all)  # (ntime, 4, npix_sky)
         horizon_all = self._horizon_all  # (ntime, npix_sky)
-        beam_coeffs_jax = jnp.array(beam_coeffs, dtype=DTYPE_R_JAX)
-        A_beam_jax = jnp.array(self.A_beam, dtype=DTYPE_R_JAX)
+        beam_coeffs_jax = jnp.asarray(beam_coeffs, dtype=DTYPE_R_JAX)
+        A_beam_jax = self.A_beam
 
         # Interpolate beam at all times: (ntime, 4, npix_sky, nmodes_beam)
         beam_interp = beam_coeffs_jax[interp_px_all]
@@ -1437,12 +1437,12 @@ class ForwardModel:
             or self._topo_all.shape[0] != rot_matrices.shape[0]
         ):
             self.precompute_time_geometry(rot_matrices)
-        interp_px_all = jnp.array(self._interp_px_all)
-        interp_wgt_all = jnp.array(self._interp_wgt_all)
-        beam_coeffs_jax = jnp.array(beam_coeffs, dtype=DTYPE_R_JAX)
+        interp_px_all = jnp.asarray(self._interp_px_all)
+        interp_wgt_all = jnp.asarray(self._interp_wgt_all)
+        beam_coeffs_jax = jnp.asarray(beam_coeffs, dtype=DTYPE_R_JAX)
         beam_interp = beam_coeffs_jax[interp_px_all]
         bi_all = jnp.sum(interp_wgt_all[:, :, :, None] * beam_interp, axis=1)
-        return (bi_all @ jnp.array(self.A_beam, dtype=DTYPE_R_JAX).T) * self._horizon_all[:, :, None]
+        return (bi_all @ self.A_beam.T) * self._horizon_all[:, :, None]
 
     def simulate_2d_with_beam_spec_horizon(self, sky_coeffs, beam_spec_h_all):
         """Simulate all times with precomputed beam spectra on sky pixels."""
