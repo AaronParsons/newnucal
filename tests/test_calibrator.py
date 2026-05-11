@@ -9,9 +9,11 @@ import numpy as np
 import jax.numpy as jnp
 import pytest
 import healpy
+import inspect
 
 from newnucal.basis import basis_project
 from newnucal.gains import apply_gains, init_gain_params
+from newnucal.simulate import ForwardModel
 
 # Mirror the conftest sizes
 NSIDE_SKY = 8
@@ -683,6 +685,18 @@ class TestBeamMasking:
         assert lookup.shape == mask.shape
         assert np.all(lookup[~mask] == -1)
         assert np.array_equal(lookup[expected_indices], np.arange(len(expected_indices)))
+
+    def test_masked_beam_scatter_uses_lookup_not_searchsorted(self):
+        """Masked adjoints should use precomputed lookup instead of per-step search."""
+        methods = [
+            ForwardModel._accumulate_beam_update_impl,
+            ForwardModel.accumulate_sky_and_beam_update_3d,
+            ForwardModel.accumulate_sky_and_beam_update_2d,
+        ]
+        for method in methods:
+            src = inspect.getsource(method)
+            assert "beam_index_lookup_jax" in src
+            assert "searchsorted" not in src
 
     def test_init_params_after_beam_mask_returns_full_beam(self, calibrator_gains_setup):
         """External parameter dicts should keep full-sized beam coefficients."""

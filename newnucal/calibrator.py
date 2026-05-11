@@ -354,6 +354,7 @@ class Calibrator:
         self._jit_simulate = jax.jit(self._sim_fn)
         self._jit_simulate_variable_beam = jax.jit(self._var_beam_sim_fn)
         self._jit_gain_solve_and_loss = jax.jit(self._gain_solve_and_loss_from_vis)
+        self._compile_adjoint_updates()
         self._variable_beam_eval_cache = None  # (sky, beam, log_amp, phase, phi, weighted_resid_for_adjoint, loss)
         self.set_channel_weights(channel_weights)
         self.set_inv_noise_var(inv_noise_var)
@@ -383,6 +384,12 @@ class Calibrator:
             self._sky_update_fn     = self.fwd.accumulate_equatorial_sky_update_3d
             self._beam_update_fn    = self.fwd.accumulate_beam_update_3d
             self._combined_update_fn = self.fwd.accumulate_sky_and_beam_update_3d
+
+    def _compile_adjoint_updates(self):
+        """Compile selected dirty-map adjoint update functions."""
+        self._jit_sky_update_fn = jax.jit(self._sky_update_fn)
+        self._jit_beam_update_fn = jax.jit(self._beam_update_fn)
+        self._jit_combined_update_fn = jax.jit(self._combined_update_fn)
 
     def _get_active_size(self):
         """Return number of active pixels after masking."""
@@ -1225,6 +1232,7 @@ class Calibrator:
         self._jit_simulate = jax.jit(self._sim_fn)
         self._jit_simulate_variable_beam = jax.jit(self._var_beam_sim_fn)
         self._jit_gain_solve_and_loss = jax.jit(self._gain_solve_and_loss_from_vis)
+        self._compile_adjoint_updates()
         self._variable_beam_eval_cache = None
 
     def compute_adjoint_updates(self, sky_coeffs, residual_vis, update_mode='both', **kwargs):
@@ -1289,7 +1297,7 @@ class Calibrator:
         if update_mode == 'sky':
             step_size = kwargs.get('step_size', 1.0)
             beam_reg = kwargs.get('beam_reg', 1e-3)
-            sky_upd = self._sky_update_fn(residual_vis, step_size=step_size, beam_reg=beam_reg)
+            sky_upd = self._jit_sky_update_fn(residual_vis, step_size=step_size, beam_reg=beam_reg)
             return {'sky': sky_upd}
 
         elif update_mode == 'beam':
@@ -1297,7 +1305,7 @@ class Calibrator:
                 raise ValueError("sky_coeffs is required for update_mode='beam'")
             step_size = kwargs.get('step_size', 1.0)
             sky_reg = kwargs.get('sky_reg', 1e-3)
-            beam_upd = self._beam_update_fn(sky_coeffs, residual_vis, step_size=step_size, sky_reg=sky_reg)
+            beam_upd = self._jit_beam_update_fn(sky_coeffs, residual_vis, step_size=step_size, sky_reg=sky_reg)
             return {'beam': beam_upd}
 
         elif update_mode == 'both':
@@ -1307,7 +1315,7 @@ class Calibrator:
             beam_step_size = kwargs.get('beam_step_size', 1.0)
             beam_reg = kwargs.get('beam_reg', 1e-3)
             sky_reg = kwargs.get('sky_reg', 1e-3)
-            sky_upd, beam_upd = self._combined_update_fn(
+            sky_upd, beam_upd = self._jit_combined_update_fn(
                 sky_coeffs, residual_vis,
                 sky_step_size=sky_step_size,
                 beam_step_size=beam_step_size,

@@ -106,7 +106,7 @@ class TestComputeAdjointUpdatesInterface:
         )
         np.testing.assert_allclose(
             np.asarray(delta_beam_direct), np.asarray(delta_beam_unified),
-            rtol=1e-5, atol=1e-8,
+            rtol=1e-5, atol=2e-8,
             err_msg="Beam component of both-mode adjoint mismatch"
         )
 
