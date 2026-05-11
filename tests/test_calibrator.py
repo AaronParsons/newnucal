@@ -669,6 +669,21 @@ class TestBeamMasking:
         assert cal.fwd.npix_beam == int(mask.sum())
         assert cal.fwd.beam_coeffs.shape[0] == int(mask.sum())
 
+    def test_apply_beam_mask_builds_index_lookup(self, calibrator_gains_setup):
+        """Beam masks should precompute full-pixel to masked-index lookup."""
+        cal, _ = calibrator_gains_setup
+        npix_beam_full = cal.fwd.npix_beam
+        mask = np.zeros(npix_beam_full, dtype=bool)
+        mask[::3] = True
+
+        cal.apply_beam_mask(mask)
+
+        lookup = cal.fwd._beam_index_lookup
+        expected_indices = np.where(mask)[0]
+        assert lookup.shape == mask.shape
+        assert np.all(lookup[~mask] == -1)
+        assert np.array_equal(lookup[expected_indices], np.arange(len(expected_indices)))
+
     def test_init_params_after_beam_mask_returns_full_beam(self, calibrator_gains_setup):
         """External parameter dicts should keep full-sized beam coefficients."""
         cal, _ = calibrator_gains_setup

@@ -405,6 +405,10 @@ class ForwardModel:
         mask = np.asarray(mask, dtype=bool)
         self._beam_mask = mask
         self._beam_indices = np.where(mask)[0].astype(np.int32)
+        self._beam_index_lookup = np.full(mask.shape, -1, dtype=np.int32)
+        self._beam_index_lookup[self._beam_indices] = np.arange(
+            len(self._beam_indices), dtype=np.int32
+        )
 
         # Reduce beam coefficients (always from original unmasked version)
         beam_coeffs_full = np.asarray(self._beam_coeffs_full)
@@ -783,8 +787,8 @@ class ForwardModel:
 
         # Precompute constants for beam scatter (outside scan for efficiency)
         if has_beam_mask:
-            beam_mask_jax = jnp.array(self._beam_mask)
             beam_indices_jax = jnp.array(self._beam_indices)
+            beam_index_lookup_jax = jnp.array(self._beam_index_lookup)
 
         # Process one time step (no Python conditionals inside scan)
         if has_beam_mask:
@@ -799,27 +803,22 @@ class ForwardModel:
                 px = self._interp_px_all[tind]  # (4, npix_sky)
                 wgt = self._interp_wgt_all[tind]  # (4, npix_sky)
 
-                # Scatter beam contributions for each of 4 neighbors (avoid large temporary)
                 beam_num_update = jnp.zeros((npix_beam_accum, self.nmodes_beam), dtype=DTYPE_R_JAX)
                 beam_den_update = jnp.zeros(npix_beam_accum, dtype=DTYPE_R_JAX)
+                px_flat = px.reshape(-1)
+                px_masked_flat = beam_index_lookup_jax[px_flat]
+                valid_flat = px_masked_flat >= 0
+                px_masked_flat = jnp.where(valid_flat, px_masked_flat, 0)
+                w_flat = (wgt * sky_pow[None, :]).reshape(-1)
+                w_flat = jnp.where(valid_flat, w_flat, 0.0)
+                delta_flat = jnp.repeat(
+                    delta_bi[None, :, :], 4, axis=0
+                ).reshape(-1, self.nmodes_beam)
 
-                def scatter_neighbor_masked(k, carry):
-                    b_num, b_den = carry
-                    px_k = px[k]  # (npix_sky,)
-                    w_k = wgt[k] * sky_pow  # (npix_sky,)
-                    mask_k = beam_mask_jax[px_k]
-                    # Compute indices for all pixels; searchsorted handles out-of-range gracefully
-                    px_k_masked = jnp.searchsorted(beam_indices_jax, px_k)
-                    # Zero out contributions where mask is False to avoid spurious accumulation
-                    safe_w = jnp.where(mask_k, w_k, 0.0)
-                    safe_delta = jnp.where(mask_k[:, None], delta_bi, 0.0)
-                    b_num = b_num.at[px_k_masked].add(safe_w[:, None] * safe_delta)
-                    b_den = b_den.at[px_k_masked].add(safe_w)
-                    return (b_num, b_den)
-
-                beam_num_update, beam_den_update = jax.lax.fori_loop(
-                    0, 4, scatter_neighbor_masked, (beam_num_update, beam_den_update)
+                beam_num_update = beam_num_update.at[px_masked_flat].add(
+                    w_flat[:, None] * delta_flat
                 )
+                beam_den_update = beam_den_update.at[px_masked_flat].add(w_flat)
 
                 new_beam_carry = (
                     beam_carry[0] + beam_num_update,
@@ -953,8 +952,8 @@ class ForwardModel:
 
         # Precompute constants for beam scatter (outside scan for efficiency)
         if has_beam_mask:
-            beam_mask_jax = jnp.array(self._beam_mask)
             beam_indices_jax = jnp.array(self._beam_indices)
+            beam_index_lookup_jax = jnp.array(self._beam_index_lookup)
 
         # Process one time step (no Python conditionals inside scan)
         if has_beam_mask:
@@ -981,27 +980,22 @@ class ForwardModel:
                 px = self._interp_px_all[tind]  # (4, npix_sky)
                 wgt = self._interp_wgt_all[tind]  # (4, npix_sky)
 
-                # Scatter beam contributions for each of 4 neighbors (avoid large temporary)
                 beam_num_update = jnp.zeros((npix_beam_accum, self.nmodes_beam), dtype=DTYPE_R_JAX)
                 beam_den_update = jnp.zeros(npix_beam_accum, dtype=DTYPE_R_JAX)
+                px_flat = px.reshape(-1)
+                px_masked_flat = beam_index_lookup_jax[px_flat]
+                valid_flat = px_masked_flat >= 0
+                px_masked_flat = jnp.where(valid_flat, px_masked_flat, 0)
+                w_flat = (wgt * sky_pow[None, :]).reshape(-1)
+                w_flat = jnp.where(valid_flat, w_flat, 0.0)
+                delta_flat = jnp.repeat(
+                    delta_bi[None, :, :], 4, axis=0
+                ).reshape(-1, self.nmodes_beam)
 
-                def scatter_neighbor_masked(k, carry):
-                    b_num, b_den = carry
-                    px_k = px[k]  # (npix_sky,)
-                    w_k = wgt[k] * sky_pow  # (npix_sky,)
-                    mask_k = beam_mask_jax[px_k]
-                    # Compute indices for all pixels; searchsorted handles out-of-range gracefully
-                    px_k_masked = jnp.searchsorted(beam_indices_jax, px_k)
-                    # Zero out contributions where mask is False to avoid spurious accumulation
-                    safe_w = jnp.where(mask_k, w_k, 0.0)
-                    safe_delta = jnp.where(mask_k[:, None], delta_bi, 0.0)
-                    b_num = b_num.at[px_k_masked].add(safe_w[:, None] * safe_delta)
-                    b_den = b_den.at[px_k_masked].add(safe_w)
-                    return (b_num, b_den)
-
-                beam_num_update, beam_den_update = jax.lax.fori_loop(
-                    0, 4, scatter_neighbor_masked, (beam_num_update, beam_den_update)
+                beam_num_update = beam_num_update.at[px_masked_flat].add(
+                    w_flat[:, None] * delta_flat
                 )
+                beam_den_update = beam_den_update.at[px_masked_flat].add(w_flat)
 
                 new_beam_carry = (
                     beam_carry[0] + beam_num_update,
@@ -1608,8 +1602,8 @@ class ForwardModel:
 
         # Precompute constants for beam scatter (outside scan for efficiency)
         if has_beam_mask:
-            beam_mask_jax = jnp.array(self._beam_mask)
             beam_indices_jax = jnp.array(self._beam_indices)
+            beam_index_lookup_jax = jnp.array(self._beam_index_lookup)
 
         # Process one time step (no Python conditionals inside scan)
         if has_beam_mask:
@@ -1636,26 +1630,22 @@ class ForwardModel:
                 px = self._interp_px_all[tind]  # (4, npix_sky)
                 wgt = self._interp_wgt_all[tind]  # (4, npix_sky)
 
-                # Scatter beam contributions for each of 4 neighbors (avoid large temporary)
                 beam_num_update = jnp.zeros((npix_beam_accum, self.nmodes_beam), dtype=DTYPE_R_JAX)
                 beam_den_update = jnp.zeros(npix_beam_accum, dtype=DTYPE_R_JAX)
+                px_flat = px.reshape(-1)
+                px_masked_flat = beam_index_lookup_jax[px_flat]
+                valid_flat = px_masked_flat >= 0
+                px_masked_flat = jnp.where(valid_flat, px_masked_flat, 0)
+                w_flat = (wgt * sky_pow[None, :]).reshape(-1)
+                w_flat = jnp.where(valid_flat, w_flat, 0.0)
+                delta_flat = jnp.repeat(
+                    delta_bi[None, :, :], 4, axis=0
+                ).reshape(-1, self.nmodes_beam)
 
-                def scatter_neighbor_masked_2d(k, carry):
-                    b_num, b_den = carry
-                    px_k = px[k]  # (npix_sky,)
-                    w_k = wgt[k] * sky_pow  # (npix_sky,)
-                    mask_k = beam_mask_jax[px_k]
-                    px_k_safe = jnp.where(mask_k, px_k, 0)
-                    px_k_masked = jnp.searchsorted(beam_indices_jax, px_k_safe)
-                    contrib = jnp.where(mask_k[:, None], w_k[:, None] * delta_bi, 0.0)
-                    den_contrib = jnp.where(mask_k, w_k, 0.0)
-                    b_num = b_num.at[px_k_masked].add(contrib)
-                    b_den = b_den.at[px_k_masked].add(den_contrib)
-                    return (b_num, b_den)
-
-                beam_num_update, beam_den_update = jax.lax.fori_loop(
-                    0, 4, scatter_neighbor_masked_2d, (beam_num_update, beam_den_update)
+                beam_num_update = beam_num_update.at[px_masked_flat].add(
+                    w_flat[:, None] * delta_flat
                 )
+                beam_den_update = beam_den_update.at[px_masked_flat].add(w_flat)
 
                 new_beam_carry = (
                     beam_carry[0] + beam_num_update,
