@@ -197,6 +197,77 @@ class TestRFIWeightedCalibrator:
 
         assert loss_downweighted < 0.05 * loss_full
 
+    def test_visibility_weights_remove_baseline_from_loss_and_residual(self, calibrator_rfi_setup):
+        cal, params = calibrator_rfi_setup
+        data = np.array(cal.data)
+        data[:, :, 0] += 100.0 + 25.0j
+        cal.data = jnp.array(data, dtype=jnp.complex64)
+
+        loss_unmasked = cal.calc_loss(params, explicit_beam=True)
+        baseline_weights = np.ones(cal.nbls, dtype=np.float32)
+        baseline_weights[0] = 0.0
+        cal.set_visibility_weights(baseline_weights)
+        loss_masked = cal.calc_loss(params, explicit_beam=True)
+        resid = cal.calibrated_residual_variable_beam(params)
+
+        assert loss_masked < 0.01 * loss_unmasked
+        np.testing.assert_allclose(np.asarray(resid[:, :, 0]), 0.0, atol=1e-6)
+
+    def test_baseline_resolution_taper_properties(self, calibrator_rfi_setup):
+        cal, _ = calibrator_rfi_setup
+        low = cal.baseline_resolution_taper(sky_nside=4, ell_factor=2.0, transition=0.2)
+        high = cal.baseline_resolution_taper(sky_nside=16, ell_factor=2.0, transition=0.2)
+
+        assert low.shape == (cal.nfreq, cal.nbls)
+        assert np.all((0.0 <= low) & (low <= 1.0))
+        assert np.all((0.0 <= high) & (high <= 1.0))
+        assert np.sum(high) >= np.sum(low)
+
+    def test_baseline_resolution_taper_verbose_reports_downweighted_fraction(
+        self, calibrator_rfi_setup, capsys
+    ):
+        cal, params = calibrator_rfi_setup
+        cal.set_baseline_resolution_taper(sky_nside=1, ell_factor=0.5, transition=0.0)
+        summary = cal.baseline_resolution_taper_summary()
+
+        assert summary is not None
+        assert summary["frac_downweighted"] > 0.0
+
+        state = cal.init_joint_sky_beam_dirty_state(
+            params,
+            joint_anderson_history=0,
+            solve_every={"gains": 0, "rfi": 0},
+        )
+        cal.run_joint_sky_beam_dirty_state(state, n_iter=0, verbose=True)
+        out = capsys.readouterr().out
+
+        assert "[resolution taper]" in out
+        assert "baseline-freq cells downweighted" in out
+        assert "% zero" in out
+
+    def test_baseline_resolution_taper_verbose_reports_nside_margin(
+        self, calibrator_rfi_setup, capsys
+    ):
+        cal, params = calibrator_rfi_setup
+        cal.set_baseline_resolution_taper(sky_nside=10000, ell_factor=2.0, transition=0.2)
+        summary = cal.baseline_resolution_taper_summary()
+
+        assert summary is not None
+        assert summary["frac_downweighted"] == 0.0
+        assert summary["nside_excess_factor"] > 1.0
+
+        state = cal.init_joint_sky_beam_dirty_state(
+            params,
+            joint_anderson_history=0,
+            solve_every={"gains": 0, "rfi": 0},
+        )
+        cal.run_joint_sky_beam_dirty_state(state, n_iter=0, verbose=True)
+        out = capsys.readouterr().out
+
+        assert "[resolution taper]" in out
+        assert "no baseline-freq cells downweighted" in out
+        assert "array max-resolution requirement" in out
+
     def test_rfi_observed_power_matches_variable_beam_loss(self, calibrator_rfi_setup):
         """Fused RFI helper should reproduce the observed-domain objective."""
         cal, params = calibrator_rfi_setup
@@ -216,7 +287,11 @@ class TestRFIWeightedCalibrator:
 
         _, observed_power = cal._jit_rfi_residual_and_observed_power_variable_beam(params)
         loss_from_power = float(
-            np.sum(np.exp(log_weights) * inv_noise_var * np.asarray(observed_power))
+            np.sum(
+                np.exp(log_weights)[:, :, None]
+                * inv_noise_var[:, :, None]
+                * np.asarray(observed_power)
+            )
         )
         loss_recalc = cal.calc_loss(params, explicit_beam=True)
 

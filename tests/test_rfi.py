@@ -43,6 +43,22 @@ def test_channel_chi2_statistic_matches_expected_whitened_power():
     np.testing.assert_allclose(chi2[:, 3], 0.0)
 
 
+def test_channel_chi2_statistic_respects_visibility_weights():
+    resid = np.zeros((2, 4, 3), dtype=np.complex64)
+    resid[:, 1, 0] = 100.0 + 0.0j
+    resid[:, 1, 1:] = 2.0 + 0.0j
+    visibility_weights = np.array([0.0, 1.0, 1.0], dtype=np.float32)
+
+    chi2 = channel_chi2_statistic(
+        resid,
+        inv_noise_var=np.ones((2, 4), dtype=np.float32),
+        visibility_weights=visibility_weights,
+    )
+
+    # The large masked baseline should not contribute; mean(|2|^2, |2|^2) = 4.
+    np.testing.assert_allclose(chi2[:, 1], 4.0)
+
+
 def test_fit_channel_weights_local_chi2_exponential_detects_outliers():
     """Verify local chi² exponential approach detects and downweights outliers."""
     rng = np.random.default_rng(0)

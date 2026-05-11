@@ -58,6 +58,7 @@ def prepare_initial_channel_weights(
 def channel_chi2_statistic(
     residual: np.ndarray,
     inv_noise_var: np.ndarray | None = None,
+    visibility_weights: np.ndarray | None = None,
 ) -> np.ndarray:
     """Return per-time, per-frequency whitened residual power.
 
@@ -66,6 +67,9 @@ def channel_chi2_statistic(
     residual : array_like, shape (ntime, nfreq, nbls)
     inv_noise_var : array_like, shape (nfreq,) or (ntime, nfreq), optional
         Inverse variance for a single complex visibility sample.
+    visibility_weights : array_like, optional
+        Per-baseline visibility weights, shape ``(nbls,)``,
+        ``(nfreq, nbls)``, or ``(ntime, nfreq, nbls)``.
 
     Returns
     -------
@@ -75,15 +79,43 @@ def channel_chi2_statistic(
     resid = np.asarray(residual)
     if resid.ndim != 3:
         raise ValueError(f"Expected residual with shape (ntime, nfreq, nbls), got {resid.shape}")
-    ntime, nfreq, _ = resid.shape
+    ntime, nfreq, nbls = resid.shape
     inv_var_tf = _as_tf(inv_noise_var, ntime, nfreq, fill_value=1.0)
-    chi2_tf = np.mean(np.abs(resid) ** 2, axis=2) * inv_var_tf
+    vis_w = _as_tfb_visibility_weights(visibility_weights, ntime, nfreq, nbls)
+    den = np.maximum(np.sum(vis_w, axis=2), 1e-30)
+    mean_power = np.sum(vis_w * (np.abs(resid) ** 2), axis=2) / den
+    chi2_tf = mean_power * inv_var_tf
     return chi2_tf.astype(DTYPE_R)
+
+
+def _as_tfb_visibility_weights(
+    arr: np.ndarray | None,
+    ntime: int,
+    nfreq: int,
+    nbls: int,
+) -> np.ndarray:
+    if arr is None:
+        return np.ones((ntime, nfreq, nbls), dtype=DTYPE_R)
+    arr = np.asarray(arr, dtype=DTYPE_R)
+    if arr.shape == (nbls,):
+        arr = np.broadcast_to(arr[None, None, :], (ntime, nfreq, nbls))
+    elif arr.shape == (nfreq, nbls):
+        arr = np.broadcast_to(arr[None, :, :], (ntime, nfreq, nbls))
+    elif arr.shape == (ntime, nfreq, nbls):
+        pass
+    else:
+        raise ValueError(
+            "visibility_weights must have shape "
+            f"({nbls},), ({nfreq}, {nbls}), or ({ntime}, {nfreq}, {nbls}); "
+            f"got {arr.shape}"
+        )
+    return np.clip(np.array(arr, dtype=DTYPE_R, copy=True), 0.0, np.inf)
 
 def fit_channel_weights_local_chi2_exponential(
     *,
     residual: np.ndarray,
     inv_noise_var: np.ndarray | None = None,
+    visibility_weights: np.ndarray | None = None,
     old_weights: np.ndarray | None = None,
     prior_weights: np.ndarray | None = None,
     min_weight: float = 0.05,
@@ -106,6 +138,9 @@ def fit_channel_weights_local_chi2_exponential(
         Unweighted gain-calibrated residuals.
     inv_noise_var : np.ndarray, optional
         Inverse variance per channel, shape (nfreq,) or (ntime, nfreq).
+    visibility_weights : np.ndarray, optional
+        Per-baseline visibility weights, shape ``(nbls,)``,
+        ``(nfreq, nbls)``, or ``(ntime, nfreq, nbls)``.
     old_weights : np.ndarray, optional
         Current weights for asymmetric smoothing, shape (nfreq,).
     prior_weights : np.ndarray, optional
@@ -174,7 +209,11 @@ def fit_channel_weights_local_chi2_exponential(
         upper = np.clip(upper, min_weight, max_weight)
 
     # Per-time/frequency whitened residual power (not yet weighted by channel_weights)
-    chi2_tf = np.mean(np.abs(residual) ** 2, axis=2) * inv_noise_var_tf
+    vis_w = _as_tfb_visibility_weights(visibility_weights, ntime, nfreq, nbls)
+    den = np.maximum(np.sum(vis_w, axis=2), 1e-30)
+    chi2_tf = (
+        np.sum(vis_w * (np.abs(residual) ** 2), axis=2) / den
+    ) * inv_noise_var_tf
 
     # Robust collapse over time (median is robust to outliers)
     chi2_f = np.median(chi2_tf, axis=0).astype(DTYPE_R)

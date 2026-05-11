@@ -21,7 +21,7 @@ from .rfi import (
     prepare_initial_channel_weights,
     fit_channel_weights_local_chi2_exponential,
 )
-from .utils import DTYPE_R_JAX, DTYPE_R_NPY, DTYPE_C_JAX
+from .utils import DTYPE_R_JAX, DTYPE_R_NPY, DTYPE_C_JAX, C
 
 
 DEFAULT_JOINT_SOLVE_EVERY = {'gains': 4, 'rfi': 2}
@@ -320,6 +320,10 @@ class Calibrator:
         self.log_ch_weights = jnp.zeros(self.data.shape[:2], dtype=DTYPE_R_JAX)
         self.inv_noise_var = jnp.ones(self.data.shape[:2], dtype=DTYPE_R_JAX)
         self._inv_noise_var_np = np.ones(self.data.shape[:2], dtype=DTYPE_R_NPY)
+        self.visibility_weights = jnp.ones(self.data.shape, dtype=DTYPE_R_JAX)
+        self._visibility_weights_np = np.ones(self.data.shape, dtype=DTYPE_R_NPY)
+        self._visibility_weight_metadata = None
+        self._visibility_weight_generation = 0
 
         self.A_sky = np.asarray(sky_model.A, dtype=DTYPE_R_NPY)  # (nfreq, nmodes)
         sky_nside  = sky_model.nside
@@ -394,6 +398,11 @@ class Calibrator:
         self._jit_sky_update_fn = jax.jit(self._sky_update_fn)
         self._jit_beam_update_fn = jax.jit(self._beam_update_fn)
         self._jit_combined_update_fn = jax.jit(self._combined_update_fn)
+
+    def _clear_loss_caches(self):
+        self._fit_gains_linear_cache = None
+        self._fit_gains_linear_variable_beam_cache = None
+        self._variable_beam_eval_cache = None
 
     def _get_active_size(self):
         """Return number of active pixels after masking."""
@@ -490,21 +499,32 @@ class Calibrator:
         return out
 
     def _effective_weights(self):
-        return (jnp.exp(self.log_ch_weights) * self.inv_noise_var).astype(DTYPE_R_JAX)
+        weights_tf = (jnp.exp(self.log_ch_weights) * self.inv_noise_var)[:, :, None]
+        return (weights_tf * self.visibility_weights).astype(DTYPE_R_JAX)
+
+    def _effective_tf_weights_np(self):
+        """Return channel/noise weights without baseline visibility weights."""
+        return np.asarray(
+            jax.device_get(jnp.exp(self.log_ch_weights)), dtype=DTYPE_R_NPY
+        ) * self._inv_noise_var_np
+
+    def _effective_dof_weights(self):
+        """Weights that count retained samples for reduced chi2."""
+        return jnp.exp(self.log_ch_weights)[:, :, None] * self.visibility_weights
 
     def _weighted_chi2(self, resid):
-        """Weighted chi2 using the current channel_weights * inv_noise_var.
+        """Weighted chi2 using current channel/noise and visibility weights.
 
         IMPORTANT: resid must be UNweighted. If resid is already weighted (e.g., from
         _residual_variable_beam or _residual_and_loss_variable_beam), this will apply
         weights twice, resulting in incorrect chi2. Use unweighted residuals here.
         """
         w = self._effective_weights()
-        return jnp.sum(w[:, :, None] * (jnp.abs(resid) ** 2))
+        return jnp.sum(w * (jnp.abs(resid) ** 2))
 
     def _weighted_mean_chi2(self, resid):
         w = self._effective_weights()
-        den = jnp.maximum(jnp.sum(w) * resid.shape[2], 1e-12)
+        den = jnp.maximum(jnp.sum(w), 1e-12)
         return self._weighted_chi2(resid) / den
 
     def _loss(self, params, weights):
@@ -512,7 +532,7 @@ class Calibrator:
         sky_coeffs = self._ensure_sky_is_active(params['sky_coeffs'])
         vis_model = self._sim_fn(sky_coeffs, self.rot_matrices)
         vis_cal = apply_gains(vis_model, params['log_amp'], params['phase'], params['phi'], self.bls)
-        return jnp.sum(weights[:, :, None] * (jnp.abs(self.data - vis_cal) ** 2))
+        return jnp.sum(weights * (jnp.abs(self.data - vis_cal) ** 2))
 
     def _loss_variable_beam(self, params, weights):
         """Loss function (variable beam) with weights passed explicitly."""
@@ -521,7 +541,7 @@ class Calibrator:
             sky_coeffs, params['beam_coeffs'], self.rot_matrices
         )
         vis_cal = apply_gains(vis_model, params['log_amp'], params['phase'], params['phi'], self.bls)
-        return jnp.sum(weights[:, :, None] * (jnp.abs(self.data - vis_cal) ** 2))
+        return jnp.sum(weights * (jnp.abs(self.data - vis_cal) ** 2))
 
     def _residual_and_loss_variable_beam(self, params, weights):
         """Compute residual and loss from a single forward simulate.
@@ -540,14 +560,14 @@ class Calibrator:
         )
         # Loss: data space
         vis_cal = apply_gains(vis_model, params['log_amp'], params['phase'], params['phi'], self.bls)
-        loss = jnp.sum(weights[:, :, None] * (jnp.abs(self.data - vis_cal) ** 2))
+        loss = jnp.sum(weights * (jnp.abs(self.data - vis_cal) ** 2))
 
         # Weighted residual for adjoint: gain-calibrated model space with weights applied
         inv_log_amp = -params['log_amp']
         inv_phase = -params['phase']
         inv_phi = -params['phi']
         data_cal = apply_gains(self.data, inv_log_amp, inv_phase, inv_phi, self.bls)
-        weighted_resid_for_adjoint = (data_cal - vis_model) * weights[:, :, None].astype(DTYPE_C_JAX)
+        weighted_resid_for_adjoint = (data_cal - vis_model) * weights.astype(DTYPE_C_JAX)
 
         return weighted_resid_for_adjoint, loss
 
@@ -558,12 +578,12 @@ class Calibrator:
             sky_coeffs, beam_spec_h_all
         )
         vis_cal = apply_gains(vis_model, params['log_amp'], params['phase'], params['phi'], self.bls)
-        loss = jnp.sum(weights[:, :, None] * (jnp.abs(self.data - vis_cal) ** 2))
+        loss = jnp.sum(weights * (jnp.abs(self.data - vis_cal) ** 2))
 
         data_cal = apply_gains(
             self.data, -params['log_amp'], -params['phase'], -params['phi'], self.bls
         )
-        weighted_resid_for_adjoint = (data_cal - vis_model) * weights[:, :, None].astype(DTYPE_C_JAX)
+        weighted_resid_for_adjoint = (data_cal - vis_model) * weights.astype(DTYPE_C_JAX)
         return weighted_resid_for_adjoint, loss
 
     def _eval_joint_candidate(
@@ -666,6 +686,180 @@ class Calibrator:
                     f"or {(self.nfreq,)}, got {arr.shape}"
                 )
         self.log_ch_weights = jnp.clip(arr, -jnp.inf, 0.0).astype(DTYPE_R_JAX)
+        self._clear_loss_caches()
+
+    def set_visibility_weights(self, visibility_weights=None):
+        """Set per-visibility objective weights.
+
+        Parameters
+        ----------
+        visibility_weights : array_like or None
+            Non-negative weights broadcastable as ``(nbls,)``,
+            ``(nfreq, nbls)``, or ``(ntime, nfreq, nbls)``. ``None`` restores
+            unit weights. These weights multiply channel weights and inverse
+            noise variance in losses, gain solves, and adjoint residuals.
+        """
+        target_shape = (self.ntime, self.nfreq, self.nbls)
+        if visibility_weights is None:
+            arr_np = np.ones(target_shape, dtype=DTYPE_R_NPY)
+        else:
+            arr_np = np.asarray(visibility_weights, dtype=DTYPE_R_NPY)
+            if arr_np.shape == (self.nbls,):
+                arr_np = np.broadcast_to(arr_np[None, None, :], target_shape)
+            elif arr_np.shape == (self.nfreq, self.nbls):
+                arr_np = np.broadcast_to(arr_np[None, :, :], target_shape)
+            elif arr_np.shape == (self.ntime, self.nfreq, self.nbls):
+                pass
+            else:
+                raise ValueError(
+                    "visibility_weights must have shape "
+                    f"{(self.nbls,)}, {(self.nfreq, self.nbls)}, or "
+                    f"{target_shape}; got {arr_np.shape}"
+                )
+            arr_np = np.array(arr_np, dtype=DTYPE_R_NPY, copy=True)
+        arr_np = np.clip(arr_np, 0.0, np.inf).astype(DTYPE_R_NPY)
+        self._visibility_weights_np = arr_np
+        self.visibility_weights = jnp.array(arr_np, dtype=DTYPE_R_JAX)
+        self._visibility_weight_metadata = None
+        self._visibility_weight_generation += 1
+        self._clear_loss_caches()
+        return self
+
+    def _baseline_resolution_taper_metadata(
+        self,
+        weights,
+        sky_nside: int,
+        ell_factor: float,
+        transition: float,
+    ):
+        weights = np.asarray(weights, dtype=DTYPE_R_NPY)
+        bl_len = np.linalg.norm(np.asarray(self.bls, dtype=DTYPE_R_NPY), axis=1)
+        freqs = np.asarray(self.freqs, dtype=DTYPE_R_NPY)
+        ell = 2.0 * np.pi * freqs[:, None] * bl_len[None, :] / C
+        ell_factor = float(ell_factor)
+        required_nside = float(np.max(ell) / ell_factor) if ell.size else 0.0
+        if required_nside <= 0.0:
+            nside_excess_factor = np.inf
+        else:
+            nside_excess_factor = float(sky_nside) / required_nside
+        return {
+            "kind": "baseline_resolution_taper",
+            "sky_nside": int(sky_nside),
+            "ell_factor": ell_factor,
+            "transition": float(transition),
+            "required_nside": required_nside,
+            "nside_excess_factor": nside_excess_factor,
+            "frac_downweighted": float(np.mean(weights < 1.0 - 1e-6)),
+            "frac_zero": float(np.mean(weights <= 1e-6)),
+            "min_weight": float(np.min(weights)) if weights.size else 1.0,
+            "mean_weight": float(np.mean(weights)) if weights.size else 1.0,
+            "nfreq": int(self.nfreq),
+            "nbls": int(self.nbls),
+        }
+
+    def baseline_resolution_taper_summary(self):
+        """Return diagnostics for the active baseline-resolution taper, if any."""
+        if (
+            self._visibility_weight_metadata is None
+            or self._visibility_weight_metadata.get("kind") != "baseline_resolution_taper"
+        ):
+            return None
+        return dict(self._visibility_weight_metadata)
+
+    def _format_resolution_taper_summary(self):
+        summary = self.baseline_resolution_taper_summary()
+        if summary is None:
+            return None
+        down = summary["frac_downweighted"]
+        zero = summary["frac_zero"]
+        if down > 0.0:
+            return (
+                "  [resolution taper]: "
+                f"{100.0 * down:.1f}% baseline-freq cells downweighted "
+                f"({100.0 * zero:.1f}% zero); "
+                f"mean_w={summary['mean_weight']:.3f}, min_w={summary['min_weight']:.3f}; "
+                f"sky_nside={summary['sky_nside']} "
+                f"(required~{summary['required_nside']:.1f})"
+            )
+        factor = summary["nside_excess_factor"]
+        factor_s = "inf" if not np.isfinite(factor) else f"{factor:.2f}x"
+        return (
+            "  [resolution taper]: no baseline-freq cells downweighted; "
+            f"sky_nside={summary['sky_nside']} is {factor_s} "
+            f"the array max-resolution requirement "
+            f"(required~{summary['required_nside']:.1f})"
+        )
+
+    def _maybe_report_resolution_taper(self, state, verbose: bool):
+        if not verbose:
+            return
+        generation = state.settings.get("_resolution_taper_report_generation")
+        if generation == self._visibility_weight_generation:
+            return
+        line = self._format_resolution_taper_summary()
+        if line is not None:
+            print(line)
+        state.settings["_resolution_taper_report_generation"] = self._visibility_weight_generation
+
+    def baseline_resolution_taper(
+        self,
+        sky_nside: int | None = None,
+        *,
+        ell_factor: float = 2.0,
+        transition: float = 0.2,
+    ):
+        """Return an NSIDE-dependent baseline support taper.
+
+        The cutoff is based on ``ell_max = ell_factor * sky_nside`` and
+        ``ell ~= 2*pi*u`` where ``u = baseline_length / wavelength``. The
+        returned array has shape ``(nfreq, nbls)`` and is intended for
+        :meth:`set_visibility_weights`.
+        """
+        if sky_nside is None:
+            sky_nside = int(self.fwd.sky_model.nside)
+        ell_max = float(ell_factor) * float(sky_nside)
+        if ell_max <= 0:
+            raise ValueError("ell_factor * sky_nside must be positive")
+        transition = float(transition)
+        if not (0.0 <= transition < 1.0):
+            raise ValueError("transition must be in [0, 1)")
+
+        bl_len = np.linalg.norm(np.asarray(self.bls, dtype=DTYPE_R_NPY), axis=1)
+        freqs = np.asarray(self.freqs, dtype=DTYPE_R_NPY)
+        u = freqs[:, None] * bl_len[None, :] / C
+        u_max = ell_max / (2.0 * np.pi)
+
+        if transition == 0.0:
+            weights = (u <= u_max).astype(DTYPE_R_NPY)
+        else:
+            u0 = (1.0 - transition) * u_max
+            x = np.clip((u - u0) / max(u_max - u0, 1e-30), 0.0, 1.0)
+            weights = 0.5 * (1.0 + np.cos(np.pi * x))
+            weights = np.where(u <= u0, 1.0, weights)
+            weights = np.where(u >= u_max, 0.0, weights)
+        return weights.astype(DTYPE_R_NPY)
+
+    def set_baseline_resolution_taper(
+        self,
+        sky_nside: int | None = None,
+        *,
+        ell_factor: float = 2.0,
+        transition: float = 0.2,
+    ):
+        """Apply an NSIDE-dependent visibility taper for baseline support."""
+        if sky_nside is None:
+            sky_nside = int(self.fwd.sky_model.nside)
+        weights = self.baseline_resolution_taper(
+            sky_nside, ell_factor=ell_factor, transition=transition
+        )
+        self.set_visibility_weights(weights)
+        self._visibility_weight_metadata = self._baseline_resolution_taper_metadata(
+            weights,
+            sky_nside=int(sky_nside),
+            ell_factor=ell_factor,
+            transition=transition,
+        )
+        return self
 
     def set_inv_noise_var(self, inv_noise_var=None):
         """Set per-time/per-frequency inverse noise variance."""
@@ -684,6 +878,7 @@ class Calibrator:
         self._inv_noise_var_np = np.asarray(
             jax.device_get(self.inv_noise_var), dtype=DTYPE_R_NPY
         )
+        self._clear_loss_caches()
 
     def set_noise_sigma(self, noise_sigma=None):
         """Set per-time/per-frequency noise sigma.
@@ -710,6 +905,7 @@ class Calibrator:
         self._inv_noise_var_np = np.asarray(
             jax.device_get(self.inv_noise_var), dtype=DTYPE_R_NPY
         )
+        self._clear_loss_caches()
 
     def calc_reduced_chi2(self, params, explicit_beam: bool | None = None, subtract_params=0):
         """Approximate reduced chi-squared under the current weights/noise model.
@@ -726,7 +922,7 @@ class Calibrator:
             npar = self.estimate_num_params(params)
         else:
             npar = int(subtract_params)
-        dof = max(float(jnp.sum(jnp.exp(self.log_ch_weights)) * self.nbls) - npar, 1.0)
+        dof = max(float(jnp.sum(self._effective_dof_weights())) - npar, 1.0)
         return float(chi2 / dof)
 
 
@@ -780,7 +976,7 @@ class Calibrator:
         sky_coeffs = self._ensure_sky_is_active(params['sky_coeffs'])
         vis_model = self._sim_fn(sky_coeffs, self.rot_matrices)
         resid = data_cal - vis_model
-        return resid * (jnp.exp(self.log_ch_weights) * self.inv_noise_var)[:, :, None].astype(DTYPE_C_JAX)
+        return resid * self._effective_weights().astype(DTYPE_C_JAX)
 
     def calibrated_residual_variable_beam(self, params):
         inv = self._invert_gains(params)
@@ -790,7 +986,7 @@ class Calibrator:
             sky_coeffs, params['beam_coeffs'], self.rot_matrices
         )
         resid = data_cal - vis_model
-        return resid * (jnp.exp(self.log_ch_weights) * self.inv_noise_var)[:, :, None].astype(DTYPE_C_JAX)
+        return resid * self._effective_weights().astype(DTYPE_C_JAX)
 
     def calibrated_residual_variable_beam_unweighted(self, params):
         """Gain-calibrated residual without channel_weights or inv_noise_var.
@@ -828,7 +1024,7 @@ class Calibrator:
             self.data, -params['log_amp'], -params['phase'], -params['phi'], self.bls
         )
         rfi_resid = data_cal - vis_model
-        observed_power = jnp.sum(jnp.abs(self.data - vis_cal) ** 2, axis=2)
+        observed_power = jnp.abs(self.data - vis_cal) ** 2
         return rfi_resid, observed_power
 
     def _residual_variable_beam(self, params, weights):
@@ -848,7 +1044,7 @@ class Calibrator:
         vis_model = self._var_beam_sim_fn(
             sky_coeffs, params['beam_coeffs'], self.rot_matrices
         )
-        return (data_cal - vis_model) * weights[:, :, None].astype(DTYPE_C_JAX)
+        return (data_cal - vis_model) * weights.astype(DTYPE_C_JAX)
 
     # ------------------------------------------------------------------
     # Pixel-cut helpers
@@ -1103,9 +1299,9 @@ class Calibrator:
         sky_active = self._ensure_sky_is_active(sky_coeffs)
         vis_model = self._jit_simulate(sky_active, self.rot_matrices)
 
-        w_tf = self._effective_weights()[:, :, None]
-        den = w_tf * jnp.abs(vis_model) ** 2
-        g_opt = (w_tf * data_for_fit * jnp.conj(vis_model)) / (den + 1e-30)
+        weights = self._effective_weights()
+        den = weights * jnp.abs(vis_model) ** 2
+        g_opt = (weights * data_for_fit * jnp.conj(vis_model)) / (den + 1e-30)
         log_g = jnp.log(g_opt + 0j)
 
         w_sum = den.sum(axis=2) + 1e-30
@@ -1176,14 +1372,14 @@ class Calibrator:
         vis_model = self._jit_simulate_variable_beam(sky_active, beam_coeffs, self.rot_matrices)
 
         # Solve for gains and compute loss directly from vis_model (avoids redundant simulation)
-        w_tf = self._effective_weights()[:, :, None]
-        gain_params, loss = self._jit_gain_solve_and_loss(vis_model, data_for_fit, w_tf)
+        weights = self._effective_weights()
+        gain_params, loss = self._jit_gain_solve_and_loss(vis_model, data_for_fit, weights)
         loss = float(loss)
         self._fit_gains_linear_variable_beam_cache = (sky_active, beam_coeffs, gain_params, loss)
         return gain_params, loss
 
 
-    def _gain_solve_and_loss_from_vis(self, vis_model, data_for_fit, weights_tf):
+    def _gain_solve_and_loss_from_vis(self, vis_model, data_for_fit, weights):
         """Solve for gains from pre-computed vis_model and compute loss directly.
 
         Avoids the redundant second simulation in the gain-fitting loop.
@@ -1194,7 +1390,7 @@ class Calibrator:
             Pre-computed model visibilities.
         data_for_fit : jnp.ndarray, shape (ntime, nfreq, nbls), complex
             Data to fit against (possibly with static sky subtracted).
-        weights_tf : jnp.ndarray, shape (ntime, nfreq, 1)
+        weights : jnp.ndarray, shape (ntime, nfreq, nbls)
             Effective weights for each visibility.
 
         Returns
@@ -1219,7 +1415,7 @@ class Calibrator:
         log_g = jnp.log(g_opt)
 
         # Apply weights only to reductions, not to the gain ratio itself
-        den = weights_tf * amp2
+        den = weights * amp2
 
         w_sum = den.sum(axis=2) + 1e-30
         log_amp = (den * jnp.real(log_g)).sum(axis=2) / w_sum
@@ -1250,7 +1446,7 @@ class Calibrator:
             gain_params['phi'],
             self.bls,
         )
-        loss = jnp.sum(weights_tf * jnp.abs(data_for_fit - vis_cal) ** 2)
+        loss = jnp.sum(weights * jnp.abs(data_for_fit - vis_cal) ** 2)
         return gain_params, loss
 
     def _recompile_jit(self):
@@ -2460,6 +2656,7 @@ class Calibrator:
             new_weights_direct, diag = fit_channel_weights_local_chi2_exponential(
                 residual=resid,
                 inv_noise_var=inv_var,
+                visibility_weights=self._visibility_weights_np,
                 old_weights=old_weights_f,
                 prior_weights=None,
                 min_weight=min_weight_direct,
@@ -2480,7 +2677,12 @@ class Calibrator:
             # Compute post-RFI objective from the observed-domain residual
             # power returned with the RFI residual. This matches
             # _loss_variable_beam without a second variable-beam simulation.
-            loss_post_rfi = float(np.sum(new_weights_direct * inv_var * observed_power))
+            loss_post_rfi = float(np.sum(
+                new_weights_direct[:, :, None]
+                * inv_var[:, :, None]
+                * self._visibility_weights_np
+                * observed_power
+            ))
             dt_rfi = max(_time.perf_counter() - t_rfi_start, 1e-3)
             dloss_rfi = max(0.0, loss_pre_rfi - loss_post_rfi)
             eff_rfi = dloss_rfi / (max(loss_pre_rfi, 1e-30) * dt_rfi)
@@ -2557,6 +2759,7 @@ class Calibrator:
             stop = _stop_flag
             old_handler = None
         try:
+            self._maybe_report_resolution_taper(state, verbose)
             for _ in range(n_iter):
                 if stop.stop:
                     state.stop_reason = 'user_stop'
@@ -2604,6 +2807,7 @@ class Calibrator:
             stop = _stop_flag
             old_handler = None
         try:
+            self._maybe_report_resolution_taper(state, verbose)
             for _ in range(n_iter):
                 if stop.stop:
                     state.stop_reason = 'user_stop'
