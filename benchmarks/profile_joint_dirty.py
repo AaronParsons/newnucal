@@ -9,6 +9,7 @@ import argparse
 import cProfile
 import os
 import pstats
+import time
 from io import StringIO
 
 os.environ['OMP_NUM_THREADS'] = '1'
@@ -16,7 +17,7 @@ os.environ['OMP_NUM_THREADS'] = '1'
 import jax
 jax.config.update("jax_enable_x64", False)
 
-from bench_utils import setup_benchmark_calibrator
+from bench_utils import block_until_ready, setup_benchmark_calibrator, time_call
 
 
 def main(args):
@@ -25,7 +26,14 @@ def main(args):
     print("=" * 80)
 
     print("\n[Setup] Building calibration problem...")
-    cal, prms0, info = setup_benchmark_calibrator()
+    cal, prms0, info = setup_benchmark_calibrator(
+        nfreq=args.nfreq,
+        ntime=args.ntime,
+        sky_nside=args.sky_nside,
+        beam_nside=args.beam_nside,
+        use_dpss_basis=args.use_dpss_basis,
+        apply_masks=args.apply_masks,
+    )
     loss_before = cal.calc_loss(prms0)
     print(f"[Setup] {info['nants']} antennas, {info['nbls']} baselines, "
           f"{info['nfreq']} freqs")
@@ -34,7 +42,7 @@ def main(args):
 
     # JIT warm-up
     print("[Warmup] Compiling JAX functions...")
-    _ = cal.calc_loss(prms0)
+    time_call("calc_loss warmup", lambda: cal.calc_loss(prms0), repeats=1)
     print("[Warmup] Done.\n")
 
     # Profile the fit
@@ -43,7 +51,12 @@ def main(args):
     print("=" * 80 + "\n")
 
     pr = cProfile.Profile()
+    t0 = time.perf_counter()
     pr.enable()
+
+    fit_kwargs = {}
+    if args.legacy_cadence:
+        fit_kwargs.update(joint_initial_step=1.0, solve_every={'gains': 5})
 
     params, loss_after = cal.fit_joint_sky_beam_dirty(
         prms0,
@@ -52,12 +65,13 @@ def main(args):
         joint_aa_start=2,
         joint_aa_damping=0.5,
         joint_aa_ridge=1e-8,
-        joint_initial_step=1.0,
-        solve_every={'gains': 5},
         verbose=False,
+        **fit_kwargs,
     )
+    block_until_ready(params)
 
     pr.disable()
+    total_time = time.perf_counter() - t0
 
     # Print stats
     s = StringIO()
@@ -74,8 +88,6 @@ def main(args):
     print(f"Iterations:    {args.n_iter}")
     print(f"AA History:    {args.aa_history}")
 
-    # Total time
-    total_time = sum(stat[3] for stat in pr.getstats().values())
     print(f"Total time:    {total_time:.2f}s")
     print(f"Time/iter:     {total_time/args.n_iter*1e3:.0f}ms")
     print("=" * 80 + "\n")
@@ -109,5 +121,23 @@ if __name__ == "__main__":
                         help="Anderson acceleration history (default: 3)")
     parser.add_argument("--top-n", type=int, default=30,
                         help="Number of top functions to display (default: 30)")
+    parser.add_argument("--nfreq", type=int, default=32,
+                        help="Number of frequency channels (default: 32)")
+    parser.add_argument("--ntime", type=int, default=12,
+                        help="Number of time samples (default: 12)")
+    parser.add_argument("--sky-nside", type=int, default=16,
+                        help="Sky HEALPix nside (default: 16)")
+    parser.add_argument("--beam-nside", type=int, default=8,
+                        help="Beam HEALPix nside (default: 8)")
+    parser.add_argument("--apply-masks", default="standard",
+                        choices=["standard", "alt", "none"],
+                        help="Mask mode for setup_benchmark_calibrator (default: standard)")
+    parser.add_argument("--use-dpss-basis", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Use generated DPSS bases instead of benchmark basis files")
+    parser.add_argument("--legacy-cadence", action="store_true",
+                        help="Use the old joint_initial_step=1.0 and solve_every={'gains': 5}")
     args = parser.parse_args()
+    if args.apply_masks == "none":
+        args.apply_masks = None
     main(args)
