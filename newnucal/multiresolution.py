@@ -9,18 +9,38 @@ import healpy
 from .utils import DTYPE_R_JAX, DTYPE_R_NPY
 
 
-def _ud_grade_spectra(spectra, nside_out: int):
+def _ud_grade_spectra(spectra, nside_out: int, *, power: float = 0.0):
     spectra = np.asarray(spectra, dtype=DTYPE_R_NPY)
     if spectra.ndim != 2:
         raise ValueError(f"Expected spectra with shape (npix, nfreq), got {spectra.shape}")
     out = [
-        healpy.ud_grade(spectra[:, fi], nside_out=nside_out, power=0)
+        healpy.ud_grade(spectra[:, fi], nside_out=nside_out, power=power)
         for fi in range(spectra.shape[1])
     ]
     return np.stack(out, axis=1).astype(DTYPE_R_NPY)
 
 
-def resample_sky_coeffs(coeffs_in, sky_model_in, sky_model_out):
+def _normalize_spectra_like_input(spectra_out, spectra_in, normalize):
+    if normalize is None or normalize == "none":
+        return spectra_out
+    if normalize == "max":
+        stat_in = np.max(np.abs(spectra_in), axis=0)
+        stat_out = np.max(np.abs(spectra_out), axis=0)
+    elif normalize == "mean":
+        stat_in = np.mean(spectra_in, axis=0)
+        stat_out = np.mean(spectra_out, axis=0)
+    else:
+        raise ValueError("normalize must be one of None, 'none', 'max', or 'mean'")
+    scale = np.divide(
+        stat_in,
+        stat_out,
+        out=np.ones_like(stat_in, dtype=DTYPE_R_NPY),
+        where=np.abs(stat_out) > 1e-30,
+    )
+    return (spectra_out * scale[None, :]).astype(DTYPE_R_NPY)
+
+
+def resample_sky_coeffs(coeffs_in, sky_model_in, sky_model_out, *, healpix_power: float = 0.0):
     """Resample sky coefficients between HEALPix resolutions.
 
     Coefficients are deprojected to frequency maps on the input sky,
@@ -33,11 +53,20 @@ def resample_sky_coeffs(coeffs_in, sky_model_in, sky_model_out):
             f"sky coeff rows {coeffs_in.shape[0]} != input sky npix {sky_model_in.npix}"
         )
     spectra_in = sky_model_in.deproject(coeffs_in)
-    spectra_out = _ud_grade_spectra(spectra_in, sky_model_out.nside)
+    spectra_out = _ud_grade_spectra(
+        spectra_in, sky_model_out.nside, power=float(healpix_power)
+    )
     return jnp.array(sky_model_out.project(spectra_out), dtype=DTYPE_R_JAX)
 
 
-def resample_beam_coeffs(coeffs_in, beam_model_in, beam_model_out):
+def resample_beam_coeffs(
+    coeffs_in,
+    beam_model_in,
+    beam_model_out,
+    *,
+    healpix_power: float = 0.0,
+    normalize: str | None = None,
+):
     """Resample beam coefficients between HEALPix resolutions.
 
     The resampling can increase or decrease NSIDE.
@@ -48,7 +77,10 @@ def resample_beam_coeffs(coeffs_in, beam_model_in, beam_model_out):
             f"beam coeff rows {coeffs_in.shape[0]} != input beam npix {beam_model_in.npix}"
         )
     spectra_in = beam_model_in.deproject(coeffs_in)
-    spectra_out = _ud_grade_spectra(spectra_in, beam_model_out.nside)
+    spectra_out = _ud_grade_spectra(
+        spectra_in, beam_model_out.nside, power=float(healpix_power)
+    )
+    spectra_out = _normalize_spectra_like_input(spectra_out, spectra_in, normalize)
     return jnp.array(beam_model_out.project(spectra_out), dtype=DTYPE_R_JAX)
 
 
@@ -59,6 +91,9 @@ def resample_params(
     *,
     sky: bool = True,
     beam: bool = True,
+    sky_healpix_power: float = 0.0,
+    beam_healpix_power: float = 0.0,
+    beam_normalize: str | None = None,
     params_input_full=None,
 ):
     """Transfer a parameter dict between calibrators at different resolutions.
@@ -76,6 +111,7 @@ def resample_params(
             params_full["sky_coeffs"],
             cal_in.fwd.sky_model,
             cal_out.fwd.sky_model,
+            healpix_power=sky_healpix_power,
         )
     elif params_full.get("sky_coeffs") is not None:
         if np.shape(params_full["sky_coeffs"])[0] == cal_out.fwd.sky_model.npix:
@@ -91,6 +127,8 @@ def resample_params(
             params_full["beam_coeffs"],
             cal_in.beam_model,
             cal_out.beam_model,
+            healpix_power=beam_healpix_power,
+            normalize=beam_normalize,
         )
     elif params_full.get("beam_coeffs") is not None:
         if np.shape(params_full["beam_coeffs"])[0] == cal_out.beam_model.npix:
@@ -115,6 +153,9 @@ def init_resampled_joint_state(
     *,
     resample_sky: bool = True,
     resample_beam: bool = True,
+    sky_healpix_power: float = 0.0,
+    beam_healpix_power: float = 0.0,
+    beam_normalize: str | None = None,
     reset_anderson: bool = True,
     **fit_kwargs,
 ):
@@ -125,6 +166,9 @@ def init_resampled_joint_state(
         cal_out,
         sky=resample_sky,
         beam=resample_beam,
+        sky_healpix_power=sky_healpix_power,
+        beam_healpix_power=beam_healpix_power,
+        beam_normalize=beam_normalize,
         params_input_full=state_in.settings.get("params_input_full"),
     )
     if "log_ch_weights" in params_out:

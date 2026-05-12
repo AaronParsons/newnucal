@@ -39,6 +39,19 @@ def test_resample_sky_coeffs_preserves_constant_when_downsampling(freqs, sky_bas
     np.testing.assert_allclose(spectra_low, 2.5, rtol=5e-5, atol=1e-4)
 
 
+def test_resample_sky_coeffs_accepts_healpix_power(freqs, sky_basis):
+    low = SkyModel(nside=2, freqs=freqs, basis=sky_basis)
+    high = SkyModel(nside=4, freqs=freqs, basis=sky_basis)
+    spectra = np.ones((low.npix, low.nfreq), dtype=np.float32)
+    coeffs_low = low.project(spectra)
+
+    coeffs_default = resample_sky_coeffs(coeffs_low, low, high)
+    coeffs_flux = resample_sky_coeffs(coeffs_low, low, high, healpix_power=-2)
+
+    assert coeffs_default.shape == coeffs_flux.shape
+    assert not np.allclose(np.asarray(coeffs_default), np.asarray(coeffs_flux))
+
+
 def test_resample_beam_coeffs_preserves_constant(freqs, beam_basis):
     low = BeamModel(nside=2, freqs=freqs, basis=beam_basis)
     high = BeamModel(nside=4, freqs=freqs, basis=beam_basis)
@@ -50,6 +63,24 @@ def test_resample_beam_coeffs_preserves_constant(freqs, beam_basis):
 
     assert coeffs_high.shape == (high.npix, high.nmodes)
     np.testing.assert_allclose(spectra_high, 0.7, rtol=5e-5, atol=3e-5)
+
+
+def test_resample_beam_coeffs_can_normalize_max(freqs, beam_basis):
+    low = BeamModel(nside=2, freqs=freqs, basis=beam_basis)
+    high = BeamModel(nside=4, freqs=freqs, basis=beam_basis)
+    spectra = np.ones((low.npix, low.nfreq), dtype=np.float32) * 0.7
+    coeffs_low = low.project(spectra)
+
+    coeffs_high = resample_beam_coeffs(
+        coeffs_low,
+        low,
+        high,
+        healpix_power=-2,
+        normalize="max",
+    )
+    spectra_high = high.deproject(np.asarray(coeffs_high))
+
+    np.testing.assert_allclose(np.max(np.abs(spectra_high), axis=0), 0.7, rtol=5e-5)
 
 
 def test_resample_params_can_transfer_sky_or_beam(
@@ -72,7 +103,16 @@ def test_resample_params_can_transfer_sky_or_beam(
     }
 
     sky_only = resample_params(params_low, cal_low, cal_high, sky=True, beam=False)
-    both = resample_params(params_low, cal_low, cal_high, sky=True, beam=True)
+    both = resample_params(
+        params_low,
+        cal_low,
+        cal_high,
+        sky=True,
+        beam=True,
+        sky_healpix_power=0,
+        beam_healpix_power=0,
+        beam_normalize="none",
+    )
 
     assert sky_only["sky_coeffs"].shape[0] == high_sky.npix
     assert both["sky_coeffs"].shape[0] == high_sky.npix
