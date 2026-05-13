@@ -364,6 +364,14 @@ class Calibrator:
         self._jit_gain_solve_and_loss = jax.jit(self._gain_solve_and_loss_from_vis)
         self._compile_adjoint_updates()
         self._variable_beam_eval_cache = None  # (sky, beam, log_amp, phase, phi, weighted_resid_for_adjoint, loss)
+
+        # L-BFGS solver + grad function are built lazily on the first call to
+        # fit_joint_sky_beam_lbfgs and cached so repeated calls don't recompile.
+        # _recompile_jit() resets them when masks / shapes change.
+        self._lbfgs_solver = None
+        self._lbfgs_grad_unscaled = None
+        self._lbfgs_solver_cfg = None  # (maxiter, history_size, tol, linesearch)
+
         self.set_channel_weights(channel_weights)
         self.set_inv_noise_var(inv_noise_var)
         if noise_sigma is not None:
@@ -1469,6 +1477,10 @@ class Calibrator:
         self._jit_gain_solve_and_loss = jax.jit(self._gain_solve_and_loss_from_vis)
         self._compile_adjoint_updates()
         self._variable_beam_eval_cache = None
+        # Invalidate L-BFGS cache; shapes may have changed.
+        self._lbfgs_solver = None
+        self._lbfgs_grad_unscaled = None
+        self._lbfgs_solver_cfg = None
 
     def compute_adjoint_updates(self, sky_coeffs, residual_vis, update_mode='both', **kwargs):
         """Unified interface for sky/beam adjoint updates.
@@ -3005,6 +3017,338 @@ class Calibrator:
         state = self.run_joint_sky_beam_dirty_state(state, n_iter=n_iter, verbose=verbose, _stop_flag=_stop_flag)
         params_full = self._params_to_full_space(state.params, state.settings.get('params_input_full'))
         return params_full, float(state.loss)
+
+    # --------------------------------------------------------------------- #
+    # L-BFGS three-block alternating fit                                    #
+    # --------------------------------------------------------------------- #
+
+    def _build_lbfgs_solver(
+        self, maxiter, history_size, tol, linesearch,
+    ):
+        """Build (and cache) the jaxopt.LBFGS solver and the un-scaled grad.
+
+        Built lazily on first call to fit_joint_sky_beam_lbfgs. Re-used on
+        subsequent calls if the solver-shaping config is unchanged; otherwise
+        rebuilt (forcing one re-JIT). _recompile_jit() also invalidates.
+        """
+        import jaxopt
+
+        cfg = (int(maxiter), int(history_size), float(tol), str(linesearch))
+        if (self._lbfgs_solver is not None
+                and self._lbfgs_solver_cfg == cfg
+                and self._lbfgs_grad_unscaled is not None):
+            return self._lbfgs_solver, self._lbfgs_grad_unscaled
+
+        def _loss_unscaled(p, gp, weights):
+            full = {
+                **gp,
+                'sky_coeffs':  p['sky_coeffs'],
+                'beam_coeffs': self._beam_coeffs_full(p['beam_coeffs']),
+            }
+            return self._jit_loss_variable_beam(full, weights)
+
+        def _loss_scaled(p_s, gp, weights, scales):
+            p = {k: v * scales[k] for k, v in p_s.items()}
+            return _loss_unscaled(p, gp, weights)
+
+        self._lbfgs_grad_unscaled = jax.jit(jax.grad(_loss_unscaled, argnums=0))
+        self._lbfgs_solver = jaxopt.LBFGS(
+            fun=_loss_scaled,
+            maxiter=maxiter,
+            tol=tol,
+            history_size=history_size,
+            linesearch=linesearch,
+            jit=True,
+        )
+        self._lbfgs_solver_cfg = cfg
+        return self._lbfgs_solver, self._lbfgs_grad_unscaled
+
+    def _lbfgs_rfi_update(
+        self, sky_coeffs, beam_coeffs, gain_params,
+        smooth_width_chans, log_threshold, gamma,
+        log_min_weight, log_max_weight,
+        alpha_down, alpha_up, min_retention_per_update,
+    ):
+        """Update self.log_ch_weights from the current model residual.
+
+        Mirrors the RFI block inside fit_joint_sky_beam_dirty so users get the
+        same local-chi² outlier detector at the same configuration.
+        """
+        from newnucal.rfi import fit_channel_weights_local_chi2_exponential
+
+        params_now = {
+            'sky_coeffs':  sky_coeffs,
+            'beam_coeffs': self._beam_coeffs_full(beam_coeffs),
+            **gain_params,
+        }
+        rfi_resid_jax, _ = self._jit_rfi_residual_and_observed_power_variable_beam(params_now)
+        rfi_resid = np.asarray(jax.device_get(rfi_resid_jax))
+
+        old_log = np.asarray(self.log_ch_weights)
+        old_weights_f = np.exp(old_log[0, :] if old_log.ndim > 1 else old_log)
+
+        new_weights_direct, _ = fit_channel_weights_local_chi2_exponential(
+            residual=rfi_resid,
+            inv_noise_var=self._inv_noise_var_np,
+            visibility_weights=self._visibility_weights_np,
+            old_weights=old_weights_f,
+            prior_weights=None,
+            min_weight=float(np.exp(log_min_weight)),
+            max_weight=float(np.exp(log_max_weight)),
+            smooth_width_chans=int(smooth_width_chans),
+            threshold_ratio=float(np.exp(log_threshold)),
+            gamma=float(gamma),
+            alpha_down=float(alpha_down),
+            alpha_up=float(alpha_up),
+            max_drop_per_update=float(1.0 - min_retention_per_update),
+        )
+        new_log_weights = np.log(np.clip(new_weights_direct, 1e-30, 1.0))
+        self.set_channel_weights(new_log_weights)
+
+    def project_degeneracies(self, params, which=('log_amp',)):
+        """Project formal gain–beam–sky degeneracies onto a canonical gauge.
+
+        Like ``hera_cal.redcal``'s degeneracy projection, this moves parameters
+        into a canonical gauge so they can be compared to truth. Supports:
+
+        ``'log_amp'`` (default)
+            Per-frequency time-mean of ``log_amp`` is degenerate with beam
+            normalization at that frequency. We subtract ``mean_t(log_amp)``
+            and absorb it into ``beam_coeffs`` via per-frequency beam-spectrum
+            scaling. **Visibility-preserving** (the (beam, log_amp) move is
+            along an exact model invariance), so safe in any context — in-loop
+            or post-hoc.
+
+        ``'tip_tilt'`` (opt-in)
+            The ``(t,f)``-mean of ``phi`` (one scalar per spatial axis) is a
+            shallow direction the optimizer drifts in when sky positions are
+            held fixed. We subtract ``mean_{t,f}(phi)`` to enforce the
+            canonical gauge ``mean_{t,f}(phi) = 0`` (which is also the gauge
+            of the simulated truth in a closed-loop test). **Not
+            visibility-preserving** — a proper back-compensation would shift
+            the sky positions, which this code can't do. Only safe post-hoc
+            (after the fit is finalized) for comparison with truth. Pass
+            ``which=('log_amp', 'tip_tilt')`` to opt in.
+
+        Parameters
+        ----------
+        params : dict
+            Must contain ``log_amp``, ``beam_coeffs`` for ``log_amp``
+            projection and ``phi`` for ``tip_tilt`` projection.
+        which : tuple of str, default ``('log_amp',)``
+
+        Returns
+        -------
+        params_canonical : dict
+            New dict with the requested degeneracies projected.
+        """
+        params = dict(params)
+        if 'log_amp' in which:
+            beam_coeffs = params['beam_coeffs']
+            log_amp = params['log_amp']
+            beam_coeffs_new, log_amp_new = self._project_log_amp_degeneracy(
+                beam_coeffs, log_amp
+            )
+            params['beam_coeffs'] = beam_coeffs_new
+            params['log_amp'] = log_amp_new
+        if 'tip_tilt' in which:
+            params['phi'] = self._project_global_tip_tilt(params['phi'])
+        return params
+
+    def _project_log_amp_degeneracy(self, beam_coeffs, log_amp):
+        """Move time-mean of log_amp into beam_coeffs via per-freq scaling.
+
+        beam_coeffs may be active (masked) or full; we operate in full form
+        and trim back if the input was active.
+        """
+        A_beam = jnp.array(self.beam_model.A, dtype=DTYPE_R_JAX)
+        log_amp = jnp.asarray(log_amp, dtype=DTYPE_R_JAX)
+        mean_log_amp = jnp.mean(log_amp, axis=0)              # (nfreq,)
+        scale_f = jnp.exp(mean_log_amp)                       # (nfreq,)
+
+        was_masked = (
+            self.beam_mask is not None
+            and beam_coeffs.shape[0] == int(self.beam_mask.sum())
+        )
+        bc_full = self._beam_coeffs_full(beam_coeffs)         # (npix_full, nmodes)
+        beam_spec = bc_full @ A_beam.T                        # (npix_full, nfreq)
+        beam_spec_new = beam_spec * scale_f[None, :]
+        bc_full_new = beam_spec_new @ A_beam                  # orthonormal A: exact round-trip
+
+        if was_masked:
+            bc_new = bc_full_new[self.fwd._beam_indices]
+        else:
+            bc_new = bc_full_new
+
+        log_amp_new = log_amp - mean_log_amp[None, :]
+        return bc_new, log_amp_new
+
+    def _project_global_tip_tilt(self, phi):
+        """Subtract the global (t,f)-mean of phi for each spatial axis.
+
+        phi has shape (ntime, 2, nfreq). The (t,f)-mean per spatial axis is
+        a single scalar pair; subtracting it gives the canonical zero-mean
+        tip-tilt gauge. Pure gauge fix: no compensating sky shift is applied
+        (closed-loop assumes accurate starting sky positions).
+        """
+        phi = jnp.asarray(phi, dtype=DTYPE_R_JAX)
+        mean_phi = jnp.mean(phi, axis=(0, 2))    # shape (2,)
+        return phi - mean_phi[None, :, None]
+
+    def fit_joint_sky_beam_lbfgs(
+        self,
+        params,
+        n_outer: int = 5,
+        lbfgs_maxiter: int = 80,
+        lbfgs_history_size: int = 30,
+        lbfgs_tol: float = 1e-12,
+        lbfgs_linesearch: str = 'backtracking',
+        solve_every: dict | None = None,
+        rfi_smooth_width_chans: int = 17,
+        rfi_log_threshold: float = np.log(3.0),
+        rfi_gamma: float = 0.75,
+        rfi_log_min_weight: float = np.log(0.05),
+        rfi_log_max_weight: float = 0.0,
+        rfi_alpha_down: float = 0.20,
+        rfi_alpha_up: float = 0.75,
+        rfi_min_retention_per_update: float = 0.8,
+        project_degeneracies: bool = True,
+        verbose: bool = False,
+    ):
+        """Three-block alternating fit: closed-form gains, RFI weights, L-BFGS sky+beam.
+
+        Drops gains out of the quasi-Newton stack so the sky/beam subproblem
+        is well-conditioned (gain Hessian entries are orders of magnitude
+        larger than sky/beam entries and otherwise poison the L-BFGS curvature).
+
+        The L-BFGS solver and gradient are cached on the calibrator after the
+        first call; repeated calls with the same ``lbfgs_*`` config do not
+        recompile. ``_recompile_jit()`` (called by mask changes etc.) invalidates
+        the cache.
+
+        Parameters
+        ----------
+        params : dict
+            Must contain ``sky_coeffs``, ``beam_coeffs``, ``log_amp``, ``phase``,
+            ``phi``; ``log_ch_weights`` optional (defaults to current cal state).
+        n_outer : int, default 5
+            Number of outer alternating iterations.
+        lbfgs_maxiter : int, default 80
+            Max inner L-BFGS iterations per outer.
+        lbfgs_history_size : int, default 30
+            L-BFGS history length.
+        lbfgs_tol : float, default 1e-12
+            L-BFGS gradient-norm tolerance.
+        lbfgs_linesearch : str, default 'backtracking'
+            Passed through to ``jaxopt.LBFGS``.
+        solve_every : dict, optional
+            ``{'gains': n, 'rfi': m}`` (default ``{'gains': 1, 'rfi': 1}``).
+            ``n=0`` disables that block.
+        rfi_* : RFI detector parameters; same semantics as fit_joint_sky_beam_dirty.
+        project_degeneracies : bool, default True
+            After each outer iteration, project out the log_amp/beam time-mean
+            degeneracy onto the canonical gauge ``mean_t(log_amp) = 0``. This
+            move is visibility-preserving (the time-mean of log_amp flows into
+            beam normalization). The tip-tilt gauge is *not* applied in-loop
+            because it would require a compensating sky-position shift this
+            fit can't do; use ``cal.project_degeneracies(prms, which=
+            ('log_amp', 'tip_tilt'))`` post-hoc for comparison-with-truth.
+        verbose : bool, default False
+
+        Returns
+        -------
+        params_full : dict
+            Sky and beam in full (un-masked) form; gains and log_ch_weights as-is.
+        loss : float
+            Final noise-weighted chi² (``cal.calc_loss``).
+        """
+        solve_every = dict(solve_every or {'gains': 1, 'rfi': 1})
+
+        solver, grad_fn = self._build_lbfgs_solver(
+            lbfgs_maxiter, lbfgs_history_size, lbfgs_tol, lbfgs_linesearch,
+        )
+
+        # Sync RFI weights from input params (if provided) into cal state.
+        params_in_sky_full = params.get('sky_coeffs')
+        if params.get('log_ch_weights') is not None:
+            self.set_channel_weights(np.asarray(params['log_ch_weights']))
+
+        # Working state: sky active, beam active (masked if applicable).
+        sky_coeffs = self._ensure_sky_is_active(params['sky_coeffs'])
+        beam_full = self._beam_coeffs_full(params.get('beam_coeffs'))
+        if self.beam_mask is not None:
+            beam_coeffs = beam_full[self.fwd._beam_indices]
+        else:
+            beam_coeffs = beam_full
+        gain_params = {k: jnp.asarray(params[k]) for k in self._GAIN_PARAM_KEYS}
+
+        for outer in range(n_outer):
+            # 1. Closed-form gains
+            if solve_every.get('gains', 0) and outer % solve_every['gains'] == 0:
+                gain_params, _ = self.fit_gains_linear_variable_beam(sky_coeffs, beam_coeffs)
+
+            # 2. RFI weights
+            if solve_every.get('rfi', 0) and outer % solve_every['rfi'] == 0:
+                self._lbfgs_rfi_update(
+                    sky_coeffs, beam_coeffs, gain_params,
+                    smooth_width_chans=rfi_smooth_width_chans,
+                    log_threshold=rfi_log_threshold,
+                    gamma=rfi_gamma,
+                    log_min_weight=rfi_log_min_weight,
+                    log_max_weight=rfi_log_max_weight,
+                    alpha_down=rfi_alpha_down,
+                    alpha_up=rfi_alpha_up,
+                    min_retention_per_update=rfi_min_retention_per_update,
+                )
+
+            # 3. L-BFGS on sky+beam (gains + RFI weights held fixed in closure args).
+            weights = self._effective_weights()
+            params_sb = {'sky_coeffs': sky_coeffs, 'beam_coeffs': beam_coeffs}
+            g0 = grad_fn(params_sb, gain_params, weights)
+            scales = {
+                'sky_coeffs':  1.0 / max(float(jnp.linalg.norm(g0['sky_coeffs'])),  1e-12),
+                'beam_coeffs': 1.0 / max(float(jnp.linalg.norm(g0['beam_coeffs'])), 1e-12),
+            }
+            params_sb_scaled = {k: v / scales[k] for k, v in params_sb.items()}
+            result = solver.run(params_sb_scaled, gain_params, weights, scales)
+            sky_coeffs  = result.params['sky_coeffs']  * scales['sky_coeffs']
+            beam_coeffs = result.params['beam_coeffs'] * scales['beam_coeffs']
+
+            # 4. Degeneracy projection (canonical gauge for log_amp only — the
+            # only one that's visibility-preserving without a compensating sky
+            # transformation. tip_tilt would also be a gauge, but back-applying
+            # it requires shifting sky positions, which this fit doesn't do.
+            # Call cal.project_degeneracies(...) post-hoc if you want tip_tilt.)
+            if project_degeneracies:
+                beam_coeffs, gain_params['log_amp'] = self._project_log_amp_degeneracy(
+                    beam_coeffs, gain_params['log_amp']
+                )
+
+            if verbose:
+                inner_loss = float(result.state.value)
+                print(f"  [lbfgs outer {outer:3d}]: inner_iters={int(result.state.iter_num):3d}  "
+                      f"loss={inner_loss:.4e}")
+
+        # Final gains solve so the returned params reflect the latest sky+beam
+        if solve_every.get('gains', 0):
+            gain_params, _ = self.fit_gains_linear_variable_beam(sky_coeffs, beam_coeffs)
+            if project_degeneracies:
+                beam_coeffs, gain_params['log_amp'] = self._project_log_amp_degeneracy(
+                    beam_coeffs, gain_params['log_amp']
+                )
+
+        # Expand beam back to full form for the returned dict
+        beam_coeffs_full = self._beam_coeffs_full(beam_coeffs)
+        final = {
+            'sky_coeffs': sky_coeffs,
+            'beam_coeffs': beam_coeffs_full,
+            'log_ch_weights': self.log_ch_weights,
+            **gain_params,
+        }
+        params_full = self._params_to_full_space(final, params_in_sky_full)
+        params_full['beam_coeffs'] = beam_coeffs_full   # ensure full beam, not active
+        loss = float(self.calc_loss(params_full, explicit_beam=True))
+        return params_full, loss
 
     def fit_alternating_dirty(
         self,
