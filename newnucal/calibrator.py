@@ -3290,95 +3290,120 @@ class Calibrator:
             new_log_weights = np.log(np.clip(new_weights_direct, 1e-30, 1.0))
             self.set_channel_weights(new_log_weights)
 
-    def project_degeneracies(self, params, which=('log_amp',)):
-        """Project formal gain–beam–sky degeneracies onto a canonical gauge.
+    def remove_degen(self, params, degen_params=None, which=('log_amp',)):
+        """Move the degenerate modes of ``params`` to match ``degen_params``.
 
-        Like ``hera_cal.redcal``'s degeneracy projection, this moves parameters
-        into a canonical gauge so they can be compared to truth. Supports:
+        Mirrors ``hera_cal.redcal.RedundantCalibrator.remove_degen``: applies a
+        gauge transformation that replaces the values of the formally
+        degenerate modes in ``params`` with those of ``degen_params``. Pass
+        ``degen_params=None`` to project onto the canonical zero gauge.
 
-        ``'log_amp'`` (default)
+        Supported degeneracies:
+
+        ``'log_amp'`` (**visibility-preserving**)
             Per-frequency time-mean of ``log_amp`` is degenerate with beam
-            normalization at that frequency. We subtract ``mean_t(log_amp)``
-            and absorb it into ``beam_coeffs`` via per-frequency beam-spectrum
-            scaling. **Visibility-preserving** (the (beam, log_amp) move is
-            along an exact model invariance), so safe in any context — in-loop
-            or post-hoc.
+            normalization at that frequency. Shifts ``params['log_amp'][t,f]``
+            by ``mean_t(degen.log_amp[*,f]) - mean_t(params.log_amp[*,f])``
+            and scales ``beam_spec[pix,f]`` by the inverse, so the gain ×
+            beam product (and therefore visibilities) is invariant. Safe in
+            any context.
 
-        ``'tip_tilt'`` (opt-in)
-            The ``(t,f)``-mean of ``phi`` (one scalar per spatial axis) is a
-            shallow direction the optimizer drifts in when sky positions are
-            held fixed. We subtract ``mean_{t,f}(phi)`` to enforce the
-            canonical gauge ``mean_{t,f}(phi) = 0`` (which is also the gauge
-            of the simulated truth in a closed-loop test). **Not
-            visibility-preserving** — a proper back-compensation would shift
-            the sky positions, which this code can't do. Only safe post-hoc
-            (after the fit is finalized) for comparison with truth. Pass
-            ``which=('log_amp', 'tip_tilt')`` to opt in.
+        ``'tip_tilt'`` (**gauge fix only — not visibility-preserving**)
+            ``(t,f)``-mean of ``phi`` (one scalar per spatial axis) is a
+            shallow direction in parameter space the optimizer drifts in when
+            sky positions are held fixed. Shifts ``params['phi']`` so its
+            ``(t,f)``-mean matches ``degen.phi``'s. Because the compensating
+            transformation would require shifting sky pixel positions (which
+            this code does not do), this is **only safe post-hoc** on a
+            finalized fit, for comparison with truth. Opt in by passing
+            ``which=('log_amp', 'tip_tilt')``.
 
         Parameters
         ----------
         params : dict
-            Must contain ``log_amp``, ``beam_coeffs`` for ``log_amp``
-            projection and ``phi`` for ``tip_tilt`` projection.
+            Solution to gauge-shift. Must contain ``log_amp``, ``beam_coeffs``
+            for ``'log_amp'`` projection and ``phi`` for ``'tip_tilt'``.
+        degen_params : dict, optional
+            Reference whose degenerate-mode values are filled into the result.
+            Must contain the same keys consumed by the requested projections.
+            ``None`` (default) means canonical zero gauge.
         which : tuple of str, default ``('log_amp',)``
 
         Returns
         -------
-        params_canonical : dict
-            New dict with the requested degeneracies projected.
+        dict
+            New params with the degenerate modes shifted.
         """
         params = dict(params)
+
         if 'log_amp' in which:
-            beam_coeffs = params['beam_coeffs']
-            log_amp = params['log_amp']
-            beam_coeffs_new, log_amp_new = self._project_log_amp_degeneracy(
-                beam_coeffs, log_amp
+            sol_log_amp = jnp.asarray(params['log_amp'], dtype=DTYPE_R_JAX)
+            sol_mean = jnp.mean(sol_log_amp, axis=0)            # (nfreq,)
+            if degen_params is not None:
+                ref_mean = jnp.mean(
+                    jnp.asarray(degen_params['log_amp'], dtype=DTYPE_R_JAX),
+                    axis=0,
+                )
+            else:
+                ref_mean = jnp.zeros_like(sol_mean)
+            shift = ref_mean - sol_mean                         # (nfreq,)
+            params['beam_coeffs'], params['log_amp'] = self._apply_log_amp_shift(
+                params['beam_coeffs'], sol_log_amp, shift,
             )
-            params['beam_coeffs'] = beam_coeffs_new
-            params['log_amp'] = log_amp_new
+
         if 'tip_tilt' in which:
-            params['phi'] = self._project_global_tip_tilt(params['phi'])
+            sol_phi = jnp.asarray(params['phi'], dtype=DTYPE_R_JAX)
+            sol_mean_phi = jnp.mean(sol_phi, axis=(0, 2))       # (2,)
+            if degen_params is not None:
+                ref_mean_phi = jnp.mean(
+                    jnp.asarray(degen_params['phi'], dtype=DTYPE_R_JAX),
+                    axis=(0, 2),
+                )
+            else:
+                ref_mean_phi = jnp.zeros_like(sol_mean_phi)
+            shift_phi = ref_mean_phi - sol_mean_phi              # (2,)
+            params['phi'] = sol_phi + shift_phi[None, :, None]
+
         return params
 
-    def _project_log_amp_degeneracy(self, beam_coeffs, log_amp):
-        """Move time-mean of log_amp into beam_coeffs via per-freq scaling.
+    # Backward-compatibility alias. Equivalent to ``remove_degen(params,
+    # degen_params=None, which=which)``.
+    def project_degeneracies(self, params, which=('log_amp',)):
+        """Project onto canonical zero gauge — alias for
+        ``remove_degen(params, degen_params=None, which=which)``."""
+        return self.remove_degen(params, degen_params=None, which=which)
+
+    def _apply_log_amp_shift(self, beam_coeffs, log_amp, shift):
+        """Visibility-preserving gauge shift.
+
+        ``log_amp[t,f] -> log_amp[t,f] + shift[f]``
+        ``beam_spec[pix,f] -> beam_spec[pix,f] / exp(shift[f])``
 
         beam_coeffs may be active (masked) or full; we operate in full form
-        and trim back if the input was active.
+        and trim back if the input was active. Round-trips exactly through
+        the orthonormal beam basis.
         """
         A_beam = jnp.array(self.beam_model.A, dtype=DTYPE_R_JAX)
         log_amp = jnp.asarray(log_amp, dtype=DTYPE_R_JAX)
-        mean_log_amp = jnp.mean(log_amp, axis=0)              # (nfreq,)
-        scale_f = jnp.exp(mean_log_amp)                       # (nfreq,)
+        shift = jnp.asarray(shift, dtype=DTYPE_R_JAX)
+        inv_scale_f = jnp.exp(-shift)                          # (nfreq,)
 
         was_masked = (
             self.beam_mask is not None
             and beam_coeffs.shape[0] == int(self.beam_mask.sum())
         )
-        bc_full = self._beam_coeffs_full(beam_coeffs)         # (npix_full, nmodes)
-        beam_spec = bc_full @ A_beam.T                        # (npix_full, nfreq)
-        beam_spec_new = beam_spec * scale_f[None, :]
-        bc_full_new = beam_spec_new @ A_beam                  # orthonormal A: exact round-trip
+        bc_full = self._beam_coeffs_full(beam_coeffs)
+        beam_spec = bc_full @ A_beam.T
+        beam_spec_new = beam_spec * inv_scale_f[None, :]
+        bc_full_new = beam_spec_new @ A_beam
 
         if was_masked:
             bc_new = bc_full_new[self.fwd._beam_indices]
         else:
             bc_new = bc_full_new
 
-        log_amp_new = log_amp - mean_log_amp[None, :]
+        log_amp_new = log_amp + shift[None, :]
         return bc_new, log_amp_new
-
-    def _project_global_tip_tilt(self, phi):
-        """Subtract the global (t,f)-mean of phi for each spatial axis.
-
-        phi has shape (ntime, 2, nfreq). The (t,f)-mean per spatial axis is
-        a single scalar pair; subtracting it gives the canonical zero-mean
-        tip-tilt gauge. Pure gauge fix: no compensating sky shift is applied
-        (closed-loop assumes accurate starting sky positions).
-        """
-        phi = jnp.asarray(phi, dtype=DTYPE_R_JAX)
-        mean_phi = jnp.mean(phi, axis=(0, 2))    # shape (2,)
-        return phi - mean_phi[None, :, None]
 
     def fit_joint_sky_beam_lbfgs(
         self,
@@ -3399,7 +3424,6 @@ class Calibrator:
         rfi_min_retention_per_update: float = 0.8,
         rfi_passes_per_outer: int = 1,
         precond_damping: float = 1e-2,
-        project_degeneracies: bool = True,
         verbose: bool = False,
         verbose_exclude_chans=None,
     ):
@@ -3446,14 +3470,6 @@ class Calibrator:
             conservative (closer to gradient descent); smaller values give
             more aggressive Newton-style preconditioning but risk oscillation
             in weakly-constrained directions.
-        project_degeneracies : bool, default True
-            After each outer iteration, project out the log_amp/beam time-mean
-            degeneracy onto the canonical gauge ``mean_t(log_amp) = 0``. This
-            move is visibility-preserving (the time-mean of log_amp flows into
-            beam normalization). The tip-tilt gauge is *not* applied in-loop
-            because it would require a compensating sky-position shift this
-            fit can't do; use ``cal.project_degeneracies(prms, which=
-            ('log_amp', 'tip_tilt'))`` post-hoc for comparison-with-truth.
         verbose_exclude_chans : iterable of int, optional
             If provided, the verbose chi² is computed by
             :meth:`calc_reduced_chi2_excluding_chans` (radiometric σ, named
@@ -3545,15 +3561,11 @@ class Calibrator:
             sky_coeffs  = result.params['sky_coeffs']  * scales['sky_coeffs']
             beam_coeffs = result.params['beam_coeffs'] * scales['beam_coeffs']
 
-            # 4. Degeneracy projection (canonical gauge for log_amp only — the
-            # only one that's visibility-preserving without a compensating sky
-            # transformation. tip_tilt would also be a gauge, but back-applying
-            # it requires shifting sky positions, which this fit doesn't do.
-            # Call cal.project_degeneracies(...) post-hoc if you want tip_tilt.)
-            if project_degeneracies:
-                beam_coeffs, gain_params['log_amp'] = self._project_log_amp_degeneracy(
-                    beam_coeffs, gain_params['log_amp']
-                )
+            # 4. (Degeneracy projection has been removed from the in-loop step.
+            #    The log_amp/beam gauge drifts freely during the fit;
+            #    visibilities are gauge-invariant so this does not hurt
+            #    convergence. Call ``cal.remove_degen(prms, ...)`` post-hoc to
+            #    shift recovered params into the truth gauge for comparison.)
 
             if verbose:
                 inner_loss = float(result.state.value)
@@ -3601,10 +3613,6 @@ class Calibrator:
             )
         if solve_every.get('gains', 0):
             gain_params, _ = self.fit_gains_linear_variable_beam(sky_coeffs, beam_coeffs)
-            if project_degeneracies:
-                beam_coeffs, gain_params['log_amp'] = self._project_log_amp_degeneracy(
-                    beam_coeffs, gain_params['log_amp']
-                )
 
         # Expand beam back to full form for the returned dict
         beam_coeffs_full = self._beam_coeffs_full(beam_coeffs)
@@ -3634,7 +3642,6 @@ class Calibrator:
         lbfgs_history_size: int = 30,
         lbfgs_solve_every: dict | None = None,
         precond_damping: float = 1e-2,
-        project_degeneracies: bool = True,
         # ---- Shared RFI config ----
         rfi_smooth_width_chans: int = 17,
         rfi_log_threshold: float = np.log(3.0),
@@ -3674,7 +3681,7 @@ class Calibrator:
             (the dirty-fit default).
         lbfgs_n_outer : int, default 3
             Outer iterations of fit_joint_sky_beam_lbfgs per cycle.
-        lbfgs_maxiter, lbfgs_history_size, precond_damping, project_degeneracies :
+        lbfgs_maxiter, lbfgs_history_size, precond_damping :
             Pass-through to fit_joint_sky_beam_lbfgs.
         lbfgs_solve_every : dict, optional
             ``{'gains': n, 'rfi': m}``. Defaults to ``{'gains': 1, 'rfi': 1}``.
@@ -3730,7 +3737,6 @@ class Calibrator:
                 rfi_alpha_up=rfi_alpha_up,
                 rfi_min_retention_per_update=rfi_min_retention_per_update,
                 precond_damping=precond_damping,
-                project_degeneracies=project_degeneracies,
                 rfi_passes_per_outer=rfi_passes_per_outer,
                 verbose=verbose,
                 verbose_exclude_chans=verbose_exclude_chans,
