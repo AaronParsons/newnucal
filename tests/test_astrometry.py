@@ -59,9 +59,10 @@ class TestRotationMatrixProperties:
         assert rot_matrices_multi.shape[0] == 4
         assert rot_matrices_multi.shape[1:] == (3, 3)
 
-    def test_dtype_float32(self, rot_matrices_single):
-        """Rotation matrices are float32."""
-        assert rot_matrices_single.dtype == np.float32
+    def test_dtype_matches_package_real_dtype(self, rot_matrices_single):
+        """Rotation matrices use the package-wide real dtype."""
+        from newnucal.utils import DTYPE_R_NPY
+        assert rot_matrices_single.dtype == DTYPE_R_NPY
 
     def test_values_finite(self, rot_matrices_multi):
         """All values are finite (no NaN or inf)."""

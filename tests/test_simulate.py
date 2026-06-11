@@ -177,6 +177,30 @@ def test_simulate_2d_matches_3d_with_rotation(forward_model, A_sky, rot_matrices
     )
 
 
+def test_simulate_2d_matches_3d_offaxis_source(forward_model, A_sky):
+    """2D and 3D paths agree for an off-zenith source, to tight tolerance.
+
+    A zenith source has identically zero fringe phase on a coplanar array, so
+    the zenith-sky tests above cannot detect lattice-orientation errors
+    (transpose/sign) in the hex-rect axial mapping.  An off-zenith source
+    exercises non-zero phase on every baseline.  Regression test for the
+    hex_lattice_matrix transpose bug.
+    """
+    nside = forward_model.sky_model.nside
+    npix = healpy.nside2npix(nside)
+    vecs = np.array(healpy.pix2vec(nside, np.arange(npix)))
+    pix = int(np.argmin(np.abs(vecs[2] - 0.7) + np.abs(vecs[0] - 0.5)))
+    coeffs = np.zeros((npix, A_sky.shape[1]))
+    coeffs[pix] = np.linalg.lstsq(A_sky, np.ones(A_sky.shape[0]), rcond=None)[0]
+    sky_coeffs = jnp.array(coeffs)
+    rot_m = _identity_rot()[None, :, :]
+
+    vis_3d = forward_model.simulate_3d(sky_coeffs, rot_m)
+    vis_2d = forward_model.simulate_2d(sky_coeffs, rot_m)
+    rel = float(jnp.max(jnp.abs(vis_2d - vis_3d)) / (jnp.mean(jnp.abs(vis_3d)) + 1e-30))
+    assert rel < 1e-3, f"2D vs 3D off-axis max relative error {rel:.2e}"
+
+
 def test_accumulate_sky_update_2d_shape(forward_model, A_sky):
     """accumulate_equatorial_sky_update_2d returns same shape as sky_coeffs."""
     sky_coeffs = _zenith_sky_coeffs(forward_model.sky_model.nside, A_sky)

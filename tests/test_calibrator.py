@@ -14,6 +14,7 @@ import inspect
 from newnucal.basis import basis_project
 from newnucal.gains import apply_gains, init_gain_params
 from newnucal.simulate import ForwardModel
+from newnucal.utils import DTYPE_R_JAX as DTYPE_R
 
 # Mirror the conftest sizes
 NSIDE_SKY = 8
@@ -151,7 +152,7 @@ class TestFitGainsLinear:
         cal, _ = calibrator_gains_setup
         gain_params, _ = cal.fit_gains_linear(sky_coeffs_true)
         for key, val in gain_params.items():
-            assert val.dtype == jnp.float32, f"{key}: expected float32, got {val.dtype}"
+            assert val.dtype == DTYPE_R, f"{key}: expected {DTYPE_R}, got {val.dtype}"
 
 
 
@@ -1277,3 +1278,322 @@ class TestBeamSkyMaskingReverse:
         # And the perturbed beam loss should be higher
         assert loss_perturbed > loss_var, \
             "Perturbed beam should give worse loss"
+
+
+# ---------------------------------------------------------------------------
+# project_out_time_mean (FR0-notch projector)
+# ---------------------------------------------------------------------------
+
+class TestProjectOutTimeMean:
+    """The P(x) = x − mean_t(x) projector for FR0-notch-filtered data."""
+
+    def _make_cal(self, array, beam_model, sky_model, freqs, rot_matrices,
+                  data, **kw):
+        from newnucal.calibrator import Calibrator
+        return Calibrator(array, beam_model, sky_model, freqs,
+                          rot_matrices, data, method='3d', **kw)
+
+    def test_simulate_output_is_time_mean_free(
+            self, array, beam_model, sky_model, freqs, rot_matrices,
+            forward_model, sky_coeffs_true):
+        vis_true = forward_model.simulate_3d(sky_coeffs_true, jnp.array(rot_matrices))
+        cal = self._make_cal(array, beam_model, sky_model, freqs, rot_matrices,
+                             vis_true, project_out_time_mean=True)
+        prms = cal.init_params()
+        prms['sky_coeffs'] = sky_coeffs_true
+        vis = cal.simulate(prms)
+        mean_t = jnp.mean(vis, axis=0)
+        assert float(jnp.max(jnp.abs(mean_t))) < 1e-6 * float(jnp.max(jnp.abs(vis)))
+
+    def test_loss_invariant_to_static_offset_in_data(
+            self, array, beam_model, sky_model, freqs, rot_matrices,
+            forward_model, sky_coeffs_true):
+        """Adding a per-(baseline, channel) time-constant to the data must not
+        change the projected loss — that is exactly the component the FR0
+        notch removed."""
+        vis_true = forward_model.simulate_3d(sky_coeffs_true, jnp.array(rot_matrices))
+        rng = np.random.default_rng(1)
+        offset = (rng.standard_normal(vis_true.shape[1:])
+                  + 1j * rng.standard_normal(vis_true.shape[1:]))
+        cal_a = self._make_cal(array, beam_model, sky_model, freqs, rot_matrices,
+                               vis_true, project_out_time_mean=True)
+        cal_b = self._make_cal(array, beam_model, sky_model, freqs, rot_matrices,
+                               vis_true + offset[None], project_out_time_mean=True)
+        prms = cal_a.init_params()
+        prms['sky_coeffs'] = sky_coeffs_true
+        loss_a = float(cal_a.calc_loss(prms))
+        loss_b = float(cal_b.calc_loss(prms))
+        assert np.isclose(loss_a, loss_b, rtol=1e-5, atol=1e-8)
+
+    def test_truth_recovers_zero_loss_on_notched_data(
+            self, array, beam_model, sky_model, freqs, rot_matrices,
+            forward_model, sky_coeffs_true):
+        """Data = P(V_true): with the projector the true sky gives ~zero loss,
+        without it the loss is dominated by the missing static component."""
+        vis_true = forward_model.simulate_3d(sky_coeffs_true, jnp.array(rot_matrices))
+        vis_notched = vis_true - jnp.mean(vis_true, axis=0, keepdims=True)
+        prms_key = ('sky_coeffs',)
+
+        cal_p = self._make_cal(array, beam_model, sky_model, freqs, rot_matrices,
+                               vis_notched, project_out_time_mean=True)
+        prms = cal_p.init_params()
+        prms['sky_coeffs'] = sky_coeffs_true
+        loss_p = float(cal_p.calc_loss(prms))
+
+        cal_n = self._make_cal(array, beam_model, sky_model, freqs, rot_matrices,
+                               vis_notched, project_out_time_mean=False)
+        loss_n = float(cal_n.calc_loss(prms))
+
+        scale = float(jnp.sum(jnp.abs(vis_notched) ** 2))
+        assert loss_p < 1e-8 * scale
+        assert loss_n > 1e3 * max(loss_p, 1e-30)
+
+    def test_requires_multiple_times(
+            self, array, beam_model, sky_model, freqs, rot_matrices,
+            forward_model, sky_coeffs_true):
+        vis_true = forward_model.simulate_3d(sky_coeffs_true, jnp.array(rot_matrices))
+        with pytest.raises(ValueError, match="ntime > 1"):
+            self._make_cal(array, beam_model, sky_model, freqs,
+                           rot_matrices[:1], vis_true[:1],
+                           project_out_time_mean=True)
+
+
+class TestFitGainsLinearZeroWeights:
+    """Regression: zero-weight samples must not produce NaN gains.
+
+    Real data has flagged/inpainted/missing samples (zero visibility weight)
+    and fully-dead channels (zero channel weight).  fit_gains_linear used to
+    hit 0·log(0) = NaN there, poisoning every channel's gain sum."""
+
+    def test_finite_gains_with_zero_weight_samples(self, calibrator_gains_setup):
+        cal, _true = calibrator_gains_setup
+        ntime, nfreq, nbls = cal.data.shape
+        vw = np.ones((ntime, nfreq, nbls))
+        vw[:, :, :: 3] = 0.0                # a third of baselines flagged
+        cal.set_visibility_weights(vw)
+        lw = np.zeros(nfreq)
+        lw[nfreq // 2] = np.log(1e-6)       # one (nearly) dead channel
+        cal.set_channel_weights(lw)
+        try:
+            sky = jnp.zeros((cal._npix_full, cal.A_sky.shape[1]))
+            # any sky works; use a small random one so vis_model is non-zero
+            rng = np.random.default_rng(0)
+            sky = jnp.array(rng.exponential(0.1, sky.shape))
+            gp, loss = cal.fit_gains_linear(sky)
+            for k in ('log_amp', 'phase', 'phi'):
+                assert np.isfinite(np.asarray(gp[k])).all(), f'{k} has non-finite entries'
+            assert np.isfinite(loss)
+        finally:
+            cal.set_visibility_weights(None)
+            cal.set_channel_weights(None)
+
+
+class TestFitSkyCG:
+    """CG sky solve: the beam-frozen, gains-fixed problem is exactly linear."""
+
+    def _build(self, array, beam_model, sky_model, freqs, rot_matrices, data, **kw):
+        from newnucal.calibrator import Calibrator
+        return Calibrator(array, beam_model, sky_model, freqs,
+                          rot_matrices, data, method='3d', **kw)
+
+    def test_drives_loss_to_floor_closed_loop(
+            self, array, beam_model, sky_model, freqs, rot_matrices,
+            forward_model, sky_coeffs_true):
+        vis_true = forward_model.simulate_3d(sky_coeffs_true, jnp.array(rot_matrices))
+        cal = self._build(array, beam_model, sky_model, freqs, rot_matrices, vis_true)
+        prms = cal.init_params()
+        gains = {k: prms[k] for k in ('log_amp', 'phase', 'phi')}
+        sky0 = jnp.zeros_like(prms['sky_coeffs'])
+        loss0 = float(cal.calc_loss({'sky_coeffs': sky0, **gains}))
+        sky_cg, loss_cg = cal.fit_sky_cg(sky0, gains, maxiter=40)
+        assert np.isfinite(loss_cg)
+        assert loss_cg < 5e-3 * loss0, f'CG only reached {loss_cg:.3e} from {loss0:.3e}'
+
+    def test_competitive_with_dirty(
+            self, array, beam_model, sky_model, freqs, rot_matrices,
+            forward_model, sky_coeffs_true):
+        """CG at a 4x iteration budget should clearly beat 10 dirty sweeps.
+        (On tiny toys the dirty solver's per-time preconditioned sweeps are
+        Kaczmarz-like and very strong early; CG's advantage is robustness on
+        ill-conditioned real problems where Richardson stalls.)"""
+        vis_true = forward_model.simulate_3d(sky_coeffs_true, jnp.array(rot_matrices))
+        cal = self._build(array, beam_model, sky_model, freqs, rot_matrices, vis_true)
+        prms = cal.init_params()
+        gains = {k: prms[k] for k in ('log_amp', 'phase', 'phi')}
+        sky0 = jnp.zeros_like(prms['sky_coeffs'])
+        _, loss_dirty = cal.fit_sky_dirty(sky0, gains, n_iter=10, step_size=0.5)
+        _, loss_cg = cal.fit_sky_cg(sky0, gains, maxiter=40)
+        assert loss_cg < loss_dirty
+
+    def test_masked_sky_path(
+            self, array, beam_model, sky_model, freqs, rot_matrices,
+            forward_model, sky_coeffs_true):
+        vis_true = forward_model.simulate_3d(sky_coeffs_true, jnp.array(rot_matrices))
+        cal = self._build(array, beam_model, sky_model, freqs, rot_matrices, vis_true)
+        beam_mask = cal.build_beam_mask_altitude(0.0)
+        cal.apply_sky_mask(cal.build_sky_mask_from_beam_pixels(beam_mask))
+        cal.apply_beam_mask(beam_mask)
+        prms = cal.init_params()
+        gains = {k: prms[k] for k in ('log_amp', 'phase', 'phi')}
+        sky0 = jnp.zeros_like(prms['sky_coeffs'])     # full-sky input
+        loss0 = float(cal.calc_loss({'sky_coeffs': sky0, **gains}))
+        sky_cg, loss_cg = cal.fit_sky_cg(sky0, gains, maxiter=30)
+        assert sky_cg.shape[0] == cal._npix_full       # returned in full format
+        assert np.isfinite(loss_cg) and loss_cg < 0.1 * loss0
+
+    def test_respects_projector(
+            self, array, beam_model, sky_model, freqs, rot_matrices,
+            forward_model, sky_coeffs_true):
+        """With project_out_time_mean, CG fits P(data) in the projected space."""
+        vis_true = forward_model.simulate_3d(sky_coeffs_true, jnp.array(rot_matrices))
+        vis_notched = vis_true - jnp.mean(vis_true, axis=0, keepdims=True)
+        cal = self._build(array, beam_model, sky_model, freqs, rot_matrices,
+                          vis_notched, project_out_time_mean=True)
+        prms = cal.init_params()
+        gains = {k: prms[k] for k in ('log_amp', 'phase', 'phi')}
+        sky0 = jnp.zeros_like(prms['sky_coeffs'])
+        loss0 = float(cal.calc_loss({'sky_coeffs': sky0, **gains}))
+        _, loss_cg = cal.fit_sky_cg(sky0, gains, maxiter=40)
+        # the projected normal operator has a different spectrum than the one
+        # the beam preconditioner models; convergence is slower but solid
+        assert loss_cg < 0.1 * loss0
+
+    def test_descends_with_nonzero_complex_gains(
+            self, array, beam_model, sky_model, freqs, rot_matrices,
+            forward_model, sky_coeffs_true):
+        """Regression: jax.vjp at a real primal gives the UNconjugated
+        transpose Re(J^T c); without conjugating the cotangent the CG normal
+        operator is wrong whenever the gain phases are nonzero (it looked
+        fine in zero-gain closed loops)."""
+        from newnucal.gains import apply_gains
+        vis_true = forward_model.simulate_3d(sky_coeffs_true, jnp.array(rot_matrices))
+        ntime, nfreq, _ = vis_true.shape
+        rng = np.random.default_rng(5)
+        gains = dict(
+            log_amp=jnp.array(0.1 * rng.standard_normal((ntime, nfreq))),
+            phase=jnp.array(1.0 * rng.standard_normal((ntime, nfreq))),
+            phi=jnp.array(1e-3 * rng.standard_normal((ntime, 2, nfreq))),
+        )
+        data = apply_gains(vis_true, gains['log_amp'], gains['phase'],
+                           gains['phi'], jnp.array(array.bls))
+        cal = self._build(array, beam_model, sky_model, freqs, rot_matrices, data)
+        sky0 = jnp.zeros_like(cal.init_params()['sky_coeffs'])
+        loss0 = float(cal.calc_loss({'sky_coeffs': sky0, **gains}))
+        _, loss_cg = cal.fit_sky_cg(sky0, gains, maxiter=40)
+        assert loss_cg < 5e-3 * loss0, f'CG reached only {loss_cg:.3e} from {loss0:.3e}'
+
+    def test_prior_pins_solution_at_large_lambda(
+            self, array, beam_model, sky_model, freqs, rot_matrices,
+            forward_model, sky_coeffs_true):
+        vis_true = forward_model.simulate_3d(sky_coeffs_true, jnp.array(rot_matrices))
+        cal = self._build(array, beam_model, sky_model, freqs, rot_matrices, vis_true)
+        prms = cal.init_params()
+        gains = {k: prms[k] for k in ('log_amp', 'phase', 'phi')}
+        rng = np.random.default_rng(2)
+        prior = jnp.array(rng.exponential(0.5, prms['sky_coeffs'].shape))
+        sky_cg, _ = cal.fit_sky_cg(jnp.zeros_like(prior), gains, maxiter=30,
+                                   prior_sky=prior, prior_lambda=1e8)
+        rel = float(jnp.max(jnp.abs(sky_cg - prior)) / jnp.max(jnp.abs(prior)))
+        assert rel < 1e-3, f'huge prior_lambda did not pin to prior (rel dev {rel:.2e})'
+
+    def test_prior_toward_truth_still_fits_data(
+            self, array, beam_model, sky_model, freqs, rot_matrices,
+            forward_model, sky_coeffs_true):
+        """A moderate prior must not block convergence when prior == truth."""
+        vis_true = forward_model.simulate_3d(sky_coeffs_true, jnp.array(rot_matrices))
+        cal = self._build(array, beam_model, sky_model, freqs, rot_matrices, vis_true)
+        prms = cal.init_params()
+        gains = {k: prms[k] for k in ('log_amp', 'phase', 'phi')}
+        sky0 = jnp.zeros_like(sky_coeffs_true)
+        loss0 = float(cal.calc_loss({'sky_coeffs': sky0, **gains}))
+        _, loss_cg = cal.fit_sky_cg(sky0, gains, maxiter=40,
+                                    prior_sky=sky_coeffs_true, prior_lambda=0.05)
+        assert loss_cg < 5e-3 * loss0
+
+    def test_prior_damps_low_weight_pixels(
+            self, array, beam_model, sky_model, freqs, rot_matrices,
+            forward_model, sky_coeffs_true):
+        """With noisy data, low-beam-weight pixels should stay near the prior
+        while high-weight pixels move with the data."""
+        vis_true = forward_model.simulate_3d(sky_coeffs_true, jnp.array(rot_matrices))
+        rng = np.random.default_rng(11)
+        noise = 0.1 * float(jnp.abs(vis_true).mean()) * (
+            rng.standard_normal(vis_true.shape) + 1j * rng.standard_normal(vis_true.shape))
+        cal = self._build(array, beam_model, sky_model, freqs, rot_matrices,
+                          vis_true + noise)
+        prms = cal.init_params()
+        gains = {k: prms[k] for k in ('log_amp', 'phase', 'phi')}
+        prior = sky_coeffs_true
+        sky0 = jnp.zeros_like(prior)
+        sky_np, _ = cal.fit_sky_cg(sky0, gains, maxiter=40)
+        sky_pr, _ = cal.fit_sky_cg(sky0, gains, maxiter=40,
+                                   prior_sky=prior, prior_lambda=0.05)
+        w_px = np.asarray(cal.get_sky_beam_weighting())
+        lo = w_px < np.percentile(w_px[w_px > 0], 25)
+        dev_np = float(np.abs(np.asarray(sky_np)[lo] - np.asarray(prior)[lo]).mean())
+        dev_pr = float(np.abs(np.asarray(sky_pr)[lo] - np.asarray(prior)[lo]).mean())
+        assert dev_pr < dev_np, (
+            f'prior did not damp low-weight pixels: {dev_pr:.3e} vs {dev_np:.3e}')
+
+
+class TestRemoveDegenLogAmpSky:
+    """'log_amp_sky' gauge projection: pin the SMOOTH gain amplitude, move it
+    into the sky spectra. Only the smooth component is a true gauge mode;
+    ragged per-channel structure is data-constrained and stays in the gains
+    (a per-channel exchange would also leave the sky basis span and break
+    visibility preservation)."""
+
+    def _build(self, array, beam_model, sky_model, freqs, rot_matrices, data):
+        from newnucal.calibrator import Calibrator
+        return Calibrator(array, beam_model, sky_model, freqs,
+                          rot_matrices, data, method='3d')
+
+    def test_smooth_gauge_pinned_and_visibility_preserved(
+            self, array, beam_model, sky_model, freqs, rot_matrices,
+            forward_model, sky_coeffs_true):
+        vis_true = forward_model.simulate_3d(sky_coeffs_true, jnp.array(rot_matrices))
+        cal = self._build(array, beam_model, sky_model, freqs, rot_matrices, vis_true)
+        prms = cal.init_params()
+        prms['sky_coeffs'] = sky_coeffs_true
+        # smooth gauge drift (in the span of the leading sky-basis modes)
+        A = np.asarray(cal.A_sky)
+        drift = A[:, :3] @ np.array([0.8, -0.3, 0.2])
+        rng = np.random.default_rng(9)
+        prms['log_amp'] = jnp.array(
+            drift[None, :] + 0.02 * rng.standard_normal(prms['log_amp'].shape))
+        del prms['beam_coeffs']                      # cached-beam path
+        vis_before = cal.simulate(prms)
+
+        out = cal.remove_degen(prms, degen_params=None, which=('log_amp_sky',))
+        # smooth component of the per-channel time-mean is pinned to zero
+        G = A[:, :3]
+        resid_smooth = G.T @ np.mean(np.asarray(out['log_amp']), axis=0)
+        assert np.max(np.abs(resid_smooth)) < 1e-8
+        # visibilities preserved up to basis-margin leakage of exp(smooth)
+        prms2 = dict(prms)
+        prms2['sky_coeffs'] = out['sky_coeffs']
+        prms2['log_amp'] = out['log_amp']
+        vis_after = cal.simulate(prms2)
+        rel = float(jnp.max(jnp.abs(vis_after - vis_before))
+                    / (jnp.max(jnp.abs(vis_before)) + 1e-30))
+        assert rel < 0.05, f'visibility change {rel:.3e} exceeds basis-margin tolerance'
+
+    def test_ragged_component_stays_in_gains(
+            self, array, beam_model, sky_model, freqs, rot_matrices,
+            forward_model, sky_coeffs_true):
+        vis_true = forward_model.simulate_3d(sky_coeffs_true, jnp.array(rot_matrices))
+        cal = self._build(array, beam_model, sky_model, freqs, rot_matrices, vis_true)
+        prms = cal.init_params()
+        prms['sky_coeffs'] = sky_coeffs_true
+        rng = np.random.default_rng(3)
+        ragged = rng.standard_normal(prms['log_amp'].shape[1])
+        A = np.asarray(cal.A_sky)
+        G = A[:, :3]
+        ragged -= G @ (G.T @ ragged)                  # orthogonal to gauge modes
+        prms['log_amp'] = jnp.array(np.tile(ragged, (prms['log_amp'].shape[0], 1)))
+        out = cal.remove_degen(prms, degen_params=None, which=('log_amp_sky',))
+        # ragged part untouched in gains, sky untouched
+        np.testing.assert_allclose(np.asarray(out['log_amp']),
+                                   np.asarray(prms['log_amp']), atol=1e-10)
+        np.testing.assert_allclose(np.asarray(out['sky_coeffs']),
+                                   np.asarray(prms['sky_coeffs']), rtol=1e-10)

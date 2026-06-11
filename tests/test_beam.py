@@ -4,6 +4,7 @@ from newnucal.beam import BeamModel
 from newnucal.basis import basis_reconstruct, dpss_matrix
 from newnucal.basis import BeamBasis, SkyBasis
 from newnucal.sky import SkyModel
+from newnucal.utils import DTYPE_R_NPY as DTYPE_R
 
 NSIDE_BEAM = 8
 N_SKY_SAMPLES = 8
@@ -60,7 +61,7 @@ def test_beam_zenith_brightest(beam_model):
 
 
 def test_beam_coeffs_dtype(beam_model):
-    assert beam_model.coeffs.dtype == np.float32
+    assert beam_model.coeffs.dtype == DTYPE_R
 
 
 # ------------------------------------------------------------------
@@ -88,7 +89,7 @@ class TestBeamModelWithBeamBasis:
     def test_coeffs_dtype(self, freqs):
         bb = _make_beam_basis(freqs)
         bm = BeamModel(nside=NSIDE_BEAM, freqs=freqs, basis=bb)
-        assert bm.coeffs.dtype == np.float32
+        assert bm.coeffs.dtype == DTYPE_R
 
     def test_reconstruction_shape(self, freqs):
         bb  = _make_beam_basis(freqs)
@@ -118,7 +119,7 @@ class TestBeamModelArrayBasis:
         nfreq  = len(freqs)
         A      = rng.standard_normal((nfreq, 4)).astype(np.float64)
         bm     = BeamModel(nside=NSIDE_BEAM, freqs=freqs, basis=A)
-        assert bm.A.dtype == np.float32
+        assert bm.A.dtype == DTYPE_R
 
 
 # ------------------------------------------------------------------

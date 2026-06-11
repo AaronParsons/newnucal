@@ -292,6 +292,7 @@ class Calibrator:
         noise_sigma=None,
         method: str = '2d',
         t_chunk_size: int = 12,
+        project_out_time_mean: bool = False,
     ):
         """
         Parameters
@@ -307,6 +308,16 @@ class Calibrator:
             Number of time steps to process per chunk in simulate.
             Default 12 (~6–12× memory reduction for 96-time observations).
             Set to ntime to disable chunking.
+        project_out_time_mean : bool, optional
+            If True, apply the projector ``P(x) = x − mean_t(x)`` (per baseline
+            and channel) to both the data (once, here) and every simulated
+            model visibility.  Use when the data have had a fringe-rate-zero
+            notch applied (e.g. HERA FR0-filtered LST stacks): the sky model
+            cannot represent the missing near-static component, so the fit
+            must be carried out in the projected subspace.  ``P`` is linear,
+            idempotent and self-adjoint, so L-BFGS gradients remain exact;
+            dirty-map adjoint steps remain exact when weights are constant in
+            time and a good approximation otherwise.  Requires ``ntime > 1``.
         """
         if method not in ('3d', '2d'):
             raise ValueError(f"method must be '3d' or '2d', got {method!r}")
@@ -316,6 +327,14 @@ class Calibrator:
         self.freqs = jnp.array(freqs, dtype=DTYPE_R_JAX)
         self.rot_matrices = jnp.array(rot_matrices, dtype=DTYPE_R_JAX)
         self.data = jnp.array(data, dtype=DTYPE_C_JAX)
+        self.project_out_time_mean = bool(project_out_time_mean)
+        if self.project_out_time_mean:
+            if self.data.shape[0] < 2:
+                raise ValueError(
+                    "project_out_time_mean requires ntime > 1 "
+                    f"(got ntime={self.data.shape[0]})"
+                )
+            self.data = self.data - jnp.mean(self.data, axis=0, keepdims=True)
         self.bls = jnp.array(array.bls, dtype=DTYPE_R_JAX)
         self.log_ch_weights = jnp.zeros(self.data.shape[:2], dtype=DTYPE_R_JAX)
         self.inv_noise_var = jnp.ones(self.data.shape[:2], dtype=DTYPE_R_JAX)
@@ -372,6 +391,8 @@ class Calibrator:
         self._lbfgs_grad_unscaled = None
         self._lbfgs_diag_gn_fn = None  # jit'd diagonal GN preconditioner
         self._lbfgs_solver_cfg = None  # (maxiter, history_size, tol, linesearch)
+        self._cg_adj = None            # cached gain-free adjoint for fit_sky_cg
+        self._cg_adj_size = None
 
         self.set_channel_weights(channel_weights)
         self.set_inv_noise_var(inv_noise_var)
@@ -390,17 +411,30 @@ class Calibrator:
     def _select_methods(self):
         """Bind forward/adjoint callables based on self.method. Only JIT the selected path."""
         if self.method == '2d':
-            self._sim_fn            = lambda sc, rm: self.fwd.simulate_2d(sc, rm, t_chunk_size=self.t_chunk_size)
-            self._var_beam_sim_fn   = self.fwd.simulate_variable_beam_2d
+            sim_fn          = lambda sc, rm: self.fwd.simulate_2d(sc, rm, t_chunk_size=self.t_chunk_size)
+            var_beam_sim_fn = self.fwd.simulate_variable_beam_2d
             self._sky_update_fn     = self.fwd.accumulate_equatorial_sky_update_2d
             self._beam_update_fn    = self.fwd.accumulate_beam_update_2d
             self._combined_update_fn = self.fwd.accumulate_sky_and_beam_update_2d
         else:  # method == '3d'
-            self._sim_fn            = lambda sc, rm: self.fwd.simulate_3d(sc, rm, t_chunk_size=self.t_chunk_size)
-            self._var_beam_sim_fn   = self.fwd.simulate_variable_beam_3d
+            sim_fn          = lambda sc, rm: self.fwd.simulate_3d(sc, rm, t_chunk_size=self.t_chunk_size)
+            var_beam_sim_fn = self.fwd.simulate_variable_beam_3d
             self._sky_update_fn     = self.fwd.accumulate_equatorial_sky_update_3d
             self._beam_update_fn    = self.fwd.accumulate_beam_update_3d
             self._combined_update_fn = self.fwd.accumulate_sky_and_beam_update_3d
+
+        if self.project_out_time_mean:
+            # P(x) = x − mean_t(x) applied to every simulated visibility, so
+            # all consumers (loss, residuals, gain solve, static-sky cache,
+            # public simulate) operate in the projected subspace that matches
+            # the projected data.
+            def _project(vis):
+                return vis - jnp.mean(vis, axis=0, keepdims=True)
+            self._sim_fn          = lambda sc, rm: _project(sim_fn(sc, rm))
+            self._var_beam_sim_fn = lambda sc, bc, rm: _project(var_beam_sim_fn(sc, bc, rm))
+        else:
+            self._sim_fn          = sim_fn
+            self._var_beam_sim_fn = var_beam_sim_fn
 
     def _compile_adjoint_updates(self):
         """Compile selected dirty-map adjoint update functions."""
@@ -948,11 +982,20 @@ class Calibrator:
 
     def calc_reduced_chi2_excluding_chans(
         self, params, exclude_chans=None, explicit_beam: bool | None = None,
+        use_visibility_weights: bool = False,
     ):
         """Reduced chi² over (non-excluded) channels using only the radiometric
         ``inv_noise_var`` — log_ch_weights are ignored. Matches the convention
         of a notebook helper like ``chi² = sum |r|²/σ² / N_kept_vis`` with the
         named channels removed entirely.
+
+        With ``use_visibility_weights=True`` the current per-visibility
+        weights are applied to both the chi² and the DOF count.  Use this
+        whenever the fit support is restricted (flags, FR0 cuts, the
+        baseline-resolution taper): otherwise the statistic is dominated by
+        cells the fit was deliberately told to ignore — e.g. under the
+        nside resolution taper, the unweighted version judges the model on
+        long baselines it cannot represent.
 
         Use this in lieu of :meth:`calc_reduced_chi2` whenever the optimizer
         has been allowed to push residuals up at soft-flagged channels — the
@@ -988,7 +1031,7 @@ class Calibrator:
         )
         resid_sq = jnp.abs(self.data - vis_cal) ** 2     # (T, F, B)
 
-        if exclude_chans:
+        if exclude_chans is not None and np.asarray(exclude_chans).size > 0:
             keep_f = np.ones(self.nfreq, dtype=DTYPE_R_NPY)
             for c in exclude_chans:
                 keep_f[int(c)] = 0.0
@@ -999,8 +1042,13 @@ class Calibrator:
             keep_jax = jnp.ones(self.nfreq, dtype=DTYPE_R_JAX)
 
         weights_tf = self.inv_noise_var * keep_jax[None, :]   # (T, F)
-        chi2 = float(jnp.sum(resid_sq * weights_tf[:, :, None]))
-        n_vis_kept = n_kept_chans * float(self.ntime) * float(resid_sq.shape[2])
+        if use_visibility_weights:
+            w_vis = self.visibility_weights                    # (T, F, B)
+            chi2 = float(jnp.sum(resid_sq * weights_tf[:, :, None] * w_vis))
+            n_vis_kept = float(jnp.sum(keep_jax[None, :, None] * w_vis))
+        else:
+            chi2 = float(jnp.sum(resid_sq * weights_tf[:, :, None]))
+            n_vis_kept = n_kept_chans * float(self.ntime) * float(resid_sq.shape[2])
         return chi2 / max(n_vis_kept, 1.0)
 
 
@@ -1380,6 +1428,11 @@ class Calibrator:
         weights = self._effective_weights()
         den = weights * jnp.abs(vis_model) ** 2
         g_opt = (weights * data_for_fit * jnp.conj(vis_model)) / (den + 1e-30)
+        # Zero-weight samples give g_opt = 0 → log(0) = -inf → 0·(-inf) = NaN
+        # in the den-weighted sums.  Replace with 1 (log = 0); den = 0 there,
+        # so the substitute contributes nothing.  (Same guard as
+        # _gain_solve_and_loss_from_vis.)
+        g_opt = jnp.where(jnp.abs(g_opt) > 1e-30, g_opt, 1.0 + 0.0j)
         log_g = jnp.log(g_opt + 0j)
 
         w_sum = den.sum(axis=2) + 1e-30
@@ -1549,6 +1602,9 @@ class Calibrator:
         self._lbfgs_grad_unscaled = None
         self._lbfgs_diag_gn_fn = None
         self._lbfgs_solver_cfg = None
+        # Invalidate cached CG adjoint (geometry/masks changed).
+        self._cg_adj = None
+        self._cg_adj_size = None
 
     def compute_adjoint_updates(self, sky_coeffs, residual_vis, update_mode='both', **kwargs):
         """Unified interface for sky/beam adjoint updates.
@@ -1848,6 +1904,172 @@ class Calibrator:
             if orig_data is not None:
                 self.data = orig_data
 
+    def fit_sky_cg(
+        self,
+        sky_coeffs,
+        gain_params,
+        maxiter: int = 50,
+        tol: float = 1e-8,
+        precond: str | None = 'beam',
+        precond_reg: float = 1e-3,
+        prior_sky=None,
+        prior_lambda: float = 0.0,
+        verbose: bool = False,
+    ):
+        """Conjugate-gradient sky solve with beam and gains held fixed.
+
+        With the beam cached and gains fixed, the model is exactly linear in
+        the sky coefficients, ``V = g ⊙ (L s)``, so the weighted least-squares
+        problem is a quadratic and preconditioned CG on the normal equations
+
+            (Lg† W Lg) s  =  Lg† W d,      Lg = g ⊙ L
+
+        is the optimal Krylov method — it replaces both the dirty fixed-point
+        iteration (Richardson) and a generic quasi-Newton solver for this
+        sub-problem.  Each CG iteration costs one forward + one adjoint
+        evaluation (the same as one loss-plus-gradient).
+
+        The ``project_out_time_mean`` projector, masks, channel weights and
+        visibility weights are all folded in automatically (they enter through
+        ``_sim_fn`` and ``_effective_weights``).
+
+        Parameters
+        ----------
+        sky_coeffs : array, (npix_full | npix_active, nmodes)
+            Initial sky coefficients (also the CG starting point).
+        gain_params : dict with 'log_amp', 'phase', 'phi'
+            Gains, held fixed.
+        maxiter : int
+            Maximum CG iterations.
+        tol : float
+            CG relative-residual tolerance.
+        precond : {'beam', None}
+            'beam' uses the per-pixel Gram-diagonal proxy from
+            :meth:`get_sky_beam_weighting` as a Jacobi preconditioner —
+            the normal operator has the squared condition number of the
+            forward operator, and the dominant diagonal variation is the
+            per-pixel beam weighting.
+        precond_reg : float
+            Relative floor added to the preconditioner diagonal.
+        prior_sky : array, optional
+            Prior sky coefficients (full-sky or active).  With
+            ``prior_lambda > 0`` the solve becomes ridge regression toward
+            the prior:  ``(N + λI) s = b + λ s_prior``.  This is the cure for
+            low-weight pixels wandering to amplified noise: χ² is flat along
+            weakly-constrained pixel directions, and preconditioned solvers
+            walk them as fast as strong ones, so solution variance scales as
+            1/weight unless a prior pins those directions.
+        prior_lambda : float
+            Prior strength *relative to the normal operator's scale*
+            (measured by a Rayleigh quotient): pixels whose data constraint
+            is below ``prior_lambda`` of typical stay at the prior; pixels
+            constrained far above it follow the data.
+
+        Returns
+        -------
+        sky_full : array
+            Solution in full-sky format.
+        loss : float
+            Weighted loss at the solution.
+        """
+        from jax.scipy.sparse.linalg import cg as _cg
+
+        sky_input_full = None
+        sky_active = jnp.asarray(
+            self._ensure_sky_is_active(sky_coeffs), dtype=DTYPE_R_JAX)
+        if sky_coeffs.shape[0] == self._npix_full:
+            sky_input_full = np.asarray(sky_coeffs)
+
+        la = jnp.array(gain_params['log_amp'], dtype=DTYPE_R_JAX)
+        ph = jnp.array(gain_params['phase'], dtype=DTYPE_R_JAX)
+        phi = jnp.array(gain_params['phi'], dtype=DTYPE_R_JAX)
+        weights = self._effective_weights()
+
+        # Gains are elementwise, so fold them into the weights and the RHS:
+        #   min_s sum w |d - g.(Ls)|^2  has normal equations
+        #   Re L^H (w|g|^2 . L) s = Re L^H (w conj(g) . d)
+        # which lets the operator pair (L, L^H) be gain-free and cached —
+        # repeated calls with new gains do not retrace or recompile.
+        g = apply_gains(jnp.ones_like(self.data), la, ph, phi, self.bls)
+        wg2 = weights * jnp.abs(g) ** 2
+
+        if self._cg_adj is None or self._cg_adj_size != sky_active.shape:
+            # NOTE: jax.vjp at a real primal with a complex cotangent c
+            # computes the UNconjugated transpose Re(L^T c); the adjoint
+            # needed here is Re(L^H c) = Re(L^T conj(c)), hence the conj.
+            # (Verified against jax.grad of the loss.)
+            _, vjp_fn = jax.vjp(
+                lambda s: self._sim_fn(s, self.rot_matrices),
+                jnp.zeros_like(sky_active))
+            self._cg_adj = jax.jit(lambda c: vjp_fn(jnp.conj(c))[0])
+            self._cg_adj_size = sky_active.shape
+        adj = self._cg_adj
+        sim = self._jit_simulate          # shared compiled forward; L is linear
+
+        def normal_op_jit(p):
+            return adj(wg2 * sim(p, self.rot_matrices))
+
+        b = adj(weights * jnp.conj(g) * self.data)
+
+        lam = DTYPE_R_JAX(0.0)
+        pr = None
+        # Rayleigh quotient of N along b sets the operator's absolute scale
+        # (used for the prior strength and the preconditioner calibration).
+        scale = float(jnp.vdot(b, normal_op_jit(b)).real
+                      / jnp.maximum(jnp.vdot(b, b).real, 1e-300))
+        if prior_sky is not None and prior_lambda > 0:
+            pr = self._ensure_sky_is_active(
+                jnp.array(prior_sky, dtype=DTYPE_R_JAX))
+            lam = DTYPE_R_JAX(prior_lambda * max(scale, 0.0))
+            data_op = normal_op_jit
+            normal_op_jit = lambda p: data_op(p) + lam * p
+            b = b + lam * pr
+
+        M = None
+        if precond == 'beam':
+            # Same (pixel, frequency)-diagonal preconditioning the dirty sky
+            # update uses: divide by the time-summed apparent beam power
+            # before re-projecting onto the spectral basis.  As an operator
+            # on coefficients this is A^T D A with D > 0 diagonal — SPD, so
+            # it is a valid CG preconditioner, and CG with the same
+            # preconditioner dominates the dirty (Richardson) iteration per
+            # matvec.  The prior's lam*I is folded in (in the same units via
+            # the Rayleigh scale), otherwise a strong prior leaves the
+            # preconditioner badly mismatched and CG stalls.
+            w_pf = np.zeros(
+                (self._get_active_size(), self.nfreq), dtype=DTYPE_R_NPY)
+            for tind in range(self.ntime):
+                bsh = np.asarray(
+                    self.fwd._beam_spec_horizon_all[tind], dtype=DTYPE_R_NPY)
+                w_pf += bsh ** 2
+            w_pf += precond_reg * max(float(w_pf.max()), 1e-30)
+            c_units = max(scale, 1e-300) / max(float(w_pf.mean()), 1e-300)
+            w_pf_inv = jnp.array(
+                1.0 / (c_units * w_pf + float(lam)), dtype=DTYPE_R_JAX)
+            A_sky_j = jnp.array(self.A_sky, dtype=DTYPE_R_JAX)
+            M = jax.jit(lambda p: ((p @ A_sky_j.T) * w_pf_inv) @ A_sky_j)
+
+        def _objective(s, data_loss):
+            if prior_sky is not None and prior_lambda > 0:
+                return float(data_loss) + float(lam) * float(jnp.sum((s - pr) ** 2))
+            return float(data_loss)
+
+        loss0 = self._jit_loss({'sky_coeffs': sky_active, **gain_params}, weights)
+        sol, _info = _cg(normal_op_jit, b, x0=sky_active, maxiter=int(maxiter), tol=tol, M=M)
+        loss = self._jit_loss({'sky_coeffs': sol, **gain_params}, weights)
+        if verbose:
+            print(f'    cg ({maxiter} iters max): loss {float(loss0):.4e} -> {float(loss):.4e}')
+
+        # CG on a consistent SPD system should not increase the (regularized)
+        # objective, but a very ill-conditioned normal operator with loose
+        # maxiter can; keep the better of start/solution.
+        if _objective(sol, loss) > _objective(sky_active, loss0):
+            sol, loss = sky_active, loss0
+
+        sky_full = self._params_to_full_space(
+            {'sky_coeffs': sol}, {'sky_coeffs': sky_input_full}
+        )['sky_coeffs']
+        return sky_full, float(loss)
 
     def init_alternating_dirty_state(
         self,
@@ -3290,7 +3512,8 @@ class Calibrator:
             new_log_weights = np.log(np.clip(new_weights_direct, 1e-30, 1.0))
             self.set_channel_weights(new_log_weights)
 
-    def remove_degen(self, params, degen_params=None, which=('log_amp',)):
+    def remove_degen(self, params, degen_params=None, which=('log_amp',),
+                     gauge_modes: int = 3):
         """Move the degenerate modes of ``params`` to match ``degen_params``.
 
         Mirrors ``hera_cal.redcal.RedundantCalibrator.remove_degen``: applies a
@@ -3307,6 +3530,27 @@ class Calibrator:
             and scales ``beam_spec[pix,f]`` by the inverse, so the gain ×
             beam product (and therefore visibilities) is invariant. Safe in
             any context.
+
+        ``'log_amp_sky'`` (**visibility-preserving for the smooth component**)
+            Same degeneracy as ``'log_amp'`` but the compensating scale is
+            applied to the *sky* spectra instead of the beam:
+            ``log_amp[t,f] -> log_amp[t,f] + shift_s[f]`` and
+            ``sky_spec[pix,f] -> sky_spec[pix,f] / exp(shift_s[f])``.
+            Use this when the beam is frozen (cached-beam fitting): shifting
+            amplitude into ``beam_coeffs`` would not reach the forward model,
+            but the sky always does.  Re-pinning the gain gauge after each
+            gain solve stops the sky x alpha / log_amp - ln(alpha) ratchet
+            and parks the amplitude where a sky prior can judge it.
+
+            Only the SMOOTH part of the shift is exchanged: ``shift_s`` is
+            the projection of the per-channel shift onto the first
+            ``gauge_modes`` sky-basis columns.  This is deliberate twice
+            over: (i) only the smooth scale is a true gauge mode — ragged
+            per-channel gain structure is data-constrained relative
+            calibration and must stay in the gains; (ii) multiplying
+            band-limited sky spectra by a ragged ``exp(-shift)`` leaves the
+            basis span, so a per-channel exchange would NOT preserve
+            visibilities.  Requires ``sky_coeffs`` in ``params``.
 
         ``'tip_tilt'`` (**gauge fix only — not visibility-preserving**)
             ``(t,f)``-mean of ``phi`` (one scalar per spatial axis) is a
@@ -3350,6 +3594,26 @@ class Calibrator:
             params['beam_coeffs'], params['log_amp'] = self._apply_log_amp_shift(
                 params['beam_coeffs'], sol_log_amp, shift,
             )
+
+        if 'log_amp_sky' in which:
+            sol_log_amp = jnp.asarray(params['log_amp'], dtype=DTYPE_R_JAX)
+            sol_mean = jnp.mean(sol_log_amp, axis=0)            # (nfreq,)
+            if degen_params is not None:
+                ref_mean = jnp.mean(
+                    jnp.asarray(degen_params['log_amp'], dtype=DTYPE_R_JAX),
+                    axis=0,
+                )
+            else:
+                ref_mean = jnp.zeros_like(sol_mean)
+            A_sky = jnp.array(self.A_sky, dtype=DTYPE_R_JAX)
+            G = A_sky[:, :max(int(gauge_modes), 1)]             # (nfreq, k)
+            shift = ref_mean - sol_mean                         # (nfreq,)
+            shift_s = G @ (G.T @ shift)                         # smooth component
+            sky = jnp.asarray(params['sky_coeffs'], dtype=DTYPE_R_JAX)
+            # row-wise basis op: works for full-sky or active coefficients
+            sky_spec = sky @ A_sky.T
+            params['sky_coeffs'] = (sky_spec * jnp.exp(-shift_s)[None, :]) @ A_sky
+            params['log_amp'] = sol_log_amp + shift_s[None, :]
 
         if 'tip_tilt' in which:
             sol_phi = jnp.asarray(params['phi'], dtype=DTYPE_R_JAX)
