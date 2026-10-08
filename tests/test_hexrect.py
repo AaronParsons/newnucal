@@ -48,9 +48,10 @@ def test_critical_channel_spacing_safety():
 # ---------------------------------------------------------------------------
 
 def test_hex_lattice_matrix_shape(array):
+    from newnucal.utils import DTYPE_R_NPY
     A_lat = hex_lattice_matrix(array)
     assert A_lat.shape == (2, 2)
-    assert A_lat.dtype == np.float32
+    assert A_lat.dtype == DTYPE_R_NPY
 
 
 def test_hex_lattice_matrix_recovers_baselines(array):

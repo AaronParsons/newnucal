@@ -27,6 +27,7 @@ import healpy
 
 from newnucal.basis import dpss_matrix, basis_project, basis_reconstruct
 from newnucal.simulate import compute_rotation_matrices, ForwardModel
+from newnucal.utils import DTYPE_C_JAX as DTYPE_C
 
 
 class TestPointSourcePhaseGradient:
@@ -537,7 +538,7 @@ class TestShapesAndDtypes:
         rot_m = jnp.eye(3, dtype=jnp.float32)[None, :, :]
         vis = forward_model.simulate(sky_coeffs, rot_m)
 
-        assert vis.dtype == jnp.complex64
+        assert vis.dtype == DTYPE_C
 
     def test_sky_coeffs_shape(self, forward_model, A_sky):
         """Sky coefficients shape is (npix_sky, nmodes_sky)."""

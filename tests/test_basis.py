@@ -19,6 +19,7 @@ import pytest
 
 from newnucal.basis import BeamBasis, SkyBasis
 from newnucal.basis import dpss_matrix, basis_project, basis_reconstruct
+from newnucal.utils import DTYPE_R_NPY as DTYPE_R
 
 # ------------------------------------------------------------------
 # Constants
@@ -129,7 +130,7 @@ class TestDirectConstruction:
         nfreq = len(freqs)
         A     = np.ones((nfreq, 3), dtype=np.float64)
         sb    = SkyBasis(A=A)
-        assert sb.A.dtype == np.float32
+        assert sb.A.dtype == DTYPE_R
 
     def test_no_freqs_hz_ok(self, freqs):
         nfreq = len(freqs)
@@ -158,7 +159,7 @@ class TestFromDpss:
 
     def test_A_dtype(self, freqs):
         sb = SkyBasis.from_dpss(freqs, 40e-9)
-        assert sb.A.dtype == np.float32
+        assert sb.A.dtype == DTYPE_R
 
 
 # ------------------------------------------------------------------
@@ -201,13 +202,13 @@ class TestFromEnsemble:
         assert np.max(np.abs(off)) < 0.1 * np.max(diag + 1e-12)
 
     def test_A_dtype(self, freqs):
-        assert _make_sky_basis(freqs).A.dtype == np.float32
+        assert _make_sky_basis(freqs).A.dtype == DTYPE_R
 
     def test_svd_dtype(self, freqs):
         sb = _make_sky_basis(freqs)
-        assert sb.svd_mean.dtype  == np.float32
-        assert sb.svd_modes.dtype == np.float32
-        assert sb.svd_svals.dtype == np.float32
+        assert sb.svd_mean.dtype  == DTYPE_R
+        assert sb.svd_modes.dtype == DTYPE_R
+        assert sb.svd_svals.dtype == DTYPE_R
 
 
 # ------------------------------------------------------------------
@@ -291,7 +292,7 @@ class TestFromBeamDiameters:
         assert np.max(np.abs(res)) < 1e-5
 
     def test_A_dtype(self, bb_from_diams):
-        assert bb_from_diams.A.dtype == np.float32
+        assert bb_from_diams.A.dtype == DTYPE_R
 
 
 # ------------------------------------------------------------------
