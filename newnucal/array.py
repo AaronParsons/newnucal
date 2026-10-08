@@ -17,6 +17,16 @@ by the forward model:
 
   n_modes       int         NUFFT grid edge length, chosen to contain all
                             baselines.
+
+Baseline convention (matches matvis and HERA data products)
+-----------------------------------------------------------
+For an antenna pair (i, j) the baseline is ``bls = x_j − x_i`` (ENU metres)
+and the visibility is
+
+    V_ij(ν) = Σ_ŝ I(ŝ, ν) B(ŝ, ν) exp(+2πi ν bls·ŝ / c),
+
+so data read from a HERA uvh5 file are modelled without conjugation.
+``tests/test_convention.py`` checks this against matvis.
 """
 
 import numpy as np
@@ -46,9 +56,9 @@ class HERAArray:
         red_gps = _fu.get_pos_reds(self.ants)
         self.antpairs = np.array([gp[0] for gp in red_gps], dtype=int)  # (nbls, 2)
         self.bls = np.array(
-            [self.ants[i] - self.ants[j] for i, j in self.antpairs],
+            [self.ants[j] - self.ants[i] for i, j in self.antpairs],
             dtype=DTYPE_R,
-        )  # (nbls, 3)  metres
+        )  # (nbls, 3)  metres; x_j − x_i (see module docstring)
 
         # Grid baseline positions and change-of-basis matrix
         _, gridded_antpos, basis_matrix = (

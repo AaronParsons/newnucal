@@ -12,7 +12,7 @@ Gains are solved independently at each time step so that slow temporal
 variation (ionospheric drift, electronics) is captured, while the sky
 model (equatorial HEALPix + DPSS) is shared across all times.
 
-Applied to a baseline (i→j) with separation bls[bl, :2] = (Δe, Δn):
+Applied to a baseline (i, j) with separation bls[bl, :2] = x_j − x_i = (Δe, Δn):
 
   V_cal[t, freq, bl] = exp(log_amp[t, freq])
                        * exp(i * (phase[t, freq]

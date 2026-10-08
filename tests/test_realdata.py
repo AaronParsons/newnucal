@@ -66,7 +66,8 @@ class TestHeraArrayFromFilePairs:
         arr = hera_array_from_file_pairs(snapped, pairs)
         assert arr.nbls == len(pairs)
         np.testing.assert_array_equal(arr.antpairs, pairs)
-        expect = np.array([snapped[i] - snapped[j] for i, j in pairs])
+        # HERA/matvis convention: bls = x_j − x_i (see tests/test_convention.py)
+        expect = np.array([snapped[j] - snapped[i] for i, j in pairs])
         np.testing.assert_allclose(arr.bls, expect, atol=1e-9)
 
 

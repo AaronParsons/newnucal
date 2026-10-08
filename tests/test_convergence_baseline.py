@@ -179,7 +179,12 @@ def test_closed_loop_default_joint_convergence_baseline(
     assert np.all(np.diff(aa_losses) <= 1e-6)
     assert aa_losses[4] < 0.72
     assert aa_losses[8] < 0.46
-    assert aa_losses[12] < 0.03
+    # Re-baselined from 0.03 when bls became x_j − x_i (matvis/HERA convention).
+    # The flip conjugates the model but not this fixed noise draw, so the solver
+    # sees an equivalent problem with a different noise realisation: with the
+    # noise conjugated too, the trace reproduces the old one exactly
+    # (0.652, 0.126, 0.019 at steps 4, 8, 12); as written it is 0.681, 0.162, 0.066.
+    assert aa_losses[12] < 0.08
 
     assert aa_losses[12] < 0.96 * plain_losses[12]
 
@@ -232,4 +237,8 @@ def test_closed_loop_default_joint_convergence_with_nonunity_gains(
     assert state.n_joint == 9
     assert state.n_gains == 3
     assert state.n_rfi == 4
-    assert losses[12] < 0.07
+    # Re-baselined from 0.07 when bls became x_j − x_i; see the note in
+    # test_closed_loop_default_joint_convergence_baseline.  Conjugating the noise
+    # and negating the true gain phase reproduces the old trace exactly
+    # (0.600, 0.220, 0.052 at steps 4, 8, 12); as written it is 0.546, 0.212, 0.094.
+    assert losses[12] < 0.11

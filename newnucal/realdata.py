@@ -158,7 +158,9 @@ def hera_array_from_file_pairs(snapped_antpos, pairs):
     redundantly-averaged files the pair list IS the group list, so we
     override the baseline attributes with the file ordering, replicating
     HERAArray's own sign conventions
-    (``bls = ants[i] - ants[j]``, ``bl_grid = round(gridded[j] - gridded[i])``).
+    (``bls = ants[j] - ants[i]``, ``bl_grid = round(gridded[j] - gridded[i])``).
+    With these the model matches the file's visibilities without conjugation
+    (see the convention in ``newnucal.array``).
     """
     import fftvis.core.antenna_gridding as _fg
 
@@ -170,7 +172,7 @@ def hera_array_from_file_pairs(snapped_antpos, pairs):
     pairs = np.asarray(pairs, dtype=int)
     array.antpairs = pairs.copy()
     array.bls = np.array(
-        [snapped_antpos[i] - snapped_antpos[j] for i, j in pairs], dtype=DTYPE_R)
+        [snapped_antpos[j] - snapped_antpos[i] for i, j in pairs], dtype=DTYPE_R)
     array.bl_grid = np.array(
         [np.round(gridded[j] - gridded[i]).astype(int)[:2] for i, j in pairs])
     array.n_modes = int(2 * np.max(np.abs(array.bl_grid)) + 1)

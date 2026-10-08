@@ -66,9 +66,10 @@ def hex_lattice_matrix(array):
     Derived from the stored basis_matrix (which equals basis_matrix_raw / C).
     fftvis returns basis_matrix such that gridded integer antenna coordinates
     map to ENU metres via  enu = C * basis_matrix @ grid, so the lattice
-    matrix is taken WITHOUT a transpose:
+    matrix is taken WITHOUT a transpose.  With ``bls = x_j − x_i`` and
+    ``bl_grid = grid_j − grid_i`` (both in the same orientation):
 
-        A_lat = -C * array.basis_matrix[:2, :2]
+        A_lat = C * array.basis_matrix[:2, :2]
 
     (The previous transposed form only agreed for symmetric lattice matrices;
     for general orientations it silently distorted the 2D NUFFT sky mapping.
@@ -82,7 +83,7 @@ def hex_lattice_matrix(array):
     -------
     A_lat : np.ndarray, shape (2, 2)
     """
-    return -C * array.basis_matrix[:2, :2]
+    return C * array.basis_matrix[:2, :2]
 
 
 def axial_grid_size(bl_grid):
