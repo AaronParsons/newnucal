@@ -1,6 +1,13 @@
 import jax.numpy as jnp
 import numpy as np
 
+# Compatibility: jax-finufft <= 1.3.1 tests ``x is batching.not_mapped``.  JAX
+# 0.10 removed that alias; it was always ``None``, which is what JAX 0.10 uses
+# for an unmapped batch dimension.  Restore it if missing (no-op on older JAX).
+from jax._src.interpreters import batching as _batching
+if not hasattr(_batching, "not_mapped"):
+    _batching.not_mapped = None
+
 if False:
     DTYPE_R_JAX = jnp.float32
     DTYPE_R_NPY =  np.float32
