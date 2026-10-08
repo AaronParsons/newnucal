@@ -211,8 +211,9 @@ def estimate_sigma_freqdiff(data, flags=None):
     """Per-channel noise sigma from frequency differencing.
 
     Adjacent fine channels see nearly the same sky, so the difference is
-    sqrt(2) x noise.  Robust median over times and baselines; for complex z
-    with per-component sigma s, median|z| = 1.1774 s.
+    sqrt(2) x noise.  Mean over times and baselines (see AGENTS.md: means,
+    not medians): for complex noise with per-component sigma s, the
+    difference d has E|d|^2 = 4 s^2.
 
     Returns (nfreq,) sigma per complex visibility component.
     """
@@ -222,15 +223,15 @@ def estimate_sigma_freqdiff(data, flags=None):
     if flags is not None:
         flags = np.asarray(flags, dtype=bool)
         good &= ~flags[:, 1:] & ~flags[:, :-1]
-    absd = np.where(good, np.abs(dvis), np.nan)
+    d2 = np.where(good, np.abs(dvis) ** 2, np.nan)
     with np.errstate(all='ignore'):
-        sigma = np.nanmedian(absd, axis=(0, 2)) / (1.1774 * np.sqrt(2.0))
+        sigma = np.sqrt(np.nanmean(d2, axis=(0, 2)) / 4.0)
     nfreq = data.shape[1]
     sigma = np.interp(np.arange(nfreq), np.arange(nfreq - 1) + 0.5, sigma)
-    # fill any all-flagged channels with the band median
+    # fill any all-flagged channels with the band mean
     bad = ~np.isfinite(sigma)
     if bad.any():
-        sigma[bad] = np.nanmedian(sigma[~bad])
+        sigma[bad] = np.nanmean(sigma[~bad])
     return sigma.astype(DTYPE_R)
 
 
