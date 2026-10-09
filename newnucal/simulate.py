@@ -8,6 +8,8 @@ custom modes — set via :meth:`~ForwardModel.set_sky_basis`.  This version also
 exposes adjoint/backprojection helpers for dirty-map sky updates.
 """
 
+import warnings
+
 import numpy as np
 import healpy
 import jax
@@ -24,6 +26,39 @@ from .beam import BeamModel
 from .sky import SkyModel
 from .hexrect import hex_lattice_matrix, axial_grid_size
 from .utils import DTYPE_R_JAX, DTYPE_C_JAX, DTYPE_R_NPY, C
+
+
+# Minimum beam-to-sky HEALPix nside ratio.  ForwardModel interpolates the
+# topocentric beam bilinearly onto the rotating sky pixels; the interpolation
+# weights kink each time a sky pixel crosses a beam-pixel boundary, which puts
+# power at all fringe rates at in-horizon delays.  For an nside-64 sky on HERA's
+# 14.6 m E-W baselines, specred memo-002 measured this artifact at 15x, ~1x and
+# 0.12x the data's own power there at beam nside 64, 128 and 256.
+MIN_BEAM_SKY_NSIDE_RATIO = 4
+
+
+class BeamResolutionWarning(UserWarning):
+    """Beam grid coarser than MIN_BEAM_SKY_NSIDE_RATIO x the sky grid."""
+
+
+def check_beam_resolution(sky_nside: int, beam_nside: int) -> bool:
+    """Warn (BeamResolutionWarning) if beam nside < 4 x sky nside.
+
+    Returns True if the beam grid is fine enough.  Coarse beams are allowed
+    (e.g. to measure the artifact); filter the warning to silence it.
+    """
+    if beam_nside >= MIN_BEAM_SKY_NSIDE_RATIO * sky_nside:
+        return True
+    warnings.warn(
+        f"beam nside {beam_nside} is below {MIN_BEAM_SKY_NSIDE_RATIO} x sky nside "
+        f"{sky_nside} (= {MIN_BEAM_SKY_NSIDE_RATIO * sky_nside}). Bilinear beam "
+        "interpolation kinks as sky pixels cross beam pixels, putting power at all "
+        "fringe rates at in-horizon delays (for an nside-64 sky: 15x, ~1x and 0.12x "
+        "the data's own power at beam nside 64, 128, 256; specred memo-002).",
+        BeamResolutionWarning,
+        stacklevel=3,
+    )
+    return False
 
 
 @dataclass
@@ -77,6 +112,7 @@ class ForwardModel:
         self.array = array
         self.sky_model = sky_model
         self.beam_model = beam_model
+        check_beam_resolution(sky_model.nside, beam_model.nside)
         self.eps = eps
         self._nufft_opts = _NufftOpts(upsampfac=nufft_upsampfac)
         self.eta_max = eta_max
