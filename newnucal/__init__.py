@@ -2,7 +2,7 @@ from .array import HERAArray
 from .beam import BeamModel
 from .basis import BeamBasis, SkyBasis
 from .sky import SkyModel
-from .simulate import ForwardModel
+from .simulate import ForwardModel, BeamResolutionWarning
 from .gains import apply_gains, init_gain_params
 from .calibrator import Calibrator
 from .multiresolution import (
@@ -20,6 +20,7 @@ __all__ = [
     "SkyBasis",
     "SkyModel",
     "ForwardModel",
+    "BeamResolutionWarning",
     "apply_gains",
     "init_gain_params",
     "Calibrator",
