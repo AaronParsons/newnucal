@@ -522,3 +522,57 @@ def test_calibrator_method_2d(forward_model, A_sky, rot_matrices):
     params = cal.init_params()
     loss = cal.calc_loss(params)
     assert np.isfinite(loss) and loss > 0.0
+
+
+# ---------------------------------------------------------------------------
+# Time-geometry cache: same number of times, different rotations
+# ---------------------------------------------------------------------------
+
+def _later_rotations(rot_matrices, hours=3.0):
+    """Rotations for the same number of times, *hours* later."""
+    from newnucal.simulate import compute_rotation_matrices
+    from tests.conftest import HERA_LOC
+    from astropy.time import Time
+    t0 = Time("2018-08-31T04:02:30", format="isot", scale="utc").jd + hours / 24
+    times = Time(np.linspace(t0, t0 + 1 / 24, rot_matrices.shape[0]), format="jd")
+    return compute_rotation_matrices(times, HERA_LOC)
+
+
+@pytest.mark.parametrize("method", ["2d", "3d"])
+def test_geometry_cache_keyed_by_rotations(forward_model, A_sky, rot_matrices, method):
+    """Cached geometry for one time range must not be reused for another of the same length."""
+    rng = np.random.default_rng(0)
+    sky = jnp.array(rng.random((forward_model.npix_sky, A_sky.shape[1])), dtype=jnp.float32)
+    rot_b = _later_rotations(rot_matrices)
+    assert rot_b.shape == rot_matrices.shape
+    assert not np.allclose(np.asarray(rot_b), np.asarray(rot_matrices))
+
+    sim = forward_model.simulate_2d if method == "2d" else forward_model.simulate_3d
+    impl = forward_model._simulate_2d_impl if method == "2d" else forward_model._simulate_impl
+    ref = impl(sky, rot_b, geom=forward_model._build_time_geometry(rot_b))
+    vis = sim(sky, rot_b)          # forward_model's cache holds rot_matrices' geometry
+    assert not np.allclose(np.asarray(ref), np.asarray(sim(sky, rot_matrices)))
+    np.testing.assert_allclose(np.asarray(vis), np.asarray(ref), rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("method", ["2d", "3d"])
+def test_variable_beam_geometry_cache_keyed_by_rotations(forward_model, A_sky, rot_matrices, method):
+    """The variable-beam paths rebuild geometry when the rotations change."""
+    from newnucal.simulate import ForwardModel
+    rng = np.random.default_rng(1)
+    sky = jnp.array(rng.random((forward_model.npix_sky, A_sky.shape[1])), dtype=jnp.float32)
+    beam = forward_model.beam_coeffs
+    rot_b = _later_rotations(rot_matrices)
+    fresh = ForwardModel(forward_model.array, forward_model.sky_model, forward_model.beam_model,
+                         forward_model.freqs)
+    fresh.precompute_time_geometry(rot_b)
+    sim = "simulate_variable_beam_2d" if method == "2d" else "simulate_variable_beam_3d"
+    ref = getattr(fresh, sim)(sky, beam, rot_b)
+    vis = getattr(forward_model, sim)(sky, beam, rot_b)
+    np.testing.assert_allclose(np.asarray(vis), np.asarray(ref), rtol=1e-5, atol=1e-6)
+
+
+def test_geometry_cache_reused_for_equal_rotations(forward_model, rot_matrices):
+    """Equal rotations (a copy) still hit the cache."""
+    assert forward_model._geom_matches(jnp.array(np.array(rot_matrices)))
+    assert not forward_model._geom_matches(_later_rotations(rot_matrices))
