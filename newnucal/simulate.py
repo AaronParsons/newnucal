@@ -182,6 +182,7 @@ class ForwardModel:
         self._2d_r_idx = jnp.array(bl_grid_np[:, 1] + n_r // 2, dtype=jnp.int32)
 
         self._geom_ready = False
+        self._geom_rot = None    # rotations the cached geometry was built from
         self._topo_all = None
         self._horizon_all = None
         self._beam_spec_horizon_all = None
@@ -576,6 +577,8 @@ class ForwardModel:
         rot_matrices : array_like, shape (ntime, 3, 3)
         """
         geom = self._build_time_geometry(rot_matrices)
+        self._geom_rot = (rot_matrices if isinstance(rot_matrices, jax.core.Tracer)
+                          else np.array(rot_matrices))
         self._topo_all = geom.topo_all
         self._horizon_all = geom.horizon_all
         self._beam_spec_horizon_all = geom.beam_spec_horizon_all
@@ -589,6 +592,22 @@ class ForwardModel:
         self._2d_y_flat = geom._2d_y_flat
         self._geom_ready = True
         return self
+
+    def _geom_matches(self, rot_matrices):
+        """True if the cached time geometry was built from *rot_matrices*.
+
+        Compares the rotations' values, not just their count: two time ranges
+        with the same number of samples must not share geometry.  Traced
+        rotations (inside ``jax.jit`` with *rot_matrices* as an argument) cannot
+        be compared, so for them only the number of times is checked.
+        """
+        if not self._geom_ready or self._topo_all is None:
+            return False
+        if self._topo_all.shape[0] != rot_matrices.shape[0]:
+            return False
+        if isinstance(rot_matrices, jax.core.Tracer) or isinstance(self._geom_rot, jax.core.Tracer):
+            return True
+        return self._geom_rot is not None and np.array_equal(np.asarray(rot_matrices), self._geom_rot)
 
     def _kernel_simulate_one_3d(self, W_eta, src_x, src_y, src_z):
         """3D NUFFT kernel with geometry as explicit arguments (no JIT recompilation).
@@ -666,7 +685,7 @@ class ForwardModel:
         """
         if geom is None:
             # Try to use cached geometry if available and matches
-            if self._geom_ready and self._topo_all.shape[0] == rot_matrices.shape[0]:
+            if self._geom_matches(rot_matrices):
                 # Use cached geometry (geom stays None to use self state)
                 pass
             else:
@@ -1202,10 +1221,7 @@ class ForwardModel:
 
     def simulate_variable_beam_3d(self, sky_coeffs, beam_coeffs, rot_matrices):
         """Simulate all time steps with *beam_coeffs* as a differentiable input (3D path)."""
-        if (
-            (not self._geom_ready)
-            or self._topo_all.shape[0] != rot_matrices.shape[0]
-        ):
+        if not self._geom_matches(rot_matrices):
             self.precompute_time_geometry(rot_matrices)
         ntime = rot_matrices.shape[0]
         sky_spec = sky_coeffs @ self.A_sky.T
@@ -1350,9 +1366,7 @@ class ForwardModel:
         """
         if geom is None:
             # Try to use cached geometry if it matches
-            if (self._geom_ready and
-                self._2d_x_flat is not None and
-                self._topo_all.shape[0] == rot_matrices.shape[0]):
+            if self._geom_matches(rot_matrices) and self._2d_x_flat is not None:
                 # Cached geometry is valid; use it
                 ntime = self._topo_all.shape[0]
                 beam_spec_h_all = self._beam_spec_horizon_all
@@ -1434,10 +1448,7 @@ class ForwardModel:
 
         Uses vmap over (time, freq) to avoid Python loop over time steps.
         """
-        if (
-            (not self._geom_ready)
-            or self._topo_all.shape[0] != rot_matrices.shape[0]
-        ):
+        if not self._geom_matches(rot_matrices):
             self.precompute_time_geometry(rot_matrices)
         ntime = self._topo_all.shape[0]
 
@@ -1468,10 +1479,7 @@ class ForwardModel:
 
     def beam_spec_horizon_from_coeffs_2d(self, beam_coeffs, rot_matrices):
         """Return beam spectra on sky pixels for explicit coefficients via the 2D path."""
-        if (
-            (not self._geom_ready)
-            or self._topo_all.shape[0] != rot_matrices.shape[0]
-        ):
+        if not self._geom_matches(rot_matrices):
             self.precompute_time_geometry(rot_matrices)
         interp_px_all = jnp.asarray(self._interp_px_all)
         interp_wgt_all = jnp.asarray(self._interp_wgt_all)
